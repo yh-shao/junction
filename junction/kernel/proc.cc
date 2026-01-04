@@ -35,6 +35,8 @@ extern "C" {
 #include "junction/syscall/strace.h"
 #include "junction/syscall/syscall.h"
 
+#include "junction/fs/shaofs/file.h"     // for final_flush()
+
 #ifndef P_PIDFD
 #define P_PIDFD 3
 #endif
@@ -276,6 +278,8 @@ void Process::ProcessFinish() {
   }
   // Check if init has died
   if (unlikely(init_proc.get() == this)) {
+    log_info("[Process::ProcessFinish()] init process exiting, flushing cache");
+    final_flush();
     syscall_exit(xstate_);
     std::unreachable();
   }

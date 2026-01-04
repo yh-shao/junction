@@ -49,9 +49,15 @@ inline constexpr long kMaxCapability = 63;
 inline bool SignalIfOwned(struct kthread *k, const thread_t *th) {
   spin_lock_np(&k->lock);
   bool found = access_once(th->cur_kthread) == kthread_idx(k);
+  // bool found = (access_once(th->cur_kthread) == kthread_idx(k)) && access_once(th->thread_running);
   // send IPI with lock held to prevent potential race where the core parks and
   // invalidates its target table entry.
   if (found && uintr_enabled) SendUipi(k->curr_cpu);
+  // if (found)
+  // {
+  //   if (uintr_enabled) SendUipi(k->curr_cpu);
+  //   else ksys_tgkill(GetLinuxPid(), k->tid, SIGURG);
+  // }
   spin_unlock_np(&k->lock);
   if (found && !uintr_enabled) ksys_tgkill(GetLinuxPid(), k->tid, SIGURG);
   return found;

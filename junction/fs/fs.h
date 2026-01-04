@@ -19,6 +19,8 @@ extern "C" {
 #include "junction/junction.h"
 #include "junction/snapshot/cereal.h"
 
+#include "junction/fs/shaofs/base.h"
+
 namespace junction {
 
 //
@@ -797,6 +799,7 @@ Status<void> FSRestore(cereal::BinaryInputArchive &ar);
 Status<void> InitFs(
     const std::vector<std::pair<std::string, std::string>> &linux_mount_points,
     const std::vector<std::string> &mem_mount_points);
+Status<void> InitMyFs();
 
 // Allocate a unique inode number.
 ino_t AllocateInodeNumber();
@@ -839,4 +842,11 @@ Status<std::shared_ptr<DirectoryEntry>> InsertTo(const FSRoot &fs,
                                                  std::string_view path,
                                                  std::shared_ptr<Inode> ino);
 
+class MyInode : public Inode {
+ public:
+  MyInode(ino_t inum) : Inode(/* mode = */ SHAOFS, inum) {}
+
+  Status<std::shared_ptr<File>> Open(uint32_t, FileMode, std::shared_ptr<DirectoryEntry>) override { return MakeError(ENOSYS); }
+  Status<void> GetStats(struct stat *buf) const override { return MakeError(ENOSYS); }
+};
 }  // namespace junction

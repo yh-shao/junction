@@ -277,6 +277,9 @@ Status<void> init() {
     return ret;
   }
 
+  ret = InitMyFs();
+  if (unlikely(!ret)) return ret;
+
   ret = ShimJmpInit();
   if (unlikely(!ret)) {
     LOG(ERR) << "failed to initialize shim: " << ret.error();
