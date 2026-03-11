@@ -1,5 +1,5 @@
 #include "disk.h"
-#include "base.h"
+#include "fs.h"
 #include "blockCache.h"
 #include "blockpool.h"
 // #include "dml_utili.h"
@@ -138,11 +138,11 @@ void read_extent(const iExtent *ext, uint64_t offset, char* buf, size_t size)
         {
             size_t of, sz;
             whattoread(current_idx, start_block_idx, end_block_idx, offset, size, of, sz);  // 计算需要拷贝的块的内容
-            // memcpy(buf + taken_size, (char*)block->data + of, sz);
+            if (sz > 0) memcpy(buf + taken_size, (char*)block->data + of, sz);
             spin_unlock(&block->mtx);
-            log_info("[read_extent()] ready to DSA");
+            // log_info("[read_extent()] ready to DSA");
             // if (sz > 0) dsa_memcpy(buf + taken_size, (char*)block->data + of, sz);
-            if (sz > 0) dsa_copy(buf + taken_size, (char*)block->data + of, sz);
+            // if (sz > 0) dsa_copy(buf + taken_size, (char*)block->data + of, sz);
             taken_size += sz;
             current_idx++; // 处理下一个 block
         }
@@ -198,13 +198,11 @@ void read_extent(const iExtent *ext, uint64_t offset, char* buf, size_t size)
                 // 拷贝到用户 buf
                 size_t of, sz;
                 whattoread(block_idx_in_extent, start_block_idx, end_block_idx, offset, size, of, sz);
-                // if (sz > 0) memcpy(buf + taken_size, (char*)block_to_fill->data + of, sz);
-                log_info("[read_extent()] ready to DSA");
+                if (sz > 0) memcpy(buf + taken_size, (char*)block_to_fill->data + of, sz);
+                // log_info("[read_extent()] ready to DSA");
                 // if (sz > 0) dsa_memcpy(buf + taken_size, (char*)block_to_fill->data + of, sz);
-                if (sz > 0) dsa_copy(buf + taken_size, (char*)block_to_fill->data + of, sz);
+                // if (sz > 0) dsa_copy(buf + taken_size, (char*)block_to_fill->data + of, sz);
                 taken_size += sz;
-
-                
             }
 
             current_idx += run_length;

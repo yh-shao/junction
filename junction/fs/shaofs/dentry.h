@@ -1,9 +1,7 @@
 #pragma once
 
-#include "base.h"
+#include "fs.h"
 #include "inode.h"
-#include <memory>
-
 
 typedef struct {
 	int inum;
@@ -28,3 +26,5 @@ void add_dentry(MInode* dir_inode, const char* name, int inum, file_type_t filet
 
 void lookup(const char *pathname, IEntry& out_entry);
 void delete_dentry(MInode*& dir_inode, char* name);
+
+bool is_dir_empty(MInode* dir_inode);

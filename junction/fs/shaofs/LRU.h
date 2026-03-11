@@ -4,7 +4,7 @@
 #include <list>
 #include <memory>
 #include <functional>
-#include "base.h"
+#include "fs.h"
 
 #define DEFAULT_CACHE_SIZE  65536
 

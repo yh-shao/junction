@@ -19,7 +19,7 @@ extern "C" {
 #include "junction/junction.h"
 #include "junction/snapshot/cereal.h"
 
-#include "junction/fs/shaofs/base.h"
+#include "junction/fs/shaofs/fs.h"
 
 namespace junction {
 

@@ -1,7 +1,7 @@
 #include "inodeCache.h"
 #include "blockCache.h"
 #include "disk.h"
-#include "base.h"
+#include "fs.h"
 #include "file.h"
 #include "dentry.h"
 #include "extent.h"
@@ -42,17 +42,17 @@ void write_file(MInode* ino, uint64_t oft, char* buf, uint64_t size)   // 从 of
 
 	if (ino == nullptr || size == 0) return;
 
-	uint64_t before_read_extents = rdtsc();
+	// uint64_t before_read_extents = rdtsc();
 	DInode &di = ino->disk_inode;
 	// std::vector<iExtent, MyAllocator<iExtent>> exts;
 	std::vector<iExtent> exts;
 	load_all_extents(di, exts);
 	ensure_coverage(exts, CEIL(oft + size, BLOCK_SIZE));
-	uint64_t after_read_extents = rdtsc();
+	// uint64_t after_read_extents = rdtsc();
 	// log_info("[read extents] duration: %lu us", (after_read_extents - before_read_extents) / cycles_per_us);
 
 
-	uint64_t before_write_extents = rdtsc();
+	// uint64_t before_write_extents = rdtsc();
 	if (oft > di.file_size)   // 存在洞（oft > file_size），先进行零填充
 	{
 		uint64_t hole_len = oft - di.file_size;
@@ -88,6 +88,8 @@ void read_file(MInode* inode, uint64_t oft, void* buf, uint64_t size)  // 从 of
 
 	// log_info("Reading file[%d] content[%lu ~ %lu) ...", inode->inum, oft, oft + size);
 	// log_info("current fsbase: 0x%lx, runtime fsbase: 0x%lx", _readfsbase_u64(), perthread_read(runtime_fsbase));
+
+    // memset(buf, 0, size);   // Zero buffer to handle file holes
 
 	std::vector<iExtent> exts;
 	load_all_extents(di, exts);
@@ -313,7 +315,7 @@ MInode* create_file(MInode* dirino, const char* filename, file_type_t filetype) 
 	MInode* inode;
 	alloc_inode(filetype, inode, inum);     // 分配（并初始化）一个 inode
 
-  	log_info("[create_file()] successfully created a file!");
+  	// log_info("[create_file()] successfully created a file!");
   	return inode;
 }
 

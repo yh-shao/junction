@@ -49,6 +49,7 @@ add_library(fs
   shaofs/dentryCache.cc
   shaofs/extent.cc
   shaofs/dsa.cc
+  shaofs/syscall.cc
 )
 
 target_include_directories(fs PRIVATE ${DML_INCLUDE_DIR})   # 添加头文件包含路径

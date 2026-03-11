@@ -23,11 +23,12 @@ extern "C" {
 #include "junction/kernel/usys.h"
 #include "junction/syscall/strace.h"
 
-#include "junction/fs/shaofs/base.h"
+#include "junction/fs/shaofs/fs.h"
 #include "junction/fs/shaofs/inodeCache.h"
 #include "junction/fs/shaofs/file.h"
 #include "junction/fs/shaofs/disk.h"
 #include "junction/fs/shaofs/blockCache.h"
+#include "junction/fs/shaofs/syscall.h"
 
 namespace {
 
@@ -226,17 +227,8 @@ ssize_t usys_read(int fd, void *buf, size_t len) {
 
   if (f->get_inode() && f->get_inode()->get_mode() == SHAOFS)
   {
-    log_info("read(fd: %d, len: %zu)", fd, len);
-    RuntimeFSBaseGuard g;
-
-    auto& cache = InodeCacheManager::instance();
-
-    int inum = f->get_inode()->get_inum();
-    MInode* inode_ptr = cache.get_or_create(inum);
-
-    size_t n = MIN(len, inode_ptr->disk_inode.file_size);
-    read_file(inode_ptr, 0, buf, n);
-    return static_cast<ssize_t>(n);
+    // log_info("read(fd: %d, len: %zu)", fd, len);
+    return my_read(f->get_inode()->get_inum(), buf, len);
   }
 
   Status<size_t> ret = f->Read(readable_span(buf, len), &f->get_off_ref());
@@ -261,18 +253,8 @@ ssize_t usys_write(int fd, const void *buf, size_t len) {
 
   if (f->get_inode() && f->get_inode()->get_mode() == SHAOFS)
   {
-    log_info("write(fd: %d, len: %zu)", fd, len);
-    RuntimeFSBaseGuard g;
-
-    auto& cache = InodeCacheManager::instance();
-
-    int inum = f->get_inode()->get_inum();
-    MInode* inode_ptr = get_inode(inum);
-
-    append_content(inode_ptr, buf, len);
-
-    release_inode(inode_ptr);
-    return len;
+    // log_info("write(fd: %d, len: %zu)", fd, len);
+    return my_write(f->get_inode()->get_inum(), buf, len);
   }
 
   Status<size_t> ret = f->Write(writable_span(buf, len), &f->get_off_ref());
@@ -284,6 +266,13 @@ ssize_t usys_pread64(int fd, void *buf, size_t len, off_t offset) {
   FileTable &ftbl = myproc().get_file_table();
   File *f = ftbl.Get(fd);
   if (unlikely(!f || !f->is_readable())) return -EBADF;
+
+  if (f->get_inode() && f->get_inode()->get_mode() == SHAOFS)    // 目前 pread 和 read 执行的是相同逻辑
+  {
+    // log_info("read(fd: %d, len: %zu)", fd, len);
+    return my_read(f->get_inode()->get_inum(), buf, len);
+  }
+
   Status<size_t> ret = f->Read(readable_span(buf, len), &offset);
   if (!ret) return MakeCError(ret);
   return static_cast<ssize_t>(*ret);
@@ -632,18 +621,18 @@ long usys_dup3(int oldfd, int newfd, int flags) {
 long usys_close(int fd) {
   FileTable &ftbl = myproc().get_file_table();
 
-  File *f = ftbl.Get(fd);
-  if (f->get_inode() && f->get_inode()->get_mode() == SHAOFS)
-  {
-    log_info("close(fd: %d)", fd);
-    RuntimeFSBaseGuard g;
+  // File *f = ftbl.Get(fd);
+  // if (f->get_inode() && f->get_inode()->get_mode() == SHAOFS)
+  // {
+    // log_info("close(fd: %d)", fd);
+    // RuntimeFSBaseGuard g;
     
-    auto& cache = InodeCacheManager::instance(); 
+    // auto& cache = InodeCacheManager::instance(); 
 
-    int inum = f->get_inode()->get_inum();
-    MInode* inode_ptr = cache.get_or_create(inum);  // 理论上应该是包命中的（避免增加 refcount）
-    release_inode(inode_ptr);
-  } 
+    // int inum = f->get_inode()->get_inum();
+    // MInode* inode_ptr = cache.get_or_create(inum);  // 理论上应该是包命中的（避免增加 refcount）
+    // release_inode(inode_ptr);
+  // } 
 
   if (!ftbl.Remove(fd)) return -EBADF;
   return 0;

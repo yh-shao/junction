@@ -1,6 +1,6 @@
 #pragma once
 
-#include "base.h"
+#include "fs.h"
 #include <cstdlib>
 #include <vector>
 
@@ -66,5 +66,3 @@ private:
     std::vector<char*>  free_list;         // 空闲块列表
     spinlock_t          mtx;
 };
-
-extern std::unique_ptr<BlockPool> tmp_block_pool;

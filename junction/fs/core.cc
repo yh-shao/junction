@@ -18,7 +18,7 @@ extern "C" {
 #include "junction/kernel/usys.h"
 #include "junction/snapshot/snapshot.h"
 
-#include "junction/fs/shaofs/base.h"
+#include "junction/fs/shaofs/fs.h"
 #include "junction/fs/shaofs/disk.h"
 #include "junction/fs/shaofs/dentry.h"
 #include "junction/fs/shaofs/file.h"
@@ -26,6 +26,7 @@ extern "C" {
 #include "junction/fs/shaofs/dentryCache.h"
 #include "junction/fs/shaofs/group.h"
 #include "junction/fs/shaofs/dsa.h"
+#include "junction/fs/shaofs/syscall.h"
 
 namespace junction {
 
@@ -414,6 +415,12 @@ long usys_mknodat(int dirfd, const char *pathname, mode_t mode, dev_t dev) {
 }
 
 long usys_mkdir(const char *pathname, mode_t mode) {
+  if (strncmp(pathname, MYPREFIX, MYPREFIX_LEN) == 0)
+  {
+    const char* realpath = pathname + MYPREFIX_LEN;
+    // log_info("[usys_mkdir(%s)] This is a shaofs path.", realpath);
+    return my_mkdir(realpath, mode);
+  }
   Status<Entry> entry = LookupEntry(myproc().get_fs(), pathname);
   if (!entry) return MakeCError(entry);
   Status<void> ret = MkDir(*entry, mode);
@@ -521,79 +528,26 @@ long usys_renameat2(int olddirfd, const char *oldpath, int newdirfd,
 long usys_openat(int dirfd, const char *pathname, int flags, mode_t mode) {
   if (strncmp(pathname, MYPREFIX, MYPREFIX_LEN) == 0)   // 判断 pathname 是否具有指定前缀（从而识别用的是 shaofs）
   {
-    RuntimeFSBaseGuard g;
-
     const char* realpath = pathname + MYPREFIX_LEN;  // 去除前缀，取出实际路径
     log_info("open(%s)", realpath);
 
-    IEntry* ent = new IEntry;
-    if (!ent)
+    int inum = my_open(realpath, flags, mode);
+    // log_info("opened file inum: %d", inum);
+    if (inum < 0)
     {
-      log_info("[openat()] ERROR: fail to new() IEntry");
+      log_info("[openat(%s)] This is a relative path (not supported currently).", realpath);
       return -1;
     }
 
-    if (realpath[0] == '/')    // 绝对路径
-    {
-      lookup(realpath, *ent);  // 解析该路径
-
-      int inum;
-      if (ent->code == 1)           // 部分匹配（可能是新建文件）
-      {
-        if (flags & kFlagCreate)   // 新建文件
-        {
-          log_info("creating new file: %s", ent->last_name);
-          MInode* newinode = create_file(ent->parent_ino, ent->last_name, REGULAR);
-
-          inum = newinode->inum;
-          release_inode(ent->parent_ino);
-          release_inode(newinode);  // 这个 ref 应当在 close() 中再释放？
-
-          auto& dentrycache = DentryCacheManager::instance();
-          dentrycache.put(realpath, inum);
-        }
-        else   // 路径错误 
-        {
-          log_info("[usys_openat] ERROR: illegal pathname %s", realpath);
-          release_inode(ent->parent_ino);
-          delete ent;
-          return -1;
-        }
-      }
-      else if (ent->code == -1)   // 路径错误
-      {
-        log_info("[usys_openat] ERROR: illegal pathname %s", realpath);
-        delete ent;
-        return -1;
-      }
-      else    // 完全匹配
-      {
-        // log_info("this file alreadly exists!");
-        inum = ent->ino->inum;
-        release_inode(ent->parent_ino);
-        release_inode(ent->ino);    // 这个 ref 应当在 close() 中再释放？
-        delete ent;
-      }
-
-      log_info("opened file inum: %d", inum);
-
-      // 成功获取到 Inode
-      Process &p = myproc();
-      FileTable &ftbl = p.get_file_table();
-
-      auto [opflag, fmode] = FromFlags(flags);
-      std::shared_ptr<Inode> myinode = std::make_shared<MyInode>(inum); 
-      // log_info("ino_num: %lu", myinode->get_inum());
-    
-      auto my_dentry = std::make_shared<junction::DirectoryEntry>("dummy_name", nullptr, myinode);
-      Status<std::shared_ptr<File>> f = std::make_shared<File>(FileType::kNormal, opflag, fmode, my_dentry);
-      return ftbl.Insert(std::move(*f), (flags & kFlagCloseExec) > 0);
-    }
-    else
-    {
-      log_info("[openat(%s)] This is a relative path.", realpath);
-      return -1;
-    }
+    Process &p = myproc();
+    FileTable &ftbl = p.get_file_table();
+    auto [opflag, fmode] = FromFlags(flags);
+    std::shared_ptr<Inode> myinode = std::make_shared<MyInode>(inum); 
+    // log_info("ino_num: %lu", myinode->get_inum());
+  
+    auto my_dentry = std::make_shared<junction::DirectoryEntry>("dummy_name", nullptr, myinode);
+    Status<std::shared_ptr<File>> f = std::make_shared<File>(FileType::kNormal, opflag, fmode, my_dentry);
+    return ftbl.Insert(std::move(*f), (flags & kFlagCloseExec) > 0);
   }
 
   Process &p = myproc();
@@ -1128,6 +1082,7 @@ ino_t AllocateInodeNumber() {
 Status<void> InitMyFs()
 {
   read_meta();
+  // init_meta();
   init_block_cache();
   init_inode_cache();
   init_dentryCache();

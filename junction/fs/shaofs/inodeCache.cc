@@ -1,6 +1,6 @@
 #include "inodeCache.h"
 #include "disk.h"
-#include "base.h"
+#include "fs.h"
 #include "file.h"
 #include "inode.h"
 #include "dentry.h"
@@ -129,30 +129,34 @@ void release_inode(MInode*& inode)     // 减少一个内存 inode 的引用
 {
     if (inode == nullptr) return;
 
-    SpinGuard g(&inode->lock);
-    inode->refcnt--;
-    // log_info("decrease ref count of inode [%d], current refcount: %d", inode->inum, inode->refcnt);
-    if (inode->refcnt)
-    {
-        inode = nullptr;
-        return;
-    }
-
-    // inode->refcnt == 0，下面判断是否删除该 inode&file
-
+    MInode* victim = nullptr;
     auto& cache = InodeCacheManager::instance();
-    if (inode->disk_inode.nlink != 0)
-    {    
-        cache.move_to_end(inode->inum);
-    }
-    else   // 硬链接为0，删除文件
+
     {
-        // log_info("inode[%d]: refcnt=0 and nlink=0. Deleting.", inode->inum);
-        truncate_inode_data_locked(inode, 0);
-        free_inum(inode->inum);
-        cache.erase(inode->inum);
-        delete inode;
+        SpinGuard g(&inode->lock);
+        inode->refcnt--;
+        // log_info("decrease ref count of inode [%d], current refcount: %d", inode->inum, inode->refcnt);
+        if (inode->refcnt)
+        {
+            inode = nullptr;
+            return;
+        }
+
+        // inode->refcnt == 0，下面判断是否删除该 inode&file
+        if (inode->disk_inode.nlink != 0)
+        {    
+            cache.move_to_end(inode->inum);
+        }
+        else   // 硬链接为0，删除文件
+        {
+            // log_info("inode[%d]: refcnt=0 and nlink=0. Deleting.", inode->inum);
+            truncate_inode_data_locked(inode, 0);
+            free_inum(inode->inum);
+            victim = cache.remove(inode->inum); // Remove from cache, but don't delete yet
+        }
     }
+
+    if (victim) delete victim;
 
     inode = nullptr;    // 将这个 inode pointer 置为 nullptr
 }

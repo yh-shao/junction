@@ -1,3 +1,4 @@
+#include "fs.h"
 #include "disk.h"
 #include "blockCache.h"
 #include "blockpool.h"

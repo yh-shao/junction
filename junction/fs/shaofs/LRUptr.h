@@ -5,7 +5,7 @@
 #include <memory>
 #include <functional>
 #include <thread>
-#include "base.h"
+#include "fs.h"
 
 #define DEFAULT_CACHE_SIZE  65536
 
@@ -99,6 +99,19 @@ public:
         return true;
     }
 
+    Entry* remove(const ID& key)
+    {
+        SpinGuard g(&mutex_);
+
+        auto it = map_.find(key);
+        if (it == map_.end()) return nullptr;
+
+        Entry* ptr = it->second.dataptr;
+        lru_list.erase(it->second.lru_pos);
+        map_.erase(it);
+        return ptr;
+    }
+
     void for_each_entry(std::function<void(Entry*)> func)
     {
         SpinGuard g(&mutex_);
@@ -173,6 +186,7 @@ public:
     Entry* get(const ID& key)           { return get_shard(key).get(key);           }
     Entry* get_or_create(const ID& key) { return get_shard(key).get_or_create(key); }
     bool erase(const ID& key)           { return get_shard(key).erase(key);         }
+    Entry* remove(const ID& key)        { return get_shard(key).remove(key);        }
     bool contains(const ID& key)        { return get_shard(key).contains(key);      }
     void move_to_end(const ID& key) { get_shard(key).move_to_end(key); }
     void for_each_entry(std::function<void(Entry*)> func) { for (auto& shard : shards) shard.for_each_entry(func); }

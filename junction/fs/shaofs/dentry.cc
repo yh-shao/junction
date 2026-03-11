@@ -62,30 +62,48 @@ int dir_lookup_locked(MInode* dir_inode, const char *name)    // 在 dir_inode �
     // thread_t *th = thread_self();
     // uint64_t before_dirlookup = thread_get_total_cycles(th) / cycles_per_us;
 
-    char* raw_buffer = new char[dir_inode->disk_inode.file_size];
-    Dirent* entries = reinterpret_cast<Dirent*>(raw_buffer);
-    if (!entries)
-    {
-        log_info("[dir_lookup(%d, %s)->new(%lu)] ERROR: fail to new", dir_inode->inum, name, dir_inode->disk_inode.file_size);
-        return -1;
-    }
+    // char* raw_buffer = new char[dir_inode->disk_inode.file_size];
+    // Dirent* entries = reinterpret_cast<Dirent*>(raw_buffer);
+    // if (!entries)
+    // {
+    //     log_info("[dir_lookup(%d, %s)->new(%lu)] ERROR: fail to new", dir_inode->inum, name, dir_inode->disk_inode.file_size);
+    //     return -1;
+    // }
 
-    read_full_file(dir_inode, entries);      // 好像多了一步从 cache 复制到 buffer 的操作
+    // read_full_file(dir_inode, entries);      // 好像多了一步从 cache 复制到 buffer 的操作
 
-    int entry_count = dir_inode->disk_inode.file_size / sizeof(Dirent), res = -1;
-    for (int i = 0; i < entry_count; i++)
-        if (strcmp(entries[i].name, name) == 0)
-        {
-            res = entries[i].inum;
-            break;
-        }
+    // int entry_count = dir_inode->disk_inode.file_size / sizeof(Dirent), res = -1;
+    // for (int i = 0; i < entry_count; i++)
+    //     if (strcmp(entries[i].name, name) == 0)
+    //     {
+    //         res = entries[i].inum;
+    //         break;
+    //     }
 
-    delete[] raw_buffer;
+    // delete[] raw_buffer;
 
-    // uint64_t after_dirlookup = thread_get_total_cycles(th) / cycles_per_us;
-    // log_info("dirlookup actual time: %lu us", after_dirlookup - before_dirlookup);
+    // // uint64_t after_dirlookup = thread_get_total_cycles(th) / cycles_per_us;
+    // // log_info("dirlookup actual time: %lu us", after_dirlookup - before_dirlookup);
     
-    return res;
+    // return res;
+
+    int found_inum = -1;
+
+    // Search block-by-block instead of reading full file
+    foreach_file_block(dir_inode, [&](char* data, size_t valid_len) -> bool {
+        size_t count = valid_len / sizeof(Dirent);
+        Dirent* entries = (Dirent*)data;
+        for (size_t i = 0; i < count; i++) 
+            if (strcmp(entries[i].name, name) == 0) 
+            {
+                found_inum = entries[i].inum;
+                return false; // Stop iteration
+            }
+
+        return true; // Continue
+    });
+    
+    return found_inum;
 }
 int dir_lookup(MInode* dir_inode, const char *name)
 {
@@ -139,7 +157,7 @@ void lookup(const char *pathname, IEntry& res)
         int target_inum = dir_lookup(current_inode, parts[i].c_str());
         if (target_inum == -1)  // 该目录下不存在 parts[i]
         {
-            log_info("not found in dir %d", current_inode->inum);
+            // log_info("not found in dir %d", current_inode->inum);
 
             if (i == parts.size() - 1)  // 仅是最后一个token不匹配（可能是新建文件）
             {
@@ -200,6 +218,7 @@ void delete_dentry(MInode*& dir_inode, char* name)
         return;
     }
 
+    /*
     uint64_t filesize = dir_inode->disk_inode.file_size;
 
     // Dirent* entries = (Dirent*)smalloc(filesize);
@@ -234,4 +253,69 @@ void delete_dentry(MInode*& dir_inode, char* name)
     delete[] raw_buffer;
 
     // log_info("delete_dentry(%d, %s) OVER", dir_inode->inum, name);
+    */
+
+
+    // Optimized delete: Find entry, Swap with Last, Truncate
+    uint64_t found_offset = 0;
+    uint64_t scan_offset = 0;
+    bool found = false;
+
+    foreach_file_block(dir_inode, [&](char* data, size_t valid_len) -> bool {
+        size_t count = valid_len / sizeof(Dirent);
+        Dirent* entries = (Dirent*)data;
+        for (size_t i = 0; i < count; i++) 
+            if (strcmp(entries[i].name, name) == 0) 
+            {
+                found_offset = scan_offset + i * sizeof(Dirent);
+                found = true;
+                return false;
+            }
+
+        scan_offset += BLOCK_SIZE;
+        return true;
+    });
+    
+    if (!found)
+    {
+        log_info("dir [%d] doesn't include name \"%s\"", dir_inode->inum, name);
+        return;
+    }
+
+    uint64_t file_size = dir_inode->disk_inode.file_size;
+    uint64_t last_offset = file_size - sizeof(Dirent);
+
+    if (found_offset != last_offset)
+    {
+        // Swap last entry to found position
+        Dirent last_entry;
+        read_file(dir_inode, last_offset, &last_entry, sizeof(Dirent));
+        write_file(dir_inode, found_offset, (char*)&last_entry, sizeof(Dirent));
+    }
+
+    // Truncate the file to remove the last entry
+    truncate_inode_data_locked(dir_inode, last_offset);
+    dir_inode->dirty = true;
+}
+
+// Helper to check if directory is empty (except . and ..)
+bool is_dir_empty(MInode* dir_inode) 
+{
+    if (dir_inode->disk_inode.file_size == 0) return true;
+    
+    char* raw_buffer = new char[dir_inode->disk_inode.file_size];
+    Dirent* entries = reinterpret_cast<Dirent*>(raw_buffer);
+    read_full_file(dir_inode, entries);
+    
+    int entry_count = dir_inode->disk_inode.file_size / sizeof(Dirent);
+    bool empty = true;
+    for (int i = 0; i < entry_count; i++) 
+        if (strcmp(entries[i].name, ".") != 0 && strcmp(entries[i].name, "..") != 0) 
+        {
+            empty = false;
+            break;
+        }
+
+    delete[] raw_buffer;
+    return empty;
 }

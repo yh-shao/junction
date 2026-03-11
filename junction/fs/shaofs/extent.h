@@ -1,6 +1,6 @@
 #pragma once
 
-#include "base.h"
+#include "fs.h"
 #include "disk.h"
 #include "inode.h"
 #include <vector>

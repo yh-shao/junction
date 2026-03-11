@@ -1,6 +1,6 @@
 #pragma once
 
-#include "base.h"
+#include "fs.h"
 #include "LRUptr.h"
 #include "inode.h"
 

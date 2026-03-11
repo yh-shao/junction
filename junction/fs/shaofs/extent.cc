@@ -197,6 +197,9 @@ static uint64_t alloc_extents_from_group(int gid, uint64_t cnt, std::vector<Exte
 
     // 因为 BMAPNUM_PERGROUP 一般为 1，所以直接读取一个 block 即可  （不过可能需要将代码写得更通用些，考虑到 BMAPNUM_PERGROUP 可能大于 1 的情况）
     BlockEntry* block = read_block(bm_start);
+
+    {
+    SpinGuard g(&block->mtx);
 	unsigned long* bm = reinterpret_cast<unsigned long*>(block->data);
 
 
@@ -212,16 +215,18 @@ static uint64_t alloc_extents_from_group(int gid, uint64_t cnt, std::vector<Exte
     // }
     // for (int j = 0; j < BMAPNUM_PERGROUP; j++) read_block(bm_start + j, bm + j * BLOCK_SIZE / sizeof(unsigned long));
     
-    if (bitmap_popcount(bm, DATABLOCKS_PERGROUP) == DATABLOCKS_PERGROUP) 
+    if (bitmap_popcount(bm, DATABLOCKS_PERGROUP) == DATABLOCKS_PERGROUP)  // 这个 group 已经没有空闲块了
     {
         // // sfree(bm);
         // delete[] raw_buffer;
         return 0;
     }
 
-    if (cnt > (uint64_t)DATABLOCKS_PERGROUP) cnt = DATABLOCKS_PERGROUP;
+    if (cnt > (uint64_t)DATABLOCKS_PERGROUP) cnt = DATABLOCKS_PERGROUP;   // 最多只能分配这么多块
 
-    uint64_t taken = 0, current_count = 0, startbit;
+    bool modified = false;
+
+    uint64_t taken = 0, current_count = 0, startbit;  // current_count 表示当前这个 extent 的长度（其中包含多少个空闲块）
     for (int i = 0; i < DATABLOCKS_PERGROUP; i++)
     {
         bool is_free = !bitmap_test(bm, i);
@@ -230,14 +235,15 @@ static uint64_t alloc_extents_from_group(int gid, uint64_t cnt, std::vector<Exte
             if (current_count == 0) startbit = i;  // 标记空闲区起始位
             current_count++;
         }
-        else if (!is_free && current_count == 0) continue;
+        else if (!is_free && current_count == 0) continue;  // 还没找到一个 extent 的开头
 
-        if ((taken + current_count == cnt) || (!is_free && current_count > 0)) 
+        if ((taken + current_count == cnt) || (!is_free && current_count > 0))  // 找到了一个 extent
         {
             res.push_back(Extent{ .physical_start = datablock_start + startbit, .block_count = current_count });
             bitmap_set_range(bm, startbit, current_count, 1);
             taken += current_count;
             current_count = 0;
+            modified = true;
             break;
         }
     }
@@ -247,12 +253,16 @@ static uint64_t alloc_extents_from_group(int gid, uint64_t cnt, std::vector<Exte
         res.push_back(Extent{ .physical_start = datablock_start + startbit, .block_count = current_count });
         bitmap_set_range(bm, startbit, current_count, 1);
         taken += current_count;
+        modified = true;
+    }
+
+    if (modified) block->dirty = true;
+    return taken;
     }
 
     // for (int j = 0; j < BMAPNUM_PERGROUP; j++) write_block(bm_start + j, bm + j * BLOCK_SIZE / sizeof(unsigned long));  // 其实可以优化为“只回写受影响块”（不过如果bitmap只有1块就无所谓了）
     // // sfree(bm);
     // delete[] raw_buffer;
-    return taken;
 }
 
 bool alloc_extents(uint64_t lba_count, std::vector<Extent> &res)    
@@ -262,6 +272,7 @@ bool alloc_extents(uint64_t lba_count, std::vector<Extent> &res)
 
     struct kthread *k = myk();
 	unsigned int coreid = k->curr_cpu;
+    if (core_to_group[coreid] == -1) set_newgroup(coreid);
 
     int loop = 0;
     uint64_t need = lba_count;
@@ -293,6 +304,8 @@ void free_oneextent(iExtent &e, uint64_t startblk)  // free_oneextent(e, 0) 即�
     
 
     BlockEntry* block = read_block(bm_start);
+    {
+    SpinGuard g(&block->mtx);
 	unsigned long* bm = reinterpret_cast<unsigned long*>(block->data);
 
     // // DEFINE_BITMAP(bm, BMAPNUM_PERGROUP * BLOCK_SIZE * 8);
@@ -309,10 +322,11 @@ void free_oneextent(iExtent &e, uint64_t startblk)  // free_oneextent(e, 0) 即�
 
     uint64_t bit_offset = start_to_free - datablock_start;
     bitmap_set_range(bm, bit_offset, count_to_free, 0);
+    block->dirty = true;
     // for (int j = 0; j < BMAPNUM_PERGROUP; j++) write_block(bm_start + j, (char*)bm + j * BLOCK_SIZE);  // 其实可以优化为“只回写受影响块”（不过如果bitmap只有1块就无所谓了）
 
     e.block_count = startblk;
-
+    }
     // sfree(bm);
     // delete[] raw_buffer;
     // log_info("free_oneextent() OVER");

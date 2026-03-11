@@ -1,6 +1,7 @@
 #pragma once
 
 extern "C" {
+#include "base/types.h"
 #include "base/lock.h"
 #include "base/log.h"
 #include "base/bitmap.h"
@@ -25,6 +26,8 @@ extern "C" {
 #ifndef ALIGN
 #define ALIGN(x, k) (((x) + (k) - 1) / (k) * (k))
 #endif
+
+typedef unsigned long* bitmap_t;
 
 struct SpinGuard 
 {

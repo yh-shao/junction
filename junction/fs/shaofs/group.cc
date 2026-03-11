@@ -1,5 +1,5 @@
 #include "group.h"
-#include "base.h"
+#include "fs.h"
 #include "disk.h"
 #include "blockCache.h"
 

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "base.h"
+#include "fs.h"
 // #include "LRU.h"
 #include "LRUptr.h"
 #include "blockpool.h"
@@ -37,11 +37,7 @@ void init_block_cache(size_t capacity = DEFAULT_CACHE_SIZE);
 // void read_block(BlockID lba, void* out_buf);
 BlockEntry* read_block(BlockID lba);
 void write_block(BlockID lba, const void* in_buf);
-// void flush_dirty_blocks();
-
-extern "C" {
-    void flush_dirty_blocks();
-}
+void flush_dirty_blocks();
 
 
 class LockedBlockHandle    // 封装对 Cache Block 的访问，自动管理锁的生命周期

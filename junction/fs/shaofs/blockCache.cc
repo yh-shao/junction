@@ -1,5 +1,5 @@
 #include "blockCache.h"
-#include "base.h"
+#include "fs.h"
 #include "disk.h"
 #include "blockpool.h"
 #include <vector>
@@ -10,7 +10,6 @@ extern "C" {
 }
 
 std::unique_ptr<BlockPool> block_pool;         // 供 blockcache 使用
-std::unique_ptr<BlockPool> tmp_block_pool;     // 供一般的 malloc(BLOCKSIZE) 使用  （定义在此文件中只是为了方便）
 
 void on_block_evict(const BlockID& lba, BlockEntry* block)   // 每次写1块到盘上好像有点慢？
 {
@@ -46,8 +45,6 @@ void init_block_cache(size_t capacity)
     auto& cache = BlockCacheManager::instance(capacity);
     cache.set_eviction_callback(on_block_evict);
     log_info("block cache initialized with %zu shards, each shard has %zu capacity, total capacity is %zu", cache.get_shard_count(), cache.get_shard_capacity(), cache.get_total_capacity());
-
-    tmp_block_pool = std::make_unique<BlockPool>(BLOCK_SIZE, 4096);
 }
 
 
