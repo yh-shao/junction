@@ -85,8 +85,8 @@ typedef struct {
 } DInode;     // disk inode
 
 extern SuperBlock sb;
-// extern bitmap_ptr_t imap;
-// extern bitmap_ptr_t gmap;
+extern bitmap_ptr_t imap;
+extern bitmap_ptr_t gmap;
 
 void init_meta();
 static inline bool USE_SHAOFS(const char *pathname) { return (strncmp(pathname, MYPREFIX, MYPREFIX_LEN) == 0); }

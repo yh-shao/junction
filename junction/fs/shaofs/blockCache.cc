@@ -20,7 +20,7 @@ void on_block_evict(const BlockID& lba, BlockEntry* block)   // 每次写1块到
         if (block->dirty) 
         {
             log_info("flushing block %d to the disk", block->lba);
-            writeObj(block->data, BLOCK_SIZE, lba, 1); 
+            storage_write_obj(block->data, BLOCK_SIZE, lba, 1); 
         }
     }
     
@@ -89,7 +89,7 @@ BlockEntry* read_block(BlockID lba)  // 读取某个 lba 中的数据（可能�
         if (!block->valid)
         {
             // log_info("read block %d from disk to blockcache", lba);
-            readObj(block->data, BLOCK_SIZE, lba, 1);
+            storage_read_obj(block->data, BLOCK_SIZE, lba, 1);
             // // storage_read(block->data, lba, 1);    
             // read_a_block_from_disk_to_blockcache(block->data, lba);
             block->dirty = false;

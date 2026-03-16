@@ -2,10 +2,10 @@
 #include "fs.h"
 #include <cstdint>
 
-DECLARE_BITMAP(imap, INODENUM);
-extern int imap_size;
+// DECLARE_BITMAP(imap, INODENUM);
+// extern int imap_size;
 
-DECLARE_BITMAP(gmap, BLOCK_SIZE * 8);
+// DECLARE_BITMAP(gmap, BLOCK_SIZE * 8);
 
 
 extern "C" {

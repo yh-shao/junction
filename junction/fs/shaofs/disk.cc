@@ -5,12 +5,12 @@
 // #include "dml_utili.h"
 #include "dsa.h"
 
-SuperBlock sb;
+// SuperBlock sb;
 
-DEFINE_BITMAP(imap, INODENUM);
-int imap_size = BITMAP_LONG_SIZE(INODENUM);
+// DEFINE_BITMAP(imap, INODENUM);
+// int imap_size = BITMAP_LONG_SIZE(INODENUM);
 
-DEFINE_BITMAP(gmap, BLOCK_SIZE * 8);
+// DEFINE_BITMAP(gmap, BLOCK_SIZE * 8);
 
 
 void read_bm(unsigned long* bm, u_int64_t nbits, BlockID blockstart, u_int64_t blockcount)  // 将盘上的 bitmap 存储到 bm 中（空间需提前申请）
@@ -22,30 +22,30 @@ void read_bm(unsigned long* bm, u_int64_t nbits, BlockID blockstart, u_int64_t b
 void write_bm(unsigned long* bm, u_int64_t nbits, BlockID blockstart, u_int64_t blockcount) // 将 bm 中的数据写入到盘上
 {
 	size_t bm_size = CEIL(nbits, 64) * sizeof(uint64_t);
-	writeObj(bm, bm_size, blockstart, blockcount);
+	storage_write_obj(bm, bm_size, blockstart, blockcount);
 }
 
 // TODO：将这些初始时读取的块放一起用 readv() 来读取，以减少 IO 命令的数目  （这些块目前是全局变量，不能 SPDK DMA，后面看咋办吧）
-void read_meta()
-{
-    log_info("Reading SuperBlock ...");
-	// readObj(&sb, sizeof(sb), 0, 1);
-    readObj_sync(&sb, sizeof(sb), 0, 1);
-    log_info("SuperBlock info:\nmagic_number: 0X%x\nblock_size: %u\ntotal_blocknum: %lu\ninode_size: %d\ninode_num: %d\nimap_blockstart: %lu\nimap_blocknum: %lu\nitable_blockstart: %lu\nitable_blocknum: %lu\nindirect_block_start: %lu\nindirect_block_num: %lu\ngroup_num: %d\ngmap_blockstart: %lu\ngmap_blocknum: %lu\nroot_inode: %d", sb.magic_number, sb.block_size, sb.total_blocknum, sb.inode_size, sb.inode_num, sb.imap_blockstart, sb.imap_blocknum, sb.itable_blockstart, sb.itable_blocknum, sb.indirect_block_start, sb.indirect_block_num, sb.group_num, sb.gmap_blockstart, sb.gmap_blocknum, sb.root_inode);
+// void read_meta()
+// {
+//     log_info("Reading SuperBlock ...");
+// 	// readObj(&sb, sizeof(sb), 0, 1);
+//     readObj_sync(&sb, sizeof(sb), 0, 1);
+//     log_info("SuperBlock info:\nmagic_number: 0X%x\nblock_size: %u\ntotal_blocknum: %lu\ninode_size: %d\ninode_num: %d\nimap_blockstart: %lu\nimap_blocknum: %lu\nitable_blockstart: %lu\nitable_blocknum: %lu\nindirect_block_start: %lu\nindirect_block_num: %lu\ngroup_num: %d\ngmap_blockstart: %lu\ngmap_blocknum: %lu\nroot_inode: %d", sb.magic_number, sb.block_size, sb.total_blocknum, sb.inode_size, sb.inode_num, sb.imap_blockstart, sb.imap_blocknum, sb.itable_blockstart, sb.itable_blocknum, sb.indirect_block_start, sb.indirect_block_num, sb.group_num, sb.gmap_blockstart, sb.gmap_blocknum, sb.root_inode);
     
-    log_info("Reading inode bitmap ...");
-    read_bm(imap, INODENUM, sb.imap_blockstart, sb.imap_blocknum);
-    for (int i = 0; i < INODENUM; i++)
-        if (bitmap_test(imap, i)) log_info("inode [%d] is used", i);
+//     log_info("Reading inode bitmap ...");
+//     read_bm(imap, INODENUM, sb.imap_blockstart, sb.imap_blocknum);
+//     for (int i = 0; i < INODENUM; i++)
+//         if (bitmap_test(imap, i)) log_info("inode [%d] is used", i);
     
-    log_info("Reading group bitmap ...");
-    read_bm(gmap, sb.group_num, sb.gmap_blockstart, sb.gmap_blocknum);
-    for (int i = 0; i < sb.group_num; i++)
-        if (bitmap_test(gmap, i)) log_info("group [%d] is used", i);
+//     log_info("Reading group bitmap ...");
+//     read_bm(gmap, sb.group_num, sb.gmap_blockstart, sb.gmap_blocknum);
+//     for (int i = 0; i < sb.group_num; i++)
+//         if (bitmap_test(gmap, i)) log_info("group [%d] is used", i);
 
-    barrier();
-    atomic64_write(&runtime_info->spdk_uipi, 1);   // 之后让 IOKernel 检查 SPDK 完成情况
-}
+//     barrier();
+//     atomic64_write(&runtime_info->spdk_uipi, 1);   // 之后让 IOKernel 检查 SPDK 完成情况
+// }
 
 uint64_t extent_size(const iExtent* ext) { return ext->block_count * BLOCK_SIZE; }
 
@@ -257,15 +257,15 @@ void test_write_disk()
 {
 	char str[] = "abcdefg";
 	uint64_t before_write = rdtsc();
-	writeObj(str, 8, 1000010, 1);
+	storage_write_obj(str, 8, 1000010, 1);
 	uint64_t after_write = rdtsc();
-	log_info("[writeObj] duration: %lu us", (after_write - before_write) / cycles_per_us);
+	log_info("[storage_write_obj] duration: %lu us", (after_write - before_write) / cycles_per_us);
 }
 void test_read_disk()
 {
 	char str[10];
 	uint64_t before_read = rdtsc();
-	readObj(str, 8, 1000010, 1);
+	storage_read_obj(str, 8, 1000010, 1);
 	uint64_t after_read = rdtsc();
-	log_info("[readObj] duration: %lu us", (after_read - before_read) / cycles_per_us);
+	log_info("[storage_read_obj] duration: %lu us", (after_read - before_read) / cycles_per_us);
 }

@@ -69,7 +69,7 @@ class LockedBlockHandle    // 封装对 Cache Block 的访问，自动管理锁�
         {
             if (block_->valid) return;
     
-            readObj(block_->data, BLOCK_SIZE, block_->lba, 1);   
+            storage_read_obj(block_->data, BLOCK_SIZE, block_->lba, 1);   
             block_->valid = true;
             block_->dirty = false;
         }

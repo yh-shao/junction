@@ -55,3 +55,8 @@ class RuntimeFSBaseGuard    // 切换到 runtime 的 fsbase，在析构时恢复
  private:
   uint64_t prev_fs_base_;
 };
+
+static inline int  atomic_read(volatile int* ptr)         { return __atomic_load_n   (ptr,    __ATOMIC_SEQ_CST); }
+static inline void atomic_write(volatile int* ptr, int x) {        __atomic_store_n  (ptr, x, __ATOMIC_SEQ_CST); }
+static inline int  atomic_inc(volatile int* ptr)          { return __atomic_add_fetch(ptr, 1, __ATOMIC_SEQ_CST); }
+static inline int  atomic_dec(volatile int* ptr)          { return __atomic_sub_fetch(ptr, 1, __ATOMIC_SEQ_CST); }

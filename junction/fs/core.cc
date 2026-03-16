@@ -27,6 +27,7 @@ extern "C" {
 #include "junction/fs/shaofs/group.h"
 #include "junction/fs/shaofs/dsa.h"
 #include "junction/fs/shaofs/syscall.h"
+#include "junction/fs/shaofs/blockCache2.h"
 
 namespace junction {
 
@@ -1081,9 +1082,9 @@ ino_t AllocateInodeNumber() {
 
 Status<void> InitMyFs()
 {
-  read_meta();
-  // init_meta();
+  init_meta();
   init_block_cache();
+  init_block_cache2();
   init_inode_cache();
   init_dentryCache();
   init_core_to_group();
