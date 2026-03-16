@@ -1,6 +1,6 @@
 #include "fs.h"
 #include "disk.h"
-#include "blockCache.h"
+#include "blockCache2.h"
 #include "blockpool.h"
 
 int alloc_inum()
@@ -35,8 +35,15 @@ void read_dinode_from_blockcache(int idx, DInode* dinode)    // 读取盘上第 
 	BlockID blockidx = sb.itable_blockstart + idx / INODENUM_PER_BLOCK;
 	int idx2 = idx % INODENUM_PER_BLOCK;
 
-	BlockEntry* block = read_block(blockidx);
-	*dinode = reinterpret_cast<DInode*>(block->data)[idx2];         // 考虑给 block cache 使用引用计数策略，防止在使用期间被 evict
+	BlockHandle handle = bc_get_handle(blockidx);
+    if (!handle) 
+    {
+        log_err("Error: Failed to get handle for inode block %lu", blockidx);
+        exit(1); // 发生严重 IO 错误或内存耗尽，保持原有的 fail-fast 语义
+    }
+
+	auto acc = handle.access();
+	*dinode = reinterpret_cast<DInode*>(acc->data)[idx2];         // 考虑给 block cache 使用引用计数策略，防止在使用期间被 evict
 
 	// log_info("read_dinode_from_blockcache(%d) done", idx);
 	// uint64_t after_readinode_tsc = rdtsc();
@@ -55,22 +62,21 @@ void write_dinode_to_blockcache(int idx, DInode* dinode)    // 将 dinode 的数
 	u_int64_t blockidx = sb.itable_blockstart + idx / INODENUM_PER_BLOCK;
     int idx2 = idx % INODENUM_PER_BLOCK;
 	
-	BlockEntry* block = read_block(blockidx);
-    DInode* inode_tbl = reinterpret_cast<DInode*>(block->data);
+	BlockHandle handle = bc_get_handle(blockidx);
+    if (!handle) 
+    {
+        log_err("Error: Failed to get handle for inode block %lu", blockidx);
+        return;
+    }
+
+	auto acc = handle.access();
+    DInode* inode_tbl = reinterpret_cast<DInode*>(acc->data);
     if (inode_tbl[idx2].idx != idx) 
     {
         log_info("Warning: overwriting mismatched inode (expected %d, got %d)", idx, inode_tbl[idx2].idx);
         return;
     }
 
-
-	{   // 直接修改 block cache 中的 block 内容
-		SpinGuard g(&block->mtx);
-		inode_tbl[idx2] = *dinode;    
-    	block->dirty = true;
-		block->valid = true;
-	}
-	
-	// uint64_t after_writeinode = rdtsc();
-	// log_info("[write_inode(%d)] duration: %lu us", idx, (after_writeinode - before_writeinode) / cycles_per_us);
+	inode_tbl[idx2] = *dinode;
+	acc.mark_dirty();
 }

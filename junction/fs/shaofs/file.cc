@@ -1,5 +1,5 @@
 #include "inodeCache.h"
-#include "blockCache.h"
+#include "blockCache2.h"
 #include "disk.h"
 #include "fs.h"
 #include "file.h"
@@ -14,8 +14,6 @@ int foreach_file_block(MInode* inode, BlockVisitor visitor)
 	std::vector<iExtent> exts;
     load_all_extents(inode->disk_inode, exts);
 
-	auto& cache = BlockCacheManager::instance();
-
 	uint64_t file_size = inode->disk_inode.file_size;
     if (file_size == 0) return 0;
 
@@ -25,12 +23,16 @@ int foreach_file_block(MInode* inode, BlockVisitor visitor)
 		BlockID lba = logicalidx_to_physicalLBA(inode, i, exts);
 		if (lba == 0) continue;   // 遇到 file hole，后面考虑如何处理（可能需要分配一个 block 给这个 hole），这里先跳过
 
-		BlockEntry* entry = cache.get_or_create(lba);
-		LockedBlockHandle handle(entry);
-		handle.ensure_data_valid();
-
+		BlockHandle handle = bc_get_handle(lba);
+        if (unlikely(!handle)) 
+        {
+            log_err("[foreach_file_block] FATAL: Failed to get handle for LBA %lu", lba);
+            return -1; // 向上层报告 IO 错误
+        }
 		size_t valid_len = MIN(BLOCK_SIZE, file_size - i * BLOCK_SIZE);
-		if (!visitor(handle.data(), valid_len)) break; 
+		auto acc = handle.access();
+		if (!visitor(acc->data, valid_len)) break;
+		// 如果 visitor 内部会修改 data 的内容，这里需要加上 acc.mark_dirty() 来标记脏数据，以确保修改会被写回磁盘
 	}
 
 	return 0;
@@ -365,7 +367,8 @@ void final_flush()
 	write_bm(imap, INODENUM,       sb.imap_blockstart, sb.imap_blocknum);
 	write_bm(gmap, BLOCK_SIZE * 8, sb.gmap_blockstart, sb.gmap_blocknum);
     flush_dirty_inodes();
-    flush_dirty_blocks();    // 需要放到最后
+    // flush_dirty_blocks();    // 需要放到最后
+	bc_flush_all();
 	// uint64_t after_flush = rdtsc();
 	// log_info("[flush] duration: %lu us", (after_flush - before_flush) / cycles_per_us);
 }

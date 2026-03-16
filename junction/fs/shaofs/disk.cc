@@ -1,6 +1,6 @@
 #include "disk.h"
 #include "fs.h"
-#include "blockCache.h"
+#include "blockCache2.h"
 #include "blockpool.h"
 // #include "dml_utili.h"
 #include "dsa.h"
@@ -118,99 +118,35 @@ void whattoread(uint64_t current_idx, uint64_t start_block_idx, uint64_t end_blo
 
 void read_extent(const iExtent *ext, uint64_t offset, char* buf, size_t size)
 {
-    // log_info("[read_extent()] START: reading extent[%lu, %lu), offset %lu, size %lu", ext->physical_start, ext->physical_start + ext->block_count, offset, size);
-
     if (ext == nullptr || ext->block_count == 0 || size == 0 || buf == NULL) return;
 
-    auto& cache = BlockCacheManager::instance();
     size_t taken_size = 0;       // 已经复制到 buf 中的字节数
 
     uint64_t start_block_idx = offset / BLOCK_SIZE;
     uint64_t   end_block_idx = (offset + size - 1) / BLOCK_SIZE;
 
-    uint64_t current_idx = start_block_idx;
-    while (current_idx <= end_block_idx)
+    for (uint64_t current_idx = start_block_idx; current_idx <= end_block_idx; current_idx++)
     {
         uint64_t current_lba = ext->physical_start + current_idx;
-        BlockEntry* block = cache.get_or_create(current_lba);
-		spin_lock(&block->mtx);
-        if (block->valid)    // Cache 命中
+
+        BlockHandle handle = bc_get_handle(current_lba);
+        if (!handle)
         {
-            size_t of, sz;
-            whattoread(current_idx, start_block_idx, end_block_idx, offset, size, of, sz);  // 计算需要拷贝的块的内容
-            if (sz > 0) memcpy(buf + taken_size, (char*)block->data + of, sz);
-            spin_unlock(&block->mtx);
-            // log_info("[read_extent()] ready to DSA");
-            // if (sz > 0) dsa_memcpy(buf + taken_size, (char*)block->data + of, sz);
-            // if (sz > 0) dsa_copy(buf + taken_size, (char*)block->data + of, sz);
-            taken_size += sz;
-            current_idx++; // 处理下一个 block
+            log_err("[read_extent] ERROR: Failed to get handle for LBA %lu. IO error or Cache Pool exhausted.", current_lba);
+            return; 
         }
-        else    // Cache 未命中
+
+        size_t of = 0, sz = 0;
+        whattoread(current_idx, start_block_idx, end_block_idx, offset, size, of, sz);
+        if (sz > 0) 
         {
-            // 我们在 current_idx 处发现了一个 invalid block，并且我们正持有它的锁。现在向后扫描，找到所有连续的 invalid block，并锁住它们。
-            std::vector<BlockEntry*> miss_run_blocks;
-            miss_run_blocks.push_back(block); // 第一个 miss 的块（已锁住）
-
-            uint64_t run_start_idx = current_idx;
-            uint64_t run_start_lba = current_lba;
-            uint32_t run_length = 1;
-
-            uint64_t scan_idx = current_idx + 1;
-            while (scan_idx <= end_block_idx)
-            {
-                uint64_t scan_lba = ext->physical_start + scan_idx;
-                BlockEntry* scan_block = cache.get_or_create(scan_lba);
-
-                spin_lock(&scan_block->mtx);
-                
-                if (scan_block->valid)  // 这是一个 valid block，"run" 在此结束
-                {
-                    spin_unlock(&scan_block->mtx);
-                    break;
-                }
-                
-                miss_run_blocks.push_back(scan_block);  // 这是一个 invalid block，将其添加到 run 中
-                run_length++;
-                scan_idx++;
-            }
-            // 此时，我们持有了 run 中所有 block 的锁
-            
-            int rc = read_blocks_from_disk(run_start_lba, run_length, (void**)miss_run_blocks.data());
-            if (rc != 0)
-            {
-                log_err("[read_extent()] Failed to read blocks from disk");
-                for (BlockEntry* b : miss_run_blocks) spin_unlock(&b->mtx);
-                return;
-            }
-
-            // 拷贝到用户 buf (我们仍持有锁)  (无需填充到 cache，因为是直接读到 cache 中的)
-            for (uint32_t k = 0; k < run_length; k++)
-            {
-                BlockEntry* block_to_fill = miss_run_blocks[k];
-                uint64_t block_idx_in_extent = run_start_idx + k;
-
-                block_to_fill->dirty = false;
-                block_to_fill->valid = true;
-
-                spin_unlock(&block_to_fill->mtx);
-
-                // 拷贝到用户 buf
-                size_t of, sz;
-                whattoread(block_idx_in_extent, start_block_idx, end_block_idx, offset, size, of, sz);
-                if (sz > 0) memcpy(buf + taken_size, (char*)block_to_fill->data + of, sz);
-                // log_info("[read_extent()] ready to DSA");
-                // if (sz > 0) dsa_memcpy(buf + taken_size, (char*)block_to_fill->data + of, sz);
-                // if (sz > 0) dsa_copy(buf + taken_size, (char*)block_to_fill->data + of, sz);
-                taken_size += sz;
-            }
-
-            current_idx += run_length;
-        } 
+            auto acc = handle.access(); 
+            memcpy(buf + taken_size, (char*)acc->data + of, sz);
+            // dsa_memcpy 优化可以在这里继续使用，替代 memcpy
+        }
+        taken_size += sz;
     }
 }
-
-
 
 void write_extent(const iExtent *ext, uint64_t offset, const void *data, size_t size)   // 从该 extent 的 offset（B）处起，写入 size 长度数据
 {
@@ -220,7 +156,6 @@ void write_extent(const iExtent *ext, uint64_t offset, const void *data, size_t 
         return;
     }
 
-    auto &cache = BlockCacheManager::instance();
     size_t written = 0;
 
 	uint64_t start_block_idx =  offset             / BLOCK_SIZE;     // 第一个字节所属的块
@@ -232,22 +167,34 @@ void write_extent(const iExtent *ext, uint64_t offset, const void *data, size_t 
         size_t of = 0, sz = BLOCK_SIZE;
 		whattoread(i, start_block_idx, end_block_idx, offset, size, of, sz);
         bool is_partial = !(of == 0 && sz == BLOCK_SIZE);   // 如果是部分写入，则需先读再写
-        BlockEntry* block = is_partial ? read_block(lba) : cache.get_or_create(lba);
-        
+        if (!is_partial)  // 如果是一整块的覆盖写，根本不需要从盘上把老数据读上来，直接调用 bc_write 将新数据扔进 Cache 并自动标脏
         {
-            SpinGuard g(&block->mtx);
             if (data == NULL)   // 若 data 为 NULL，则置 0    （考虑写盘时用 spdk_nvme_ns_cmd_write_zeroes 来优化，如果是写内存cache，好像不行）
-			{
-				memset(block->data + of, 0, sz);
-			}
-			else
-			{
-				memcpy(block->data + of, (char*)data + written, sz);
-			}		
-            block->valid = true;
-            block->dirty = true;
+            {
+                char zero_buf[BLOCK_SIZE] = {0};
+                bc_write(lba, zero_buf);
+            } 
+            else 
+            {
+                bc_write(lba, (const char*)data + written);
+            }
         }
+        else
+        {
+            BlockHandle handle = bc_get_handle(lba);
+            if (!handle) 
+            {
+                log_err("[write_extent] ERROR: Failed to get handle for LBA %lu", lba);
+                return;
+            }
 
+            auto acc = handle.access();
+            if (data == NULL)   
+                memset((char*)acc->data + of, 0, sz);
+            else
+                memcpy((char*)acc->data + of, (const char*)data + written, sz);    
+            acc.mark_dirty();
+        }
         written += sz;
 	}
 }
