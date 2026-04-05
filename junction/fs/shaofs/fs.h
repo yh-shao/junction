@@ -6,8 +6,9 @@
 #define MYPREFIX_LEN            (sizeof(MYPREFIX) - 1)   // 不包括末尾的 \0，值为 6
 
 #define BLOCK_SIZE              4096
-typedef uint64_t BlockID;
 struct BlockData { char data[BLOCK_SIZE]; };
+typedef uint64_t BlockID;
+#define INVALID_BLOCK_ID ((BlockID)-1)
 
 #define INODENUM                32768               // 所能创建的文件数目
 #define INODE_SIZE              sizeof(DInode)      // 每个 inode 占用的字节数（目前设置为 256B）
@@ -22,9 +23,8 @@ struct BlockData { char data[BLOCK_SIZE]; };
 #define ROOT_INO                0                   // 根结点对应的 inode
 
 #define DIRECT_EXTENT_NUM       6                   // 每个 inode 中的 direct extent 数目
-#define DEFAULT_EXTENT_LENGTH   10                  // extent 的默认长度（包含多少个块）
+#define DEFAULT_EXTENT_LENGTH   10                  // 为目录文件预分配的块数
 
-#define GROUPNUM                32768               // 盘上的块分为多少个 group
 #define BMAPNUM_PERGROUP        1                   // 每个 group 中 bitmap 占多少个块
 #define DATABLOCKS_PERGROUP     (BMAPNUM_PERGROUP * BLOCK_SIZE * 8)  // 4096*8=32768
 #define TOTALBLOCKS_PERGROUP    (BMAPNUM_PERGROUP + DATABLOCKS_PERGROUP) 
@@ -37,27 +37,37 @@ typedef enum {
 } file_type_t;
 
 typedef struct {
-	uint32_t       magic_number;                 // FSMAGIC=0x0517junction/fs/shaofs
-	uint32_t       block_size;                   // 每块（LBA）的大小（B）
+    uint32_t       magic_number;                 // FSMAGIC=0x0517
+    uint32_t       block_size;                   // 每块（LBA）的大小（B）
     uint64_t       total_blocknum;               // 总块数
-	int            inode_size;                   // inode 大小
-	int            inode_num;                    // inode 数目
+    uint32_t       inode_size;                   // inode 大小
+    uint32_t       inode_num;                    // inode 数目
 
-	BlockID        imap_blockstart;              // inode bitmap 起始块
-	uint64_t       imap_blocknum;                // inode bitmap 占用的块数
+    BlockID        imap_blockstart;              // inode bitmap 起始块
+    uint64_t       imap_blocknum;                // inode bitmap 占用的块数
 
-	BlockID        itable_blockstart;            // inode table 起始块
-	uint64_t       itable_blocknum;              // inode table 占用的块数
+    BlockID        itable_blockstart;            // inode table 起始块
+    uint64_t       itable_blocknum;              // inode table 占用的块数
 
-	BlockID        indirect_block_start;         // 第一个 indirect extent block
-	uint64_t       indirect_block_num;           // 等于 inode_num
+    BlockID        indirect_block_start;         // 第一个 indirect extent block
+    uint64_t       indirect_block_num;           // 等于 inode_num
 
-	int            group_num;                    // group 数目
-	BlockID        gmap_blockstart;              // group bitmap 起始块
-	uint64_t       gmap_blocknum;                // group bitmap 占用的块数（很难不是1）
+    uint32_t       group_num;                    // group 数目
+    BlockID        gdt_blockstart;               // group descriptor table 起始块
+    uint64_t       gdt_blocknum;                 // group descriptor table 占用的块数
 
-	int            root_inode;                   // root 目录对应的 inode 号
+    BlockID        group_blockstart;             // 第一个 group 的起始块（它的 bitmap）
+
+    uint32_t       root_inode;                   // root 目录对应的 inode 号
 } SuperBlock;
+
+typedef struct {
+    uint32_t free_blocks_count; // 该组中当前空闲的数据块总数
+    uint32_t next_free_hint;    // 下一个可用空闲块的相对索引（加速查找）
+    uint32_t flags;             // 状态标志位
+    uint32_t pad1;              
+    uint64_t pad2[2];          
+} GroupDescriptor;
 
 typedef struct {
     BlockID physical_start;
@@ -67,6 +77,8 @@ typedef struct {
 	BlockID logical_start, physical_start;
     uint64_t block_count;
 } iExtent;    // in-inode extent
+static inline uint64_t extent_size(const iExtent* ext) { return ext->block_count * BLOCK_SIZE; }
+#define EXTENTS_PER_BLOCK (BLOCK_SIZE / sizeof(iExtent))
 
 typedef struct {
 	int         idx;
@@ -82,7 +94,7 @@ typedef struct {
 	uint64_t    mtime;                              // 修改时间
 	uint64_t    atime;                              // 访问时间
 	char        pad[56];
-} DInode;     // disk inode
+} DInode;     // disk inode (256B)
 
 extern SuperBlock sb;
 extern bitmap_ptr_t imap;

@@ -40,19 +40,17 @@ add_library(fs
   stdiofile.cc
 
   shaofs/fs.cc
-  shaofs/disk.cc
   shaofs/group.cc
   shaofs/blockCache.cc
-  shaofs/blockCache2.cc
   shaofs/file.cc
-  shaofs/dentry.cc
   shaofs/inode.cc
   shaofs/inodeCache.cc
   shaofs/dentryCache.cc
   shaofs/extent.cc
   shaofs/dsa.cc
   shaofs/syscall.cc
-  shaofs/backend.cc
+  shaofs/namei.cc
+  shaofs/dir.cc
 )
 
 target_include_directories(fs PRIVATE ${DML_INCLUDE_DIR})   # 添加头文件包含路径

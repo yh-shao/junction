@@ -26,7 +26,6 @@ extern "C" {
 #include "junction/fs/shaofs/fs.h"
 #include "junction/fs/shaofs/inodeCache.h"
 #include "junction/fs/shaofs/file.h"
-#include "junction/fs/shaofs/disk.h"
 #include "junction/fs/shaofs/blockCache.h"
 #include "junction/fs/shaofs/syscall.h"
 
@@ -228,7 +227,7 @@ ssize_t usys_read(int fd, void *buf, size_t len) {
   if (f->get_inode() && f->get_inode()->get_mode() == SHAOFS)
   {
     // log_info("read(fd: %d, len: %zu)", fd, len);
-    return my_read(f->get_inode()->get_inum(), buf, len);
+    return my_read(f->get_inode()->get_inum(), buf, &f->get_off_ref(), len, false);
   }
 
   Status<size_t> ret = f->Read(readable_span(buf, len), &f->get_off_ref());
@@ -254,7 +253,9 @@ ssize_t usys_write(int fd, const void *buf, size_t len) {
   if (f->get_inode() && f->get_inode()->get_mode() == SHAOFS)
   {
     // log_info("write(fd: %d, len: %zu)", fd, len);
-    return my_write(f->get_inode()->get_inum(), buf, len);
+    int inum = f->get_inode()->get_inum();
+    if (f->get_flags() & O_APPEND) f->get_off_ref() = my_lseek(inum, 0, SEEK_END, 0);  // 指针移动到末尾（这里 old_offset 可以忽略）
+    return my_write(inum, buf, &f->get_off_ref(), len, false);
   }
 
   Status<size_t> ret = f->Write(writable_span(buf, len), &f->get_off_ref());
@@ -267,10 +268,10 @@ ssize_t usys_pread64(int fd, void *buf, size_t len, off_t offset) {
   File *f = ftbl.Get(fd);
   if (unlikely(!f || !f->is_readable())) return -EBADF;
 
-  if (f->get_inode() && f->get_inode()->get_mode() == SHAOFS)    // 目前 pread 和 read 执行的是相同逻辑
+  if (f->get_inode() && f->get_inode()->get_mode() == SHAOFS)
   {
     // log_info("read(fd: %d, len: %zu)", fd, len);
-    return my_read(f->get_inode()->get_inum(), buf, len);
+    return my_read(f->get_inode()->get_inum(), buf, &offset, len, false);
   }
 
   Status<size_t> ret = f->Read(readable_span(buf, len), &offset);
@@ -548,6 +549,13 @@ ssize_t usys_pwrite64(int fd, const void *buf, size_t len, off_t offset) {
   FileTable &ftbl = myproc().get_file_table();
   File *f = ftbl.Get(fd);
   if (unlikely(!f || !f->is_writeable())) return -EBADF;
+
+  if (f->get_inode() && f->get_inode()->get_mode() == SHAOFS)
+  {
+    // log_info("read(fd: %d, len: %zu)", fd, len);
+    return my_write(f->get_inode()->get_inum(), buf, &offset, len, false);
+  }
+
   Status<size_t> ret = f->Write(writable_span(buf, len), &offset);
   if (!ret) return MakeCError(ret);
   return static_cast<ssize_t>(*ret);
@@ -576,6 +584,12 @@ off_t usys_lseek(int fd, off_t offset, int whence) {
   FileTable &ftbl = myproc().get_file_table();
   File *f = ftbl.Get(fd);
   if (unlikely(!f)) return -EBADF;
+  if (f->get_inode() && f->get_inode()->get_mode() == SHAOFS)
+  {
+    off_t new_off = my_lseek(f->get_inode()->get_inum(), offset, whence, f->get_off_ref());
+    f->get_off_ref() = new_off;
+    return new_off;
+  }
   Status<off_t> ret = f->Seek(offset, static_cast<SeekFrom>(whence));
   if (!ret) return MakeCError(ret);
   f->get_off_ref() = *ret;

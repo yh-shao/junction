@@ -915,6 +915,7 @@ class Process : public std::enable_shared_from_this<Process> {
         LOG(ERR) << "failed to allocate caladan thread";
         return;
       }
+      LOG(INFO) << "[load_and_construct()] created thread " << th;
 
       pid_t tid;
       ar(tid);

@@ -19,15 +19,13 @@ extern "C" {
 #include "junction/snapshot/snapshot.h"
 
 #include "junction/fs/shaofs/fs.h"
-#include "junction/fs/shaofs/disk.h"
-#include "junction/fs/shaofs/dentry.h"
 #include "junction/fs/shaofs/file.h"
-#include "junction/fs/shaofs/blockCache.h"
 #include "junction/fs/shaofs/dentryCache.h"
 #include "junction/fs/shaofs/group.h"
 #include "junction/fs/shaofs/dsa.h"
 #include "junction/fs/shaofs/syscall.h"
-#include "junction/fs/shaofs/blockCache2.h"
+#include "junction/fs/shaofs/blockCache.h"
+#include "junction/fs/shaofs/inodeCache.h"
 
 namespace junction {
 
@@ -530,8 +528,6 @@ long usys_openat(int dirfd, const char *pathname, int flags, mode_t mode) {
   if (strncmp(pathname, MYPREFIX, MYPREFIX_LEN) == 0)   // 判断 pathname 是否具有指定前缀（从而识别用的是 shaofs）
   {
     const char* realpath = pathname + MYPREFIX_LEN;  // 去除前缀，取出实际路径
-    log_info("open(%s)", realpath);
-
     int inum = my_open(realpath, flags, mode);
     // log_info("opened file inum: %d", inum);
     if (inum < 0)
@@ -548,6 +544,7 @@ long usys_openat(int dirfd, const char *pathname, int flags, mode_t mode) {
   
     auto my_dentry = std::make_shared<junction::DirectoryEntry>("dummy_name", nullptr, myinode);
     Status<std::shared_ptr<File>> f = std::make_shared<File>(FileType::kNormal, opflag, fmode, my_dentry);
+    if (flags & kFlagAppend) (*f)->get_off_ref() = my_lseek(inum, 0, SEEK_END, 0);   // 此处 old_offset 可以忽略
     return ftbl.Insert(std::move(*f), (flags & kFlagCloseExec) > 0);
   }
 
@@ -1084,10 +1081,8 @@ Status<void> InitMyFs()
 {
   init_meta();
   init_block_cache();
-  init_block_cache2();
   init_inode_cache();
-  init_dentryCache();
-  init_core_to_group();
+  init_dentry_cache();
   prewarm_dsa_driver();  // 预热 DSA 驱动
 
   // TODO: 

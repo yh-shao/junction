@@ -2,9 +2,26 @@
 #include "fs.h"
 
 extern int core_to_group[];
+struct alignas(64) GroupDescExt {
+    spinlock_t lock;
+    uint32_t   free_blocks_count;   // 当前空闲数据块数
+    uint32_t   next_free_hint;      // 记录上次分配到的位置
+    uint32_t   flags;               // 状态标志位
 
-void init_core_to_group();
-bool groupValid(unsigned int coreid);
+    BlockID    bitmap_lba;                   // 该 group 的 bitmap 起始块
+    BlockID    data_start_lba;               // 该 group 的第一个数据块
+    uint32_t   group_id;                     // group 编号，便于调试
+    uint32_t   reserved;                     // 补齐/保留
+    GroupDescExt() : free_blocks_count(0), next_free_hint(0), flags(0), bitmap_lba(0), data_start_lba(0), group_id(0), reserved(0) { spin_lock_init(&lock); }  // 初始值
+};
+extern GroupDescExt* group_info;
+
+void init_group();
 bool set_newgroup(unsigned int coreid);
 void get_group_by_gid(int groupid, BlockID* bitmap, BlockID* datablock_start);
 void get_group_by_blkid(BlockID blk, int* groupid, BlockID* bitmap, BlockID* datablock_start);
+bool is_datablock(BlockID block_id);
+
+BlockID alloc_block();
+void free_block(BlockID blk);
+void sync_all_gdt();

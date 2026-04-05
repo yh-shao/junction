@@ -1,81 +1,49 @@
 #pragma once
-
 #include "fs.h"
-// #include "LRU.h"
-#include "LRUptr.h"
-#include "blockpool.h"
-#include "disk.h"
+#include "generic_cache/objpool.h"
+#include "generic_cache/backend.h"
+#include "generic_cache/replace_policy.h"
+#include "generic_cache/sharded_cache.h"
+extern "C" {
+#include "runtime/storage.h"
+}
 
-extern std::unique_ptr<BlockPool> block_pool;
-
-struct BlockEntry
-{
-    BlockID     lba;
-    char*       data;
-    bool        valid;    // 是否从盘上读取了数据
-    bool        dirty;    // 是否需要写回磁盘
-    spinlock_t  mtx;
-
-    // BlockEntry() = default;
-    BlockEntry(BlockID lba) : lba(lba), data(block_pool->alloc_block()), dirty(false), valid(false) 
+class NVMeSSD : public Backend<BlockID, BlockData> {
+public:
+    bool read(const BlockID& key, BlockData& value)
     {
-        if (!data) 
-        { 
-            log_info("[create BlockEntry] ERROR: block pool exhausted");
-            throw std::bad_alloc();
-        }
-        mtx.locked = 0;
-        // log_info("BlockEntry created for lba %d", lba);
+        int ret = storage_read(static_cast<void*>(value.data), key, 1);
+        return (ret == 0);
     }
+    bool write(const BlockID& key, BlockData const& value)
+    {
+        int ret = storage_write(static_cast<const void*>(value.data), key, 1);
+        // log_info("write to block %lu", key);
+        return (ret == 0);
+    }
+
+    static NVMeSSD& getInstance()   // singleton，全局只有 1 个 NVMeSSD 实例
+    {
+        static NVMeSSD instance;
+        return instance;
+    }
+    NVMeSSD(const NVMeSSD&) = delete;
+    void operator=(const NVMeSSD&) = delete;
+private:
+    NVMeSSD() = default;
 };
 
+#define DEFAULT_BLOCKCACHE_CAPACITY 65536    // 默认 BlockCache 容量（单位：块数），即 256MB（65536 * 4096 Bytes）。可以通过 init_block_cache() 的参数调整。
+#define DEFAULT_SHARD_NUM           32       // 默认分片数量，可以通过 init_block_cache() 的参数调整。每个分片的容量 = capacity / shard_num。
 
-using BlockCacheManager = ShardedLRUPtrSingleton<BlockID, BlockEntry>;
+using GlobalBlockCache = ShardedCache<BlockID, BlockData>;
+GlobalBlockCache& get_block_cache();
+void init_block_cache(size_t capacity = DEFAULT_BLOCKCACHE_CAPACITY, size_t shard_num = DEFAULT_SHARD_NUM);
 
+bool bc_read(BlockID id, void* buffer);         // 从 BlockCache 读取一个 Block 到 user buffer（大小为 BLOCK_SIZE），存在 memcpy
+void bc_write(BlockID id, const void* buffer);  // 将 user buffer 中的数据写入 cache 并标记 dirty，存在 memcpy
+void bc_flush_all();                            // 将 cache 中所有脏数据刷回后端存储
+void bc_prefetch(BlockID id);                   // 拉取块数据到内存
 
-void init_block_cache(size_t capacity = DEFAULT_CACHE_SIZE);
-// void read_block(BlockID lba, void* out_buf);
-BlockEntry* read_block(BlockID lba);
-void write_block(BlockID lba, const void* in_buf);
-void flush_dirty_blocks();
-
-
-class LockedBlockHandle    // 封装对 Cache Block 的访问，自动管理锁的生命周期
-{   
-    public:
-        LockedBlockHandle(BlockEntry* block)  // block 必须非空
-        {
-            if (!block)
-            {
-                log_info("LockedBlockHandle: block is nullptr!");
-                throw std::invalid_argument("LockedBlockHandle: block is nullptr!");
-            }
-
-            block_ = block;
-            spin_lock(&block_->mtx);
-        }
-    
-        ~LockedBlockHandle() 
-        {
-            spin_unlock(&block_->mtx);
-        }
-    
-        // 禁止拷贝，只能移动
-        LockedBlockHandle(const LockedBlockHandle&) = delete;
-        LockedBlockHandle(LockedBlockHandle&& other) : block_(other.block_) { other.block_ = nullptr; }
-    
-        
-        void ensure_data_valid()    // 核心逻辑：确保数据有效（如果 Cache Miss 则读盘）
-        {
-            if (block_->valid) return;
-    
-            storage_read_obj(block_->data, BLOCK_SIZE, block_->lba, 1);   
-            block_->valid = true;
-            block_->dirty = false;
-        }
-    
-        char* data() const { return block_->data; }
-    
-    private:
-        BlockEntry* block_;
-    };
+using BlockHandle = GlobalBlockCache::Handle;
+BlockHandle bc_get_handle(BlockID id);          // 获取 Block 的 handle，用于直接操作 BlockCache 中的数据，无需 memcpy（注意：通过 handle 修改数据后需要调用 handle.access().mark_dirty() 来标记脏数据）

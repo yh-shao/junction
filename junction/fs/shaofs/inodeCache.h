@@ -1,20 +1,66 @@
 #pragma once
-
 #include "fs.h"
-#include "LRUptr.h"
+#include "generic_cache/sharded_cache.h"
+#include "generic_cache/backend.h"
 #include "inode.h"
+#include "blockCache.h"
 
-using InodeCacheManager = ShardedLRUPtrSingleton<int, MInode>;
+#define DEFAULT_INODECACHE_CAPACITY 8192
+#define DEFAULT_INODE_SHARD_NUM     16
+
+class InodeBackend : public Backend<int, MInode> {
+public:
+    bool read(const int& inum, MInode& value)
+    {
+        BlockID blockidx = sb.itable_blockstart + inum / INODENUM_PER_BLOCK;
+        int offset = inum % INODENUM_PER_BLOCK;
+
+        BlockHandle handle = bc_get_handle(blockidx);
+        if (!handle) return false;
+
+        auto acc = handle.read_access();
+        const DInode* inode_tbl = reinterpret_cast<const DInode*>(acc->data);
+        value = inode_tbl[offset];
+        return true;
+    }
+
+    bool write(const int& inum, const MInode& value)
+    {
+        BlockID blockidx = sb.itable_blockstart + inum / INODENUM_PER_BLOCK;
+        int offset = inum % INODENUM_PER_BLOCK;
+
+        BlockHandle handle = bc_get_handle(blockidx);
+        if (!handle) return false;
+
+        auto acc = handle.write_access();
+        DInode* inode_tbl = reinterpret_cast<DInode*>(acc->data);
+        inode_tbl[offset] = value;
+        acc.mark_dirty();  
+        // log_info("written Inode %d to Block %lu", inum, blockidx);
+        return true;
+    }
+
+    static InodeBackend& getInstance() 
+    {
+        static InodeBackend instance;
+        return instance;
+    }
+
+    InodeBackend(const InodeBackend&) = delete;
+    void operator=(const InodeBackend&) = delete;
+private:
+    InodeBackend() = default;
+};
 
 
-int alloc_inode(file_type_t type, MInode*& inode, int inum = -1);
+using GlobalInodeCache = ShardedCache<int, MInode>;
+GlobalInodeCache& get_inode_cache();
+void init_inode_cache(size_t capacity = DEFAULT_INODECACHE_CAPACITY, size_t shard_num = DEFAULT_INODE_SHARD_NUM);
 
-void init_inode_cache(size_t capacity = DEFAULT_CACHE_SIZE);
-MInode* get_inode(int inum);
-void mark_inode_dirty(MInode* inode);
-void ref_inode(MInode* inode);
-void release_inode(MInode*& inode);
-void unlink_inode(MInode* dirinode, char *name, MInode* inode);
-void flush_inode(MInode* inode);
-void flush_dirty_inodes();
-void print_inode(MInode *inode);
+using InodeHandle = GlobalInodeCache::Handle;
+InodeHandle ic_alloc_inode(file_type_t type, int inum = -1);
+InodeHandle ic_get_inode(int inum);
+void ic_flush_all();
+bool ic_free_inode(int inum);
+
+void print_inode_info(int inum);

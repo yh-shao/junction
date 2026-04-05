@@ -1,368 +1,189 @@
-#include "disk.h"
 #include "extent.h"
-#include "blockCache2.h"
+#include "blockCache.h"
 #include "group.h"
 #include "inode.h"
 #include <vector>
 #include <algorithm>
+#include "inodeCache.h"
 
 extern "C" {
 #include "../runtime/defs.h"
 }
 
-BlockID logicalidx_to_physicalLBA(MInode* inode, BlockID logical_idx, const std::vector<iExtent>& exts)
+#define MAX_EXTENTS  (DIRECT_EXTENT_NUM + EXTENTS_PER_BLOCK + 1)
+
+int get_valid_extent_count(const iExtent* extents, int max_count) 
 {
-    for (const auto& e : exts) 
+    int count = 0;
+    while (count < max_count && extents[count].block_count > 0) count++;
+    return count;
+}
+BlockID lookup_extent(const iExtent* extents, int valid_count, BlockID logical_blk)   // 在有序的 Extent 数组中进行二分查找，若找到，则直接返回物理块号
+{
+    int left = 0, right = valid_count - 1;
+    while (left <= right) 
     {
-        if (logical_idx >= e.logical_start && logical_idx < e.logical_start + e.block_count) 
-            return e.physical_start + (logical_idx - e.logical_start);
+        int mid = left + (right - left) / 2;
+        const auto& ext = extents[mid];
+
+        if (logical_blk < ext.logical_start) 
+            right = mid - 1;
+        else if (logical_blk >= ext.logical_start + ext.block_count) 
+            left = mid + 1;
+        else   // 命中
+            return ext.physical_start + (logical_blk - ext.logical_start);  
     }
-    return 0;   // 未找到，返回 0  （file hole，后面考虑怎么处理）
+    return INVALID_BLOCK_ID;
 }
 
-void load_all_extents(DInode &di, std::vector<iExtent> &out)   // 将该 inode 拥有的 iextent 都读取出来（应该是已经“规范化”了，有序+无法再合并）
+int compact_extents_inplace(iExtent* exts, int count)   // 就地排序 + 合并相邻 extent，返回合并后的数量（无需堆分配）
 {
-    // log_info("load_all_extents() START");
-    // log_info("current fsbase: 0x%lx, runtime fsbase: 0x%lx", _readfsbase_u64(), perthread_read(runtime_fsbase));
+    if (count <= 0) return 0;
 
-	out.clear();
-	for (int i = 0; i < DIRECT_EXTENT_NUM; i++) 
-	{
-        const iExtent &e = di.direct_extents[i];
-        if (e.block_count == 0) break;        // 遇到 iExtent{0,0,0}（结束标记）即退出
-        out.push_back(e);
-    }
+    std::sort(exts, exts + count, [](const iExtent& a, const iExtent& b) { return a.logical_start < b.logical_start; });   // 强制按逻辑起始块号排序
 
-    BlockHandle handle = bc_get_handle(di.indirect_extent_block);
-    if (!handle) 
+    int write_pos = 0;  // 合并后写入的位置
+    for (int i = 1; i < count; i++)
     {
-        log_err("[load_all_extents] ERROR: Failed to get handle for indirect block %lu", di.indirect_extent_block);
-        return;
+        iExtent& last = exts[write_pos];
+        const iExtent& cur = exts[i];
+        if (last.logical_start + last.block_count == cur.logical_start && last.physical_start + last.block_count == cur.physical_start)
+            last.block_count += cur.block_count;   // merge
+        else
+            exts[++write_pos] = cur;               // 无法 merge，保留为独立 extent
     }
-	auto acc = handle.access();
-    iExtent* exts = reinterpret_cast<iExtent*>(acc->data);
-	const size_t cap = BLOCK_SIZE / sizeof(iExtent);
-	for (int i = 0; i < cap; i++)
-	{
-		if (exts[i].block_count == 0) break;   // 遇到 iExtent{0,0,0}（结束标记）即退出
-		out.push_back(exts[i]);
-	}
-
-    // log_info("load_all_extents() OVER");
+    return write_pos + 1;
 }
-void normalize_extent(std::vector<iExtent> &exts) 
+
+// 约定：调用此函数前，caller 必须持有该 inode 的读锁（无需allocate）或写锁（需要allocate）
+BlockID inode_bmap_locked(DInode* inode_ptr, int inum, BlockID logical_blk, bool allocate, bool* is_new) 
 {
-    if (exts.empty()) return;
+    if (is_new) *is_new = false; // 默认初始化为老块（并非新分配的块）
 
-    std::sort(exts.begin(), exts.end(), [](auto &a, auto &b){ return a.logical_start < b.logical_start; });
-    exts.erase(std::remove_if(exts.begin(), exts.end(), [](const iExtent &e) { return e.block_count == 0; }), exts.end());
+    // Fast Path: 尝试在 Direct Extents 中直接命中
+    int direct_count = get_valid_extent_count(inode_ptr->direct_extents, DIRECT_EXTENT_NUM);
+    BlockID phys_blk = lookup_extent(inode_ptr->direct_extents, direct_count, logical_blk);
+    if (phys_blk != INVALID_BLOCK_ID) return phys_blk;
 
-    std::vector<iExtent> v;
-    v.reserve(exts.size());
-    v.push_back(exts[0]);
-    for (int i = 1; i < exts.size(); i++) 
-	{
-        auto &prev = v.back();
-        const auto &cur = exts[i];
+    BlockHandle ind_bh;
+    int indirect_count = 0;
+    if (direct_count == DIRECT_EXTENT_NUM)  // 尝试在 Indirect Extents 中命中
+    {
+        ind_bh = bc_get_handle(inode_ptr->indirect_extent_block);
+        if (unlikely(!ind_bh)) 
+        {
+            log_err("[inode_bmap()] Failed to get indirect block [%lu] for inode %d", inode_ptr->indirect_extent_block, inum);
+            return INVALID_BLOCK_ID;
+        }
+
+        {
+            // auto ind_acc = ind_bh.access();
+            // ind_exts = reinterpret_cast<iExtent*>(ind_acc->data);
+            auto ind_read_acc = ind_bh.read_access();
+            const iExtent* ind_exts = reinterpret_cast<const iExtent*>(ind_read_acc->data);
+            indirect_count = get_valid_extent_count(ind_exts, EXTENTS_PER_BLOCK);
+            phys_blk = lookup_extent(ind_exts, indirect_count, logical_blk);
+        }
         
-        if (prev.logical_start  + prev.block_count == cur.logical_start && prev.physical_start + prev.block_count == cur.physical_start)  // 逻辑连续且物理也紧邻
-            prev.block_count += cur.block_count;
-		else v.push_back(cur);
-    }
-    exts.swap(v);
-}
-void store_all_extents(DInode &di, std::vector<iExtent> &exts)
-{
-    // log_info("store_all_extents() START");
+        if (phys_blk != INVALID_BLOCK_ID) return phys_blk;
+    }// 离开作用域，ind_read_acc 析构，自动释放间接块的读锁
 
-    normalize_extent(exts);
-    
-	size_t n = exts.size();
-	size_t nd = MIN(n, DIRECT_EXTENT_NUM);
-	for (int i = 0; i < nd; i++) di.direct_extents[i] = exts[i];
-	for (int i = nd; i < DIRECT_EXTENT_NUM; i++) di.direct_extents[i] = iExtent{0, 0, 0};  // 若存在则填充为0
-	
-	int remain = (n > nd) ? (n - nd) : 0;
-	if (remain == 0) return;
+    if (allocate == false) return INVALID_BLOCK_ID; // 读取模式遇到空洞，返回
 
-	const size_t cap = CEIL(BLOCK_SIZE, sizeof(iExtent));   // 此处无法整除，向上取整
-    std::vector<iExtent> buf(cap);
-    size_t to_copy = MIN(remain, cap);
-	for (int i = 0; i < to_copy; i++) buf[i] = exts[nd + i];
-	if (to_copy < cap) buf[to_copy] = iExtent{0, 0, 0};    // 结束标记
-	bc_write(di.indirect_extent_block, (const void*)buf.data());
+    // 新分配一个块，并加入到现有 extent 数组中
+    BlockID new_phys_blk = alloc_block();
+    if (new_phys_blk == INVALID_BLOCK_ID) return INVALID_BLOCK_ID; // 磁盘已满
 
-    // log_info("store_all_extents() OVER");
-}
+    // std::vector<iExtent> all_extents;      // 收集所有 Extents
+    // all_extents.reserve(DIRECT_EXTENT_NUM + EXTENTS_PER_BLOCK + 1);
+    // for (int i = 0; i < direct_count; ++i) all_extents.push_back(inode_ptr->direct_extents[i]);
+    iExtent all_extents[MAX_EXTENTS];   // 栈分配，零堆开销
+    int ext_count = 0;
+    for (int i = 0; i < direct_count; ++i) all_extents[ext_count++] = inode_ptr->direct_extents[i];
 
-
-static void bitmap_set_range(unsigned long *bm, uint64_t start, uint64_t len, bool one) 
-{
-    if (one)
-        for (uint64_t i = 0; i < len; i++) bitmap_set(bm, start + i);
-    else
-        for (uint64_t i = 0; i < len; i++) bitmap_clear(bm, start + i);
-}
-static uint64_t alloc_oneextent_from_group(int gid, uint64_t cnt, Extent &res)   // 从该组中尝试分配一个extent（长度至多为cnt）
-{
-    if (cnt == 0 || gid == -1) return 0;
-    if (cnt > (uint64_t)DATABLOCKS_PERGROUP) cnt = DATABLOCKS_PERGROUP;
-
-    BlockID bm_start, datablock_start;
-	get_group_by_gid(gid, &bm_start, &datablock_start);
-
-    // 因为 BMAPNUM_PERGROUP 一般为 1，所以直接读取一个 block 即可  （不过可能需要将代码写得更通用些，考虑到 BMAPNUM_PERGROUP 可能大于 1 的情况）
-    BlockHandle handle = bc_get_handle(bm_start);
-    if (!handle) return 0;
-
-    auto acc = handle.access();
-    unsigned long* bm = reinterpret_cast<unsigned long*>(acc->data);
-    if (bitmap_popcount(bm, DATABLOCKS_PERGROUP) == DATABLOCKS_PERGROUP) return 0;
-
-    uint64_t current_count = 0, startbit;
-    for (int i = 0; i < DATABLOCKS_PERGROUP; i++)
+    if (ind_bh) // 如果间接块有效（说明该 inode 有用到 indirect extent block），重新获取读锁拷贝其内容
     {
-        bool is_free = !bitmap_test(bm, i);
-        if (is_free) 
-        {
-            if (current_count == 0) startbit = i;  // 标记空闲区起始位
-            current_count++;
-        }
-        else if (!is_free && current_count == 0) continue;
+        auto ind_read_acc = ind_bh.read_access();
+        const iExtent* ind_exts = reinterpret_cast<const iExtent*>(ind_read_acc->data);
+        indirect_count = get_valid_extent_count(ind_exts, EXTENTS_PER_BLOCK);
+        // for (int i = 0; i < indirect_count; ++i) all_extents.push_back(ind_exts[i]); 
+        for (int i = 0; i < indirect_count; ++i) all_extents[ext_count++] = ind_exts[i];
+    }
+    // all_extents.push_back({.logical_start = logical_blk, .physical_start = new_phys_blk, .block_count = 1});
+    // compact_extents(all_extents);  // 压缩
+    all_extents[ext_count++] = {.logical_start = logical_blk, .physical_start = new_phys_blk, .block_count = 1};
+    ext_count = compact_extents_inplace(all_extents, ext_count);  // 就地压缩，无堆分配
 
-        if ((!is_free && current_count > 0) || current_count == cnt)
-        {
-            res = Extent{ .physical_start = datablock_start + startbit, .block_count = current_count };
-            bitmap_set_range(bm, startbit, current_count, 1); // 直接修改 block cache 中的 block 内容
-            acc.mark_dirty();
-            return current_count;
-        }
+    // if (all_extents.size() > DIRECT_EXTENT_NUM + EXTENTS_PER_BLOCK) 
+    if (ext_count > DIRECT_EXTENT_NUM + EXTENTS_PER_BLOCK)
+    {
+        log_err("[extent] Extent array overflow for inode %d!", inum);
+        free_block(new_phys_blk); // 事务回滚
+        return INVALID_BLOCK_ID;
     }
 
-    if (current_count > 0)
+    // 写回 Direct 区域 (直接修改 inode_ptr，因为调用者已经加了写锁)（inode 一定会被修改）
+    int global_idx = 0;
+    for (int i = 0; i < DIRECT_EXTENT_NUM; ++i) 
     {
-        res = Extent{ .physical_start = datablock_start + startbit, .block_count = current_count };
-        bitmap_set_range(bm, startbit, current_count, 1);  
-        acc.mark_dirty();
-        return current_count;
-    }
-
-    // 理论上不会运行到这里
-    return 0;
-}
-
-// 在同一 group 内，尽量用若干个 extent 累加到 cnt 块；返回实际分到的块数。
-// static uint64_t alloc_extents_from_group(int gid, uint64_t cnt, std::vector<Extent> &res)    // 这种写法可能会有多次的 bitmap IO
-// {
-//     if (cnt == 0 || gid == -1) return 0;
-
-//     uint64_t taken = 0;
-//     while (taken < cnt)
-//     {
-//         const uint64_t need = cnt - taken;
-//         Extent e;
-//         uint64_t got = alloc_oneextent_from_group(gid, need, e);
-//         if (got == 0) break;  // 该 group 已无可分配的空闲 extent
-//         res.push_back(e);
-//         taken += got;
-//     }
-
-//     return taken;
-// }
-
-
-// 在同一 group 内，尽量用若干个 extent 累加到 cnt 块；返回实际分到的块数。
-static uint64_t alloc_extents_from_group(int gid, uint64_t cnt, std::vector<Extent> &res)  // 考虑使用 buddy system 进行优化
-{
-    if (cnt == 0 || gid == -1) return 0;
-    if (cnt > (uint64_t)DATABLOCKS_PERGROUP) cnt = DATABLOCKS_PERGROUP;   // 最多只能分配这么多块
-
-    BlockID bm_start, datablock_start;
-	get_group_by_gid(gid, &bm_start, &datablock_start);
-
-    // 因为 BMAPNUM_PERGROUP 一般为 1，所以直接读取一个 block 即可  （不过可能需要将代码写得更通用些，考虑到 BMAPNUM_PERGROUP 可能大于 1 的情况）
-    BlockHandle handle = bc_get_handle(bm_start);
-    if (!handle) return 0;
-
-    auto acc = handle.access(); // 自动替代原版的 SpinGuard
-    unsigned long* bm = reinterpret_cast<unsigned long*>(acc->data);
-    if (bitmap_popcount(bm, DATABLOCKS_PERGROUP) == DATABLOCKS_PERGROUP) return 0;
-
-    bool modified = false;
-
-    uint64_t taken = 0, current_count = 0, startbit;  // current_count 表示当前这个 extent 的长度（其中包含多少个空闲块）
-    for (int i = 0; i < DATABLOCKS_PERGROUP; i++)
-    {
-        bool is_free = !bitmap_test(bm, i);
-        if (is_free) 
+        // if (global_idx < all_extents.size()) inode_ptr->direct_extents[i] = all_extents[global_idx++];
+        if (global_idx < ext_count) inode_ptr->direct_extents[i] = all_extents[global_idx++];
+        else 
         {
-            if (current_count == 0) startbit = i;  // 标记空闲区起始位
-            current_count++;
-        }
-        else if (!is_free && current_count == 0) continue;  // 还没找到一个 extent 的开头
-
-        if ((taken + current_count == cnt) || (!is_free && current_count > 0))  // 找到了一个 extent
-        {
-            res.push_back(Extent{ .physical_start = datablock_start + startbit, .block_count = current_count });
-            bitmap_set_range(bm, startbit, current_count, 1);
-            taken += current_count;
-            current_count = 0;
-            modified = true;
+            memset(&inode_ptr->direct_extents[i], 0, sizeof(iExtent) * (DIRECT_EXTENT_NUM - i));
             break;
         }
     }
 
-    if (current_count > 0)
+    if (ind_bh)
     {
-        res.push_back(Extent{ .physical_start = datablock_start + startbit, .block_count = current_count });
-        bitmap_set_range(bm, startbit, current_count, 1);
-        taken += current_count;
-        modified = true;
+        // auto ind_acc = ind_bh.access();
+        auto ind_write_acc = ind_bh.write_access();    // 此时必须获取写锁！
+        iExtent* ind_exts = reinterpret_cast<iExtent*>(ind_write_acc->data);
+        
+        for (int i = 0; i < EXTENTS_PER_BLOCK; ++i) 
+        {
+            // if (global_idx < all_extents.size()) ind_exts[i] = all_extents[global_idx++];
+            if (global_idx < ext_count) ind_exts[i] = all_extents[global_idx++];
+            else 
+            {
+                memset(&ind_exts[i], 0, sizeof(iExtent) * (EXTENTS_PER_BLOCK - i));
+                break;
+            }
+        }
+        ind_write_acc.mark_dirty(); // 标记间接块为脏
     }
 
-    if (modified) acc.mark_dirty();
-    return taken;
+    if (is_new) *is_new = true;
+    return new_phys_blk;
 }
-
-bool alloc_extents(uint64_t lba_count, std::vector<Extent> &res)    
+BlockID inode_bmap(int inum, BlockID logical_blk, bool allocate, bool* is_new)
 {
-    if (lba_count == 0) return true;
-    res.clear();
-
-    struct kthread *k = myk();
-	unsigned int coreid = k->curr_cpu;
-    if (core_to_group[coreid] == -1) set_newgroup(coreid);
-
-    int loop = 0;
-    uint64_t need = lba_count;
-    while (need > 0 && loop < sb.group_num)
+    InodeHandle ih = ic_get_inode(inum);
+    if (unlikely(!ih)) 
     {
-        uint64_t got = alloc_extents_from_group(core_to_group[coreid], need, res);
-        if (got >= need) { need = 0; break; }
-        need -= got;
-        set_newgroup(coreid);
-        loop++;  // 避免死循环
+        log_err("[inode_bmap()] Failed to get inode %d from cache", inum);
+        return INVALID_BLOCK_ID;
     }
 
-    return (need == 0);
-}
+    BlockID phys_blk = INVALID_BLOCK_ID;
+    bool newly_allocated = false;
 
-void free_oneextent(iExtent &e, uint64_t startblk)  // free_oneextent(e, 0) 即释放整个 extent
-{
-    // log_info("free_oneextent() START");
-
-    if (startblk >= e.block_count) return; // 视为成功
-
-    BlockID  start_to_free = e.physical_start + startblk;  // 所要释放的起始块
-    uint64_t count_to_free = e.block_count - startblk;     // 所要释放的块数
-
-    int gid;
-    BlockID bm_start, datablock_start;
-    get_group_by_blkid(start_to_free, &gid, &bm_start, &datablock_start);
-    // log_info("group id: %d, bm_start: %llu, datablock_start: %llu", gid, bm_start, datablock_start);
-    
-
-    BlockHandle handle = bc_get_handle(bm_start);
-    if (!handle) 
+    if (allocate)
     {
-        log_err("[free_oneextent] ERROR: Failed to get handle for block %lu", bm_start);
-        return;
+        auto write_acc = ih.write_access();
+        DInode* inode_ptr = &(*write_acc);
+        phys_blk = inode_bmap_locked(inode_ptr, inum, logical_blk, true, &newly_allocated);
+        if (newly_allocated) write_acc.mark_dirty();
+    }
+    else
+    {
+        auto read_acc = ih.read_access();
+        DInode* inode_ptr = const_cast<MInode*>(&(*read_acc));
+        phys_blk = inode_bmap_locked(inode_ptr, inum, logical_blk, false, is_new);
     }
 
-	auto acc = handle.access();
-    unsigned long* bm = reinterpret_cast<unsigned long*>(acc->data);
+    if (is_new) *is_new = newly_allocated;
 
-    uint64_t bit_offset = start_to_free - datablock_start;
-    bitmap_set_range(bm, bit_offset, count_to_free, 0);
-    acc.mark_dirty();
-
-    e.block_count = startblk;
-}
-
-
-void read_extentS(const std::vector<iExtent> &exts, uint64_t off, void* buf, uint64_t len)
-{
-    // log_info("read_extentS() START");
-
-    if (len == 0) return;
-
-    uint64_t taken = 0;
-    for (const auto &e : exts)
-    {
-        uint64_t e_L = e.logical_start * BLOCK_SIZE, e_R = (e.logical_start + e.block_count) * BLOCK_SIZE;  // 该 extent 覆盖的字节区间：[e_L, e_R)
-        uint64_t s = MAX(off, e_L), t = MIN(off + len, e_R);
-        if (s >= t) continue;   // 该 extent 不与 [off, off+len) 重叠
-
-        uint64_t off0  = s - e_L;
-        uint64_t size0 = t - s;
-        read_extent(&e, off0, (char*)buf + taken, size0);
-
-        taken += size0;
-        if (taken == len) break;
-    }
-
-    // log_info("read_extentS() DONE");
-}
-
-void write_extentS(const std::vector<iExtent> &exts, uint64_t off, const char* buf, uint64_t len)
-{
-    // log_info("write_extentS() START");
-
-    if (len == 0) return;
-
-    uint64_t remaining = len;
-    for (const auto &e : exts)
-    {
-        uint64_t e_L = e.logical_start * BLOCK_SIZE, e_R = (e.logical_start + e.block_count) * BLOCK_SIZE;  // 该 extent 覆盖的字节区间：[e_L, e_R)
-        uint64_t s = MAX(off, e_L), t = MIN(off + len, e_R);
-        if (s >= t) continue;   // 该 extent 不与 [off, off+len) 重叠
-
-        uint64_t off0  = s - e_L;
-        uint64_t size0 = t - s;
-        if (buf == NULL) write_extent(&e, off0, NULL, size0);  // buf 为 NULL 时填充 0
-        else write_extent(&e, off0, buf + s - off, size0); 
-
-        remaining -= size0;
-        if (remaining == 0) break;
-    }
-
-    // log_info("write_extentS() OVER");
-}
-
-void ensure_coverage(std::vector<iExtent> &exts, uint64_t end)   // 确保 [0, end) 逻辑块区间被 extents 覆盖；若有缺口则分配并填充  （exts中的各extent在逻辑上应当是连续的）
-{
-    // log_info("ensure_coverage() START");
-
-    uint64_t start = 0;
-    if (!exts.empty()) 
-    {
-        iExtent& last = exts[exts.size() - 1];
-        start = last.logical_start + last.block_count;
-    }
-    if (start >= end) return;
-
-    // 存在缺口 [start, end)
-    uint64_t need = end - start;
-    std::vector<Extent> new_extents;
-    if (!alloc_extents(need, new_extents))
-    {
-        log_info("ERROR: fail to alloc extents in ensure_coverage()");
-        return;
-    }
-
-    // 将 new_extents 加入到 iExtent 中
-    uint64_t L = start;
-    for (const auto &e : new_extents) 
-    {
-        iExtent ni;
-        ni.logical_start  = L;
-        ni.physical_start = e.physical_start; 
-		ni.block_count    = e.block_count;
-        exts.push_back(ni);
-        L += ni.block_count;
-    }
-
-    normalize_extent(exts);
-
-    // log_info("ensure_coverage() OVER");
+    return phys_blk;
 }
