@@ -37,7 +37,7 @@ public:
             free_head_ = &data_[0]; // 头指针指向第一个元素
         }
         
-        log_info("ObjectPool<%s> initialized: %zu objects", typeid(T).name(), count_);
+        // log_info("ObjectPool<%s> initialized: %zu objects", typeid(T).name(), count_);
     }
     ~ObjectPool()  // 每个 obj 的前 8B 不应存储对析构有影响的数据，否则会有问题
     {
