@@ -2,6 +2,8 @@
 #include "generic_cache/backend.h"
 #include "utili.h"
 #include "inode.h"
+#include "extent.h"
+#include "group.h"
 #include <cstring>
 
 static GlobalInodeCache* g_inode_cache_ptr = nullptr;
@@ -97,27 +99,50 @@ bool ic_free_inode(int inum)   // 释放该 inode 持有的所有资源，inum �
     {
         auto write_acc = ih.write_access();  // 获取排他写锁，防止在销毁时有其他线程试图读取
         if (!write_acc->used) return false;  // 防止被重复删除
-        write_acc->used = false;        // 逻辑删除（新的请求将被阻止）
-        write_acc.mark_dirty();              
+        write_acc->used = false;        // 逻辑删除（新的读写请求拿到锁后看到 used == false 会直接退出）
+        write_acc.mark_dirty();
     }
 
-    // ih.wait_for_io();    // 新的读写请求拿到锁后看到 used == false 会直接退出，但是已经拿到物理块并且正在执行底层 memcpy/磁盘IO 的请求还在飞，必须等它们结束
-
-    // 此处 io_in_flight 为 0，没有人在操作这个文件的物理块了
     {
         auto write_acc = ih.write_access();
-        // TODO: 遍历该文件的 direct_extents 和 indirect_extents，调用 free_block(phys_blk) 归还给磁盘
-        // 伪代码: free_all_blocks_for_inode(&*write_acc);
+
+        // 释放 direct extents 中引用的所有物理块
+        int direct_count = get_valid_extent_count(write_acc->direct_extents, DIRECT_EXTENT_NUM);
+        for (int i = 0; i < direct_count; i++)
+        {
+            const iExtent& ext = write_acc->direct_extents[i];
+            for (uint64_t j = 0; j < ext.block_count; j++)
+                free_block(ext.physical_start + j);
+        }
+
+        // 释放 indirect extents 中引用的所有物理块
+        if (direct_count == DIRECT_EXTENT_NUM && write_acc->indirect_extent_block != 0)
+        {
+            BlockHandle ind_bh = bc_get_handle(write_acc->indirect_extent_block);
+            if (ind_bh)
+            {
+                auto ind_acc = ind_bh.read_access();
+                const iExtent* ind_exts = reinterpret_cast<const iExtent*>(ind_acc->data);
+                int indirect_count = get_valid_extent_count(ind_exts, EXTENTS_PER_BLOCK);
+                for (int i = 0; i < indirect_count; i++)
+                {
+                    const iExtent& ext = ind_exts[i];
+                    for (uint64_t j = 0; j < ext.block_count; j++)
+                        free_block(ext.physical_start + j);
+                }
+            }
+        }
 
         write_acc->type      = UNKNOWN;
         write_acc->nlink     = 0;
         write_acc->file_size = 0;
         memset(write_acc->direct_extents, 0, sizeof(write_acc->direct_extents));
-        
+        memset(&write_acc->extent_hint, 0, sizeof(write_acc->extent_hint));
+
         write_acc.mark_dirty();
     }
 
-    free_inum(inum); 
+    free_inum(inum);
 
     return true;
 }
@@ -125,6 +150,16 @@ bool ic_free_inode(int inum)   // 释放该 inode 持有的所有资源，inum �
 void ic_flush_all()
 {
     get_inode_cache().flush();
+}
+
+bool ic_flush_inode(int inum)
+{
+    // 刷写 inode cache entry 自身（将 MInode 数据写回 inode table block）
+    if (!get_inode_cache().flush_entry(inum)) return false;
+
+    // inode 写回后，inode table block 在 block cache 中也变脏了，需要一并刷写
+    BlockID itable_blk = sb.itable_blockstart + inum / INODENUM_PER_BLOCK;
+    return bc_flush_block(itable_blk);
 }
 
 void print_inode_info(int inum) 

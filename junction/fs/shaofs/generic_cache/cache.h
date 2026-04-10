@@ -222,6 +222,25 @@ public:
         return true;
     }
 
+    bool flush_entry(const Key& key)   // 将指定 key 的 CacheEntry 刷写到后端（如果在缓存中且为脏）
+    {
+        spin_lock(&shard_lock);
+        Handle entryHandle(hashmap->find(key));  // Pin 住，防止被驱逐
+        spin_unlock(&shard_lock);
+
+        if (!entryHandle) return true;   // 不在缓存中，无需刷写
+
+        EntryType* entry = entryHandle.get_entry();
+
+        auto acc = entryHandle.read_access();   // 读锁即可：只是读数据写到后端，不修改 entry 的 data
+        if (atomic_read(&entry->dirty) && atomic_read(&entry->valid))
+        {
+            if (backend->write(entry->key, entry->data)) atomic_write(&entry->dirty, 0);
+            else return false;
+        }
+        return true;
+    }
+    
     void flush()   // 调用此函数时，应保证外部没有任何线程并发访问 Cache，例如系统终止时，不然该线程的阻塞时间就太久了。
     {
         spin_lock(&shard_lock);

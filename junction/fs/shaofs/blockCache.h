@@ -12,14 +12,16 @@ class NVMeSSD : public Backend<BlockID, BlockData> {
 public:
     bool read(const BlockID& key, BlockData& value)
     {
-        int ret = storage_read(static_cast<void*>(value.data), key, 1);
-        return (ret == 0);
+        // int ret = storage_read(static_cast<void*>(value.data), key, 1);
+        // return (ret == 0);
+        return DMA_read_block(static_cast<void*>(value.data), key);
     }
     bool write(const BlockID& key, BlockData const& value)
     {
-        int ret = storage_write(static_cast<const void*>(value.data), key, 1);
-        // log_info("write to block %lu", key);
-        return (ret == 0);
+        // int ret = storage_write(static_cast<const void*>(value.data), key, 1);
+        // log_info("write to block %lu", key);                                                                    
+        // return (ret == 0);
+        return DMA_write_block(static_cast<const void*>(value.data), key);
     }
 
     static NVMeSSD& getInstance()   // singleton，全局只有 1 个 NVMeSSD 实例
@@ -43,6 +45,7 @@ void init_block_cache(size_t capacity = DEFAULT_BLOCKCACHE_CAPACITY, size_t shar
 bool bc_read(BlockID id, void* buffer);         // 从 BlockCache 读取一个 Block 到 user buffer（大小为 BLOCK_SIZE），存在 memcpy
 void bc_write(BlockID id, const void* buffer);  // 将 user buffer 中的数据写入 cache 并标记 dirty，存在 memcpy
 void bc_flush_all();                            // 将 cache 中所有脏数据刷回后端存储
+bool bc_flush_block(BlockID id);                // 将指定 block 刷写到后端（如果在缓存中且为脏）
 void bc_prefetch(BlockID id);                   // 拉取块数据到内存
 
 using BlockHandle = GlobalBlockCache::Handle;

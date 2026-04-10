@@ -69,6 +69,7 @@ bool bc_read(BlockID id, void* buffer)
 }
 void bc_write(BlockID id, const void* buffer) { get_block_cache().put(id, *(BlockData*)buffer); }
 void bc_flush_all() { get_block_cache().flush(); }
+bool bc_flush_block(BlockID id) { return get_block_cache().flush_entry(id); }
 BlockHandle bc_get_handle(BlockID id) { return get_block_cache().getHandle(id); }
 
 
