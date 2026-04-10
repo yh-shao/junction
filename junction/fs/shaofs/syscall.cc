@@ -6,6 +6,7 @@
 #include "dir.h"
 #include "inodeCache.h"
 #include "blockCache.h"
+#include "extent.h"
 #include "junction/fs/file.h"
 
 
@@ -15,7 +16,7 @@ int my_open2(const char* pathname, int flags, mode_t mode)
     // log_info("BlockNum: %lu", storage_num_blocks());
 
     RuntimeFSBaseGuard g;
-    // storage_read_obj(&sb, sizeof(SuperBlock), SUPERBLOCK_LOCATION, SUPERBLOCK_NUM);
+    // storage_read_obj(&sb, sizeof(SuperBlock), SUPERBLOCK_LOCATION, 0);
     // log_info("magic num: %x", sb.magic_number);
     
     // char buffer[BLOCK_SIZE];
@@ -96,7 +97,7 @@ int my_open(const char* pathname, int flags, mode_t mode)
             }
 
             inum = new_inum; // 创建成功！
-            log_info("created a new file: %s", pathname);
+            // log_info("created a new file: %s", pathname);
             break;
           }
         }
@@ -112,34 +113,31 @@ int my_open(const char* pathname, int flags, mode_t mode)
     }
 
     // 处理文件截断
-    // if (inum != -1 && (flags & junction::kFlagTruncate)) 
-    // {
-    //     truncate_inode(inum);
-    // }
+    if (inum != -1 && (flags & junction::kFlagTruncate))
+    {
+        truncate_inode(inum);
+    }
 
     return inum;
 }
 
-ssize_t my_read(int inum, void *buf, off_t* off, size_t len, bool direct) 
+ssize_t my_read(int inum, void *buf, off_t* off, size_t len, bool direct)
 {
-    // log_info("read(inum=%d, len=%d)", inum, len);
     RuntimeFSBaseGuard g;
 
-    ssize_t ret = file_read(inum, (char*)buf, *off, len);
+    ssize_t ret = direct ? file_read_direct(inum, (char*)buf, *off, len)
+                         : file_read(inum, (char*)buf, *off, len);
     if (ret >= 0) *off += ret;
     return ret;
 }
 
-ssize_t my_write(int inum, const void *buf, off_t* off, size_t len, bool direct) 
+ssize_t my_write(int inum, const void *buf, off_t* off, size_t len, bool direct)
 {
-    // uint64_t start_us = microtime(), end_us;
-    // log_info("write(inum=%d, len=%d)", inum, len);
     RuntimeFSBaseGuard g;
 
-    size_t ret = file_write(inum, (const char*)buf, *off, len);
+    ssize_t ret = direct ? file_write_direct(inum, (const char*)buf, *off, len)
+                         : file_write(inum, (const char*)buf, *off, len);
     if (ret >= 0) *off += ret;
-    // end_us = microtime();
-    // log_info("write: %lu us", end_us - start_us);
     return ret;
 }
 
@@ -222,7 +220,7 @@ int my_mkdir(const char *pathname, mode_t mode)
     // auto& dentrycache = DentryCacheManager::instance();
     // dentrycache.put(pathname, new_inum);
 
-    log_info("created a new directory: %s", pathname);
+    // log_info("created a new directory: %s", pathname);
     return 0;
 }
 
@@ -250,4 +248,130 @@ off_t my_lseek(int inum, off_t offset, int whence, off_t old_off)
     }
     if (new_off < 0) return -EINVAL;
     return new_off;
+}
+
+static void fill_stat_from_inode(const MInode* inode, int inum, struct stat *st)
+{
+    memset(st, 0, sizeof(struct stat));
+
+    st->st_ino   = inum;
+    st->st_nlink = inode->nlink;
+    st->st_size  = inode->file_size;
+
+    // 文件类型映射
+    switch (inode->type) 
+    {
+      case REGULAR:   st->st_mode = S_IFREG | 0644; break;
+      case DIRECTORY: st->st_mode = S_IFDIR | 0755; break;
+      case SYMLINK:   st->st_mode = S_IFLNK | 0777; break;
+      default:        st->st_mode = S_IFREG | 0644; break;
+    }
+
+    st->st_blksize = BLOCK_SIZE;
+
+    // 统计已分配的物理块数（st_blocks 单位为 512B 扇区）
+    uint64_t allocated_blocks = 0;
+    int direct_count = get_valid_extent_count(inode->direct_extents, DIRECT_EXTENT_NUM);
+    for (int i = 0; i < direct_count; i++)
+        allocated_blocks += inode->direct_extents[i].block_count;
+
+    // indirect extent block 中可能还有更多 extent
+    if (direct_count == DIRECT_EXTENT_NUM && inode->indirect_extent_block != 0)
+    {
+        BlockHandle ind_bh = bc_get_handle(inode->indirect_extent_block);
+        if (ind_bh)
+        {
+            auto ind_acc = ind_bh.read_access();
+            const iExtent* ind_exts = reinterpret_cast<const iExtent*>(ind_acc->data);
+            int indirect_count = get_valid_extent_count(ind_exts, EXTENTS_PER_BLOCK);
+            for (int i = 0; i < indirect_count; i++) allocated_blocks += ind_exts[i].block_count;
+        }
+    }
+
+    st->st_blocks = allocated_blocks * (BLOCK_SIZE / 512);
+
+    st->st_dev   = 0;
+    st->st_atime = inode->atime;
+    st->st_mtime = inode->mtime;
+    st->st_ctime = inode->ctime;
+}
+
+int my_fstat(int inum, struct stat *statbuf)
+{
+    RuntimeFSBaseGuard g;
+
+    InodeHandle ih = ic_get_inode(inum);
+    if (unlikely(!ih)) return -ENOENT;
+
+    auto read_acc = ih.read_access();
+    if (!read_acc->used) return -ENOENT;
+
+    fill_stat_from_inode(&(*read_acc), inum, statbuf);
+    return 0;
+}
+
+int my_newfstatat(const char *pathname, struct stat *statbuf)
+{
+    RuntimeFSBaseGuard g;
+
+    int inum = namei(pathname);
+    if (inum == -1) return -ENOENT;
+
+    InodeHandle ih = ic_get_inode(inum);
+    if (unlikely(!ih)) return -ENOENT;
+
+    auto read_acc = ih.read_access();
+    if (!read_acc->used) return -ENOENT;
+
+    fill_stat_from_inode(&(*read_acc), inum, statbuf);
+    return 0;
+}
+
+int my_fsync(int inum)
+{
+    RuntimeFSBaseGuard g;
+
+    InodeHandle ih = ic_get_inode(inum);
+    if (unlikely(!ih)) return -ENOENT;
+
+    // 遍历该 inode 的所有 extent，刷写每个脏数据块
+    {
+        auto read_acc = ih.read_access();
+        if (!read_acc->used) return -ENOENT;
+
+        // 刷写 direct extents 引用的物理块
+        int direct_count = get_valid_extent_count(read_acc->direct_extents, DIRECT_EXTENT_NUM);
+        for (int i = 0; i < direct_count; i++)
+        {
+            const iExtent& ext = read_acc->direct_extents[i];
+            for (uint64_t j = 0; j < ext.block_count; j++)
+                bc_flush_block(ext.physical_start + j);
+        }
+
+        // 刷写 indirect extents 引用的物理块
+        if (direct_count == DIRECT_EXTENT_NUM && read_acc->indirect_extent_block != 0)
+        {
+            // 先刷写 indirect extent block 自身
+            bc_flush_block(read_acc->indirect_extent_block);
+
+            BlockHandle ind_bh = bc_get_handle(read_acc->indirect_extent_block);
+            if (ind_bh)
+            {
+                auto ind_acc = ind_bh.read_access();
+                const iExtent* ind_exts = reinterpret_cast<const iExtent*>(ind_acc->data);
+                int indirect_count = get_valid_extent_count(ind_exts, EXTENTS_PER_BLOCK);
+                for (int i = 0; i < indirect_count; i++)
+                {
+                    const iExtent& ext = ind_exts[i];
+                    for (uint64_t j = 0; j < ext.block_count; j++)
+                        bc_flush_block(ext.physical_start + j);
+                }
+            }
+        }
+    }
+
+    // 刷写 inode 元数据自身
+    ic_flush_inode(inum);
+
+    return 0;
 }

@@ -226,8 +226,8 @@ ssize_t usys_read(int fd, void *buf, size_t len) {
 
   if (f->get_inode() && f->get_inode()->get_mode() == SHAOFS)
   {
-    // log_info("read(fd: %d, len: %zu)", fd, len);
-    return my_read(f->get_inode()->get_inum(), buf, &f->get_off_ref(), len, false);
+    bool direct = f->get_flags() & kFlagDirect;
+    return my_read(f->get_inode()->get_inum(), buf, &f->get_off_ref(), len, direct);
   }
 
   Status<size_t> ret = f->Read(readable_span(buf, len), &f->get_off_ref());
@@ -252,10 +252,10 @@ ssize_t usys_write(int fd, const void *buf, size_t len) {
 
   if (f->get_inode() && f->get_inode()->get_mode() == SHAOFS)
   {
-    // log_info("write(fd: %d, len: %zu)", fd, len);
     int inum = f->get_inode()->get_inum();
-    if (f->get_flags() & O_APPEND) f->get_off_ref() = my_lseek(inum, 0, SEEK_END, 0);  // 指针移动到末尾（这里 old_offset 可以忽略）
-    return my_write(inum, buf, &f->get_off_ref(), len, false);
+    bool direct = f->get_flags() & kFlagDirect;
+    if (f->get_flags() & O_APPEND) f->get_off_ref() = my_lseek(inum, 0, SEEK_END, 0);
+    return my_write(inum, buf, &f->get_off_ref(), len, direct);
   }
 
   Status<size_t> ret = f->Write(writable_span(buf, len), &f->get_off_ref());
@@ -270,8 +270,8 @@ ssize_t usys_pread64(int fd, void *buf, size_t len, off_t offset) {
 
   if (f->get_inode() && f->get_inode()->get_mode() == SHAOFS)
   {
-    // log_info("read(fd: %d, len: %zu)", fd, len);
-    return my_read(f->get_inode()->get_inum(), buf, &offset, len, false);
+    bool direct = f->get_flags() & kFlagDirect;
+    return my_read(f->get_inode()->get_inum(), buf, &offset, len, direct);
   }
 
   Status<size_t> ret = f->Read(readable_span(buf, len), &offset);
@@ -552,8 +552,8 @@ ssize_t usys_pwrite64(int fd, const void *buf, size_t len, off_t offset) {
 
   if (f->get_inode() && f->get_inode()->get_mode() == SHAOFS)
   {
-    // log_info("read(fd: %d, len: %zu)", fd, len);
-    return my_write(f->get_inode()->get_inum(), buf, &offset, len, false);
+    bool direct = f->get_flags() & kFlagDirect;
+    return my_write(f->get_inode()->get_inum(), buf, &offset, len, direct);
   }
 
   Status<size_t> ret = f->Write(writable_span(buf, len), &offset);
@@ -600,6 +600,12 @@ long usys_fsync(int fd) {
   FileTable &ftbl = myproc().get_file_table();
   File *f = ftbl.Get(fd);
   if (unlikely(!f)) return -EBADF;
+
+  if (f->get_inode() && f->get_inode()->get_mode() == SHAOFS)
+  {
+    return my_fsync(f->get_inode()->get_inum());
+  }
+
   Status<void> ret = f->Sync();
   if (!ret) return MakeCError(ret);
   return 0;
@@ -656,6 +662,12 @@ long usys_fstat(int fd, struct stat *statbuf) {
   FileTable &ftbl = myproc().get_file_table();
   File *f = ftbl.Get(fd);
   if (unlikely(!f)) return -EBADF;
+
+  if (f->get_inode() && f->get_inode()->get_mode() == SHAOFS)
+  {
+    return my_fstat(f->get_inode()->get_inum(), statbuf);
+  }
+
   Status<void> ret = f->Stat(statbuf);
   if (!ret) return MakeCError(ret);
   return 0;
@@ -665,6 +677,12 @@ long usys_newfstatat(int dirfd, const char *c_path, struct stat *statbuf,
                      int flags) {
   // Needed for compatibility with fish-shell.
   if (unlikely(!c_path)) return -EFAULT;
+
+  if (USE_SHAOFS(c_path))
+  {
+    const char* realpath = c_path + MYPREFIX_LEN;
+    return my_newfstatat(realpath, statbuf);
+  }
 
   const std::string_view path(c_path);
   std::shared_ptr<Inode> inode;

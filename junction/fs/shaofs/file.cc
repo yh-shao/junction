@@ -6,6 +6,56 @@
 #include <vector>
 #include "group.h"
 
+// 释放 inode 持有的所有数据块（direct + indirect extents）。调用前必须持有 inode 写锁。
+static void free_inode_data_blocks(MInode* inode_ptr, int inum)
+{
+    // 释放 direct extents 中引用的所有物理块
+    int direct_count = get_valid_extent_count(inode_ptr->direct_extents, DIRECT_EXTENT_NUM);
+    for (int i = 0; i < direct_count; i++)
+    {
+        const iExtent& ext = inode_ptr->direct_extents[i];
+        for (uint64_t j = 0; j < ext.block_count; j++)
+            free_block(ext.physical_start + j);
+    }
+
+    // 释放 indirect extents 中引用的所有物理块
+    if (direct_count == DIRECT_EXTENT_NUM && inode_ptr->indirect_extent_block != 0)
+    {
+        BlockHandle ind_bh = bc_get_handle(inode_ptr->indirect_extent_block);
+        if (ind_bh)
+        {
+            auto ind_acc = ind_bh.read_access();
+            const iExtent* ind_exts = reinterpret_cast<const iExtent*>(ind_acc->data);
+            int indirect_count = get_valid_extent_count(ind_exts, EXTENTS_PER_BLOCK);
+            for (int i = 0; i < indirect_count; i++)
+            {
+                const iExtent& ext = ind_exts[i];
+                for (uint64_t j = 0; j < ext.block_count; j++)
+                    free_block(ext.physical_start + j);
+            }
+        }
+    }
+
+    // 清空 inode 的 extent 元数据
+    memset(inode_ptr->direct_extents, 0, sizeof(inode_ptr->direct_extents));
+    inode_ptr->file_size = 0;
+
+    // 清空 extent hint
+    memset(&inode_ptr->extent_hint, 0, sizeof(inode_ptr->extent_hint));
+}
+
+void truncate_inode(int inum)
+{
+    InodeHandle ih = ic_get_inode(inum);
+    if (!ih) return;
+
+    auto write_acc = ih.write_access();
+    if (!write_acc->used || write_acc->file_size == 0) return;
+
+    free_inode_data_blocks(&*write_acc, inum);
+    write_acc.mark_dirty();
+}
+
 void final_flush()
 {
 	// atomic64_write(&runtime_info->spdk_uipi, 0);  // 停止让 IOKernel 检查 SPDK 完成情况
@@ -13,7 +63,7 @@ void final_flush()
 
 	RuntimeFSBaseGuard g;
 	// uint64_t before_flush = rdtsc();
-	storage_write_obj(imap, BITMAP_LONG_SIZE(sb.inode_num) * sizeof(unsigned long), sb.imap_blockstart, sb.imap_blocknum);
+	storage_write_obj(imap, BITMAP_LONG_SIZE(sb.inode_num) * sizeof(unsigned long), sb.imap_blockstart, 0);
 	sync_all_gdt();
 	ic_flush_all();
 	bc_flush_all();
@@ -99,48 +149,139 @@ ssize_t file_write(int inum, const char* buf, off_t offset, size_t len)
         BlockID phys_blk = INVALID_BLOCK_ID;
         bool is_new_block = false;
 
+        // Phase 1: 持有 inode 写锁，仅做 bmap 查找/分配 + file_size 更新
         {
-            auto write_acc = ih.write_access();   // 获取 Inode 排他写锁
-            if (!write_acc->used)
-            {
-                log_info("inode %d is not valid (deleted)", inum);
-                break;  // POSIX 语义：失败时，不返回 -1，而是返回目前已成功写入的字节数
-            }
+            auto write_acc = ih.write_access();
+            if (!write_acc->used) break;
 
             phys_blk = inode_bmap_locked(&*write_acc, inum, logical_blk, true, &is_new_block);
-            if (phys_blk == INVALID_BLOCK_ID) 
+            if (phys_blk == INVALID_BLOCK_ID)
             {
                 log_err("[file_write] Disk full or bmap failed at logical block %lu", logical_blk);
-                break; // POSIX 语义：分配失败（磁盘满）时，不返回 -1，而是返回目前已成功写入的字节数
+                break;
             }
 
-            // 将数据写入 BlockCache （注意：此时我们仍然持有 inode 的排他写锁！）
-            BlockHandle bh = bc_get_handle(phys_blk); 
-            if (unlikely(!bh)) 
-            {
-                log_err("[file_write] Failed to get cache handle for physical block %lu", phys_blk);
-                break; 
-            }
-
-            {
-                auto block_write_acc = bh.write_access(); // 获取这一个物理块的排他写锁
-                if (is_new_block && copy_len < BLOCK_SIZE) memset(block_write_acc->data, 0, BLOCK_SIZE);   // 防止旧磁盘垃圾数据泄漏
-                memcpy(block_write_acc->data + blk_offset, buf + bytes_written, copy_len);  // 写入用户真实数据
-                block_write_acc.mark_dirty();                                               // 标记底层数据块为脏页
-            } // 物理块写锁释放
-
-            // 在同一把 Inode 写锁的保护下更新 file_size，保证任何等待 Inode 锁的读线程一旦被唤醒，立刻就能看到刚写入的新数据和正确的文件长度。
+            // 在释放 inode 锁之前先更新 file_size
             uint64_t new_end_pos = current_offset + copy_len;
-            if (new_end_pos > write_acc->file_size) 
+            if (new_end_pos > write_acc->file_size)
             {
                 write_acc->file_size = new_end_pos;
-                write_acc.mark_dirty(); // 标记 Inode 脏
+                write_acc.mark_dirty();
             }
-            
-        } // 离开作用域，Inode 排他写锁被释放
-        
+        } // inode 写锁释放
+
+        // Phase 2: inode 锁已释放，使用 block cache 自身的锁保护数据写入
+        BlockHandle bh = bc_get_handle(phys_blk);
+        if (unlikely(!bh))
+        {
+            log_err("[file_write] Failed to get cache handle for physical block %lu", phys_blk);
+            break;
+        }
+
+        {
+            auto block_write_acc = bh.write_access();
+            if (is_new_block && copy_len < BLOCK_SIZE) memset(block_write_acc->data, 0, BLOCK_SIZE);
+            memcpy(block_write_acc->data + blk_offset, buf + bytes_written, copy_len);
+            block_write_acc.mark_dirty();
+        }
+
         bytes_written += copy_len;
     }
 
     return bytes_written;
+}
+
+
+/* O_DIRECT I/O */
+// 目前是实现是绕过 Block Cache，使用 storage_read_obj/storage_write_obj 直接访问磁盘，但是内部还是会分配临时 SPDK DMA buffer 并 memcpy 到/从用户 buffer，并不是真正的零拷贝（有待修改）
+ssize_t file_read_direct(int inum, char* buf, off_t offset, size_t len)
+{
+    if (len == 0) return 0;
+
+    InodeHandle ih = ic_get_inode(inum);
+    if (unlikely(!ih)) return -1;
+
+    uint64_t bytes_read = 0;
+    while (bytes_read < len)
+    {
+        uint64_t current_offset = offset + bytes_read;
+        uint64_t logical_blk = current_offset / BLOCK_SIZE, blk_offset  = current_offset % BLOCK_SIZE;
+
+        uint64_t copy_len = 0;
+        BlockID phys_blk = INVALID_BLOCK_ID;
+
+        {
+            auto read_acc = ih.read_access();
+            if (!read_acc->used || current_offset >= read_acc->file_size) break;
+
+            uint64_t actual_remain = read_acc->file_size - current_offset;
+            uint64_t request_remain = len - bytes_read;
+            copy_len = MIN(BLOCK_SIZE - blk_offset, MIN(request_remain, actual_remain));
+
+            phys_blk = inode_bmap_locked(const_cast<MInode*>(&(*read_acc)), inum, logical_blk, false, nullptr);
+        }
+
+        if (copy_len == 0) break;
+
+        if (phys_blk == INVALID_BLOCK_ID) memset(buf + bytes_read, 0, copy_len);  // 处理文件空洞 (Hole)：直接将对应的用户 Buffer 填 0，无需下发 I/O
+        else
+        {
+            bc_flush_block(phys_blk);  // 若该块在 cache 中且为脏，先刷盘保证一致性，从而 Direct I/O 能读到 Cache 中尚未落盘的脏数据
+            if (storage_read_obj(buf + bytes_read, copy_len, phys_blk, blk_offset) != 0) break;
+        }
+
+        bytes_read += copy_len;
+    }
+
+    return bytes_read;
+}
+
+ssize_t file_write_direct(int inum, const char* buf, off_t offset, size_t len)
+{
+    if (len == 0) return 0;
+
+    InodeHandle ih = ic_get_inode(inum);
+    if (unlikely(!ih)) return -1;
+
+    uint64_t bytes_written = 0;
+    while (bytes_written < len)
+    {
+        uint64_t current_offset = offset + bytes_written;
+        uint64_t logical_blk = current_offset / BLOCK_SIZE, blk_offset  = current_offset % BLOCK_SIZE;
+        uint64_t copy_len = MIN(BLOCK_SIZE - blk_offset, len - bytes_written);
+
+        BlockID phys_blk = INVALID_BLOCK_ID;
+        bool is_new_block = false;
+
+        // 持有 inode 写锁：bmap 分配 + file_size 更新
+        {
+            auto write_acc = ih.write_access();
+            if (!write_acc->used) break;
+
+            phys_blk = inode_bmap_locked(&*write_acc, inum, logical_blk, true, &is_new_block);
+            if (phys_blk == INVALID_BLOCK_ID) break;
+        }
+
+        int ret = 0;
+        if (is_new_block) 
+            ret = storage_write_obj_no_rmw(buf + bytes_written, copy_len, phys_blk, blk_offset);
+        else 
+            ret = storage_write_obj(buf + bytes_written, copy_len, phys_blk, blk_offset);
+        if (unlikely(ret != 0)) break;
+
+        uint64_t new_end_pos = current_offset + copy_len;
+
+        {
+            auto write_acc = ih.write_access();
+            if (new_end_pos > write_acc->file_size)
+            {
+                write_acc->file_size = new_end_pos;
+                write_acc.mark_dirty();
+            }
+        }
+
+        bytes_written += copy_len;
+    }
+
+    return (bytes_written == 0 && len > 0) ? -1 : bytes_written;
 }
