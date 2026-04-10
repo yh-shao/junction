@@ -42,7 +42,7 @@ void init_group()
 	memset(core_to_group, -1, sizeof(core_to_group));
 
     GroupDescriptor* disk_gdt = new GroupDescriptor[sb.group_num]();
-    storage_read_obj(disk_gdt, sb.group_num * sizeof(GroupDescriptor), sb.gdt_blockstart, sb.gdt_blocknum);
+    storage_read_obj(disk_gdt, sb.group_num * sizeof(GroupDescriptor), sb.gdt_blockstart, 0);
 
 	group_info = new GroupDescExt[sb.group_num];
 	for (uint32_t i = 0; i < sb.group_num; i++) 
@@ -170,20 +170,19 @@ BlockID alloc_block()
             return INVALID_BLOCK_ID;
         }
 
-        // 重新进入不可抢占区，确认：①线程仍在原来的 core 上；②这个 core 当前仍绑定同一个 gid。 若不成立，说明前面的快照已经失效，必须重试。
+        // 先获取写锁（可能 yield），再进入不可抢占区做校验和 bitmap 操作
+        auto acc = handle.write_access();
+        unsigned long* bmap = reinterpret_cast<unsigned long*>(acc->data);
+
         {
             kguard k;
             unsigned int curr_coreid = k->curr_cpu;
             int curr_gid = core_to_group[curr_coreid];
 
-            if (curr_coreid != snapshot_coreid || curr_gid != snapshot_gid) continue;   // 重试
-
-            // 到这里，说明：当前线程还在原来那个 core 上 且 当前 core 仍然使用这个 gid
-            auto acc = handle.write_access();
-            unsigned long* bmap = reinterpret_cast<unsigned long*>(acc->data);
+            if (curr_coreid != snapshot_coreid || curr_gid != snapshot_gid) continue;   // 重试（acc 析构释放写锁）
 
             spin_lock(&group_info[snapshot_gid].lock);
-            if (group_info[snapshot_gid].free_blocks_count == 0)   // 在锁内再确认一次 group 的状态，避免并发 free/alloc 导致快照过期
+            if (group_info[snapshot_gid].free_blocks_count == 0)
             {
                 spin_unlock(&group_info[snapshot_gid].lock);
                 continue;
@@ -191,7 +190,7 @@ BlockID alloc_block()
 
             uint32_t hint = group_info[snapshot_gid].next_free_hint;
             int allocated_offset = alloc_one_bit_from_bitmap_locked(bmap, DATABLOCKS_PERGROUP, &hint);
-            if (allocated_offset >= 0) 
+            if (allocated_offset >= 0)
             {
                 group_info[snapshot_gid].next_free_hint = hint;
                 group_info[snapshot_gid].free_blocks_count--;
@@ -201,7 +200,7 @@ BlockID alloc_block()
                 acc.mark_dirty();
                 spin_unlock(&group_info[snapshot_gid].lock);
 
-                log_info("Core %u allocated block %llu in group %d", curr_coreid, (unsigned long long)allocated_blk, snapshot_gid);
+                // log_info("Core %u allocated block %llu in group %d", curr_coreid, (unsigned long long)allocated_blk, snapshot_gid);
                 return allocated_blk;
             }
 
@@ -271,7 +270,7 @@ void free_block(BlockID blk)
     acc.mark_dirty();
     spin_unlock(&group_info[gid].lock);
 
-    log_info("Freed block %llu in group %u", (unsigned long long)blk, gid);
+    // log_info("Freed block %llu in group %u", (unsigned long long)blk, gid);
 }
 
 void sync_gdt(uint32_t gid)
@@ -288,7 +287,7 @@ void sync_gdt(uint32_t gid)
     const BlockID lba = sb.gdt_blockstart + block_idx;
 
     GroupDescriptor block_buf[BLOCK_SIZE / sizeof(GroupDescriptor)];
-    storage_read_obj(block_buf, BLOCK_SIZE, lba, 1);
+    storage_read_obj(block_buf, BLOCK_SIZE, lba, 0);
 
     spin_lock(&group_info[gid].lock);
     block_buf[idx_in_block].free_blocks_count = group_info[gid].free_blocks_count;
@@ -299,7 +298,7 @@ void sync_gdt(uint32_t gid)
     block_buf[idx_in_block].pad2[1]           = 0;
     spin_unlock(&group_info[gid].lock);
 
-    storage_write_obj(block_buf, BLOCK_SIZE, lba, 1);
+    storage_write_obj(block_buf, BLOCK_SIZE, lba, 0);
 }
 void sync_all_gdt()
 {
@@ -325,7 +324,7 @@ void sync_all_gdt()
         spin_unlock(&group_info[i].lock);
     }
 
-    storage_write_obj(disk_gdt, sb.group_num * sizeof(GroupDescriptor), sb.gdt_blockstart, sb.gdt_blocknum);
+    storage_write_obj(disk_gdt, sb.group_num * sizeof(GroupDescriptor), sb.gdt_blockstart, 0);
 
     delete[] disk_gdt;
 

@@ -9,10 +9,10 @@ bitmap_ptr_t gmap;    // gmap[i] 表示第 i 个 group 是否被某个核占用
 
 void init_meta()
 {
-    storage_read_obj(&sb, sizeof(SuperBlock), SUPERBLOCK_LOCATION, SUPERBLOCK_NUM);
+    storage_read_obj(&sb, sizeof(SuperBlock), SUPERBLOCK_LOCATION, 0);
 
     imap = new unsigned long[BITMAP_LONG_SIZE(sb.inode_num)]();
-    storage_read_obj(imap, BITMAP_LONG_SIZE(sb.inode_num) * sizeof(unsigned long), sb.imap_blockstart, sb.imap_blocknum);
+    storage_read_obj(imap, BITMAP_LONG_SIZE(sb.inode_num) * sizeof(unsigned long), sb.imap_blockstart, 0);
 
     gmap = new unsigned long[BITMAP_LONG_SIZE(sb.group_num)]();
 
