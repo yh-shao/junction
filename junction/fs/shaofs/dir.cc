@@ -4,180 +4,185 @@
 #include "file.h"
 #include "dentryCache.h"
 
-class DirGuard 
+// 获取目录 inode 的 dir_mtx 指针（通过短暂的 inode cache 读锁获取）
+static rwmutex_t* get_dir_mtx(const InodeHandle& ih)
 {
-    mutex_t* mtx = nullptr;
+    auto acc = ih.read_access();
+    return &acc->dir_mtx;
+}
 
+// RAII 目录读锁：允许多个 lookup / is_empty 并发执行
+class DirReadGuard
+{
+    rwmutex_t* mtx;
 public:
-    explicit DirGuard(const InodeHandle& ih) 
-    {
-        if (ih) 
-        {
-            auto acc = ih.read_access();
-            mtx = &acc->dir_mtx; 
-        }
-        if (mtx) mutex_lock(mtx);
-    }
-
-    ~DirGuard() { if (mtx) mutex_unlock(mtx); }
-
-    // 禁用拷贝
-    DirGuard(const DirGuard&) = delete;
-    DirGuard& operator=(const DirGuard&) = delete;
+    explicit DirReadGuard(const InodeHandle& ih) : mtx(get_dir_mtx(ih)) { rwmutex_rdlock(mtx); }
+    ~DirReadGuard() { rwmutex_unlock(mtx); }
+    DirReadGuard(const DirReadGuard&) = delete;
+    DirReadGuard& operator=(const DirReadGuard&) = delete;
 };
 
-template <typename Func>
-int dir_foreach(int dir_inum, Func callback) 
+// RAII 目录写锁：add_entry / delete_entry 需要排他访问
+class DirWriteGuard
 {
-    uint64_t offset = 0;
-    Dirent entry;
+    rwmutex_t* mtx;
+public:
+    explicit DirWriteGuard(const InodeHandle& ih) : mtx(get_dir_mtx(ih)) { rwmutex_wrlock(mtx); }
+    ~DirWriteGuard() { rwmutex_unlock(mtx); }
+    DirWriteGuard(const DirWriteGuard&) = delete;
+    DirWriteGuard& operator=(const DirWriteGuard&) = delete;
+};
+
+// 遍历目录中的所有 Dirent。调用前 caller 应已持有 dir_mtx（读锁或写锁）。
+template <typename Func>
+static int dir_foreach_locked(int dir_inum, Func callback)
+{
     char block_buf[BLOCK_SIZE];
-    while (true) 
+    uint64_t offset = 0;
+
+    while (true)
     {
-        ssize_t read_bytes = file_read(dir_inum, block_buf, offset, BLOCK_SIZE);   // 一次读取一整个块（4KB），包含 8 个 Dirent
-        
-        if (read_bytes < 0) 
-        {
-            log_err("[dir_foreach] Failed to read entry at offset %lu", offset);
-            return -1; 
-        }
-        
+        ssize_t read_bytes = file_read(dir_inum, block_buf, offset, BLOCK_SIZE);
+        if (read_bytes < 0) return -1;
+
         int n_entries = read_bytes / sizeof(Dirent);
         Dirent* entries = reinterpret_cast<Dirent*>(block_buf);
         for (int i = 0; i < n_entries; i++)
-            if (callback(entries[i], offset + i * sizeof(Dirent))) return 0;  // 执行上层注入的业务逻辑，若返回 true 则立刻终止遍历
+            if (callback(entries[i], offset + i * sizeof(Dirent))) return 0;
 
-        if (read_bytes < BLOCK_SIZE) break; // 到达文件末尾
+        if (read_bytes < BLOCK_SIZE) break;
         offset += read_bytes;
     }
 
-    return 0;   
+    return 0;
 }
 
 int dir_lookup(int dir_inum, const char* name, file_type_t* type)
 {
-    int found_inum = -1;
+    InodeHandle dir_ih = ic_get_inode(dir_inum);
+    if (!dir_ih) return -1;
 
-    dir_foreach(dir_inum, [&](Dirent& entry, uint64_t offset) {
-        if (entry.inum != 0 && strncmp(entry.name, name, NAMESIZ) == 0) 
+    DirReadGuard rguard(dir_ih);   // 目录读锁，允许并发 lookup
+
+    int found_inum = -1;
+    dir_foreach_locked(dir_inum, [&](const Dirent& entry, uint64_t) {
+        if (!dirent_is_empty(&entry) && strncmp(entry.name, name, NAMESIZ) == 0)
         {
             if (type) *type = entry.filetype;
             found_inum = entry.inum;
-            return true; // 命中，停止遍历
+            return true;
         }
         return false;
     });
 
     return found_inum;
-} 
+}
 
 bool dir_is_empty(int dir_inum)
 {
+    InodeHandle dir_ih = ic_get_inode(dir_inum);
+    if (!dir_ih) return true;
+
+    DirReadGuard rguard(dir_ih);
+
     bool empty = true;
-    
-    dir_foreach(dir_inum, [&](Dirent& entry, uint64_t offset) {
-        if (entry.inum != 0 && strncmp(entry.name, ".", NAMESIZ) != 0 && strncmp(entry.name, "..", NAMESIZ) != 0) 
+    dir_foreach_locked(dir_inum, [&](const Dirent& entry, uint64_t) {
+        if (!dirent_is_empty(&entry) &&
+            strncmp(entry.name, ".", NAMESIZ) != 0 &&
+            strncmp(entry.name, "..", NAMESIZ) != 0)
         {
-            empty = false; 
-            return true; // 发现实体文件，立刻停止遍历
+            empty = false;
+            return true;
         }
-        return false; 
+        return false;
     });
-    
+
     return empty;
 }
 
 int dir_add_entry(int dir_inum, const char* name, int inum, file_type_t type)
 {
+    InodeHandle dir_ih = ic_get_inode(dir_inum);
+    if (!dir_ih) return -1;
+
+    DirWriteGuard wguard(dir_ih);   // 目录写锁，串行化增删操作
+
+    uint64_t target_offset = (uint64_t)-1;
+    bool conflict = false;
+
+    dir_foreach_locked(dir_inum, [&](const Dirent& entry, uint64_t offset) {
+        if (dirent_is_empty(&entry))
+        {
+            if (target_offset == (uint64_t)-1) target_offset = offset;
+            return false;   // 继续检查重名
+        }
+        if (strncmp(entry.name, name, NAMESIZ) == 0)
+        {
+            conflict = true;
+            return true;
+        }
+        return false;
+    });
+
+    if (conflict)
     {
-        InodeHandle dir_ih = ic_get_inode(dir_inum);
-        if (!dir_ih) return -1;
-
-        DirGuard vfs_guard(dir_ih);   // 获取 VFS 专属互斥锁，串行化当前目录的增删操作
-
-        uint64_t target_offset = (uint64_t)-1;
-        bool conflict = false;
-
-        dir_foreach(dir_inum, [&](Dirent& entry, uint64_t offset) {
-            if (entry.inum == 0) 
-            {
-                if (target_offset == (uint64_t)-1) target_offset = offset;  // 记录第一个空槽位
-                return false;                                               // 继续检查重名
-            }
-            if (strncmp(entry.name, name, NAMESIZ) == 0) 
-            {
-                conflict = true;                                            
-                return true;                                                // 发现冲突，立刻停止
-            }
-            return false;                                                   
-        });
-
-        if (conflict) 
-        {
-            log_err("[dir_add_entry] Entry '%s' already exists.", name);
-            return -EEXIST;
-        }
-
-        if (target_offset == (uint64_t)-1)        
-        {
-            // 无空槽位，需追加。持有 VFS 锁时，file_size 是安全的
-            auto read_acc = dir_ih.read_access();
-            target_offset = read_acc->file_size; 
-        }
-
-        Dirent new_entry;
-        memset(&new_entry, 0, sizeof(Dirent));
-        new_entry.inum = inum;
-        new_entry.filetype = type;
-        strncpy(new_entry.name, name, NAMESIZ);
-
-        ssize_t written = file_write(dir_inum, (const char*)&new_entry, target_offset, sizeof(Dirent));
-        if (written != sizeof(Dirent)) 
-        {
-            log_err("[dir_add_entry] Failed to write directory entry.");
-            return -1;
-        }
-
-        // 更新脏标记，以便将来同步 mtime
-        dir_ih.write_access().mark_dirty();    
-        get_dentry_cache().put(DentryKey(dir_inum, name), {inum, type});  // 加入 dentryCache
+        log_err("[dir_add_entry] Entry '%s' already exists.", name);
+        return -EEXIST;
     }
+
+    if (target_offset == (uint64_t)-1)
+    {
+        auto read_acc = dir_ih.read_access();
+        target_offset = read_acc->file_size;
+    }
+
+    Dirent new_entry;
+    memset(&new_entry, 0, sizeof(Dirent));
+    new_entry.inum = inum;
+    new_entry.filetype = type;
+    strncpy(new_entry.name, name, NAMESIZ);
+
+    ssize_t written = file_write(dir_inum, (const char*)&new_entry, target_offset, sizeof(Dirent));
+    if (written != sizeof(Dirent))
+    {
+        log_err("[dir_add_entry] Failed to write directory entry.");
+        return -1;
+    }
+
+    dir_ih.write_access().mark_dirty();
+    get_dentry_cache().put(DentryKey(dir_inum, name), {inum, type});
 
     return 0;
 }
 
 int dir_delete_entry(int dir_inum, const char* name)
 {
+    InodeHandle dir_ih = ic_get_inode(dir_inum);
+    if (!dir_ih) return -1;
+
+    DirWriteGuard wguard(dir_ih);
+
     bool deleted = false;
-
-    {
-        InodeHandle dir_ih = ic_get_inode(dir_inum);
-        if (!dir_ih) return -1;
-
-        // 获取 VFS 专属互斥锁
-        DirGuard vfs_guard(dir_ih);
-
-        dir_foreach(dir_inum, [&](Dirent& entry, uint64_t offset) {
-            if (entry.inum != 0 && strncmp(entry.name, name, NAMESIZ) == 0) 
-            {
-                entry.inum = 0;                      
-                memset(entry.name, 0, NAMESIZ);      
-            
-                // 数据擦除后写回原位置
-                file_write(dir_inum, (const char*)&entry, offset, sizeof(Dirent));   
-                deleted = true;
-                return true; // 删完即走
-            }
-            return false; 
-        });
-
-        if (deleted) 
+    dir_foreach_locked(dir_inum, [&](Dirent& entry, uint64_t offset) {
+        if (!dirent_is_empty(&entry) && strncmp(entry.name, name, NAMESIZ) == 0)
         {
-            dir_ih.write_access().mark_dirty();
-            get_dentry_cache().invalidate(DentryKey(dir_inum, name));      // 磁盘上文件已经被删了，必须把缓存里的条目也抹杀掉！
-            return 0;
+            // 清空该 slot：inum=0 且 name 清零，满足 dirent_is_empty() 判定
+            entry.inum = 0;
+            memset(entry.name, 0, NAMESIZ);
+
+            file_write(dir_inum, (const char*)&entry, offset, sizeof(Dirent));
+            deleted = true;
+            return true;
         }
+        return false;
+    });
+
+    if (deleted)
+    {
+        dir_ih.write_access().mark_dirty();
+        get_dentry_cache().invalidate(DentryKey(dir_inum, name));
+        return 0;
     }
-    
-    return -1;   
+
+    return -1;
 }
