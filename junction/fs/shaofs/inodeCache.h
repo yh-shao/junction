@@ -6,7 +6,7 @@
 #include "blockCache.h"
 
 #define DEFAULT_INODECACHE_CAPACITY 8192
-#define DEFAULT_INODE_SHARD_NUM     16
+#define DEFAULT_INODE_SHARD_NUM     128
 
 class InodeBackend : public Backend<int, MInode> {
 public:

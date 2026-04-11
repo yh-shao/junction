@@ -36,7 +36,7 @@ private:
 };
 
 #define DEFAULT_BLOCKCACHE_CAPACITY 65536    // 默认 BlockCache 容量（单位：块数），即 256MB（65536 * 4096 Bytes）。可以通过 init_block_cache() 的参数调整。
-#define DEFAULT_SHARD_NUM           32       // 默认分片数量，可以通过 init_block_cache() 的参数调整。每个分片的容量 = capacity / shard_num。
+#define DEFAULT_SHARD_NUM           128      // 分片数量
 
 using GlobalBlockCache = ShardedCache<BlockID, BlockData>;
 GlobalBlockCache& get_block_cache();
