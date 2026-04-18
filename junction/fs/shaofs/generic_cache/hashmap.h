@@ -1,42 +1,36 @@
 #pragma once
 #include <functional>
 #include <cstddef>
-#include <stdexcept>
-#include <algorithm>
+#include <bit>
 
-/* 本 hashmap 不含内置锁，并发安全由所在 shard 负责 */
+/** 侵入式哈希表
+注意：
+  * bucket 数目会自动增大为 2 的幂 （可能会被传入的 bucket 参数大），之后 bucket 数目将是固定的，不支持动态扩容
+  * 本 hashmap 不含内置锁，并发安全由上层负责 
+  * EntryType 必须包含 KeyType key 和 EntryType* hash_next 两个成员变量
+  * 表中每个 key 都是唯一的，不支持重复插入
+  * 经过初始化后，运行时无需内存分配
+*/
 
-/* 注意：EntryType 必须包含 KeyType key 和 EntryType* hash_next 两个成员变量 */
 template <typename Key, typename EntryType, typename Hash = std::hash<Key>>
 class IntrusiveCacheMap {
 private:
-    size_t num_buckets;
+    size_t num_buckets;    // num_buckets 必须是 2 的幂，从而才能用位运算来优化取模运算
     EntryType** buckets;
     size_t current_size;   // hashmap 中当前存储的元素数量
 
     Hash hasher;
-    bool external_memory;
 
-    inline size_t get_bucket_idx(const Key& key) const { return hasher(key) % num_buckets; }
+    inline size_t get_bucket_idx(const Key& key) const { return hasher(key) & (num_buckets - 1); }   
 
 public:
-    IntrusiveCacheMap(size_t buckets_count, void* buckets_addr = nullptr)  : num_buckets(buckets_count), current_size(0), external_memory(buckets_addr != nullptr) 
+    IntrusiveCacheMap(size_t buckets_count)  : num_buckets(std::bit_ceil(buckets_count)), current_size(0)
     {
-        if (num_buckets < 1) throw std::invalid_argument("Bucket count must be greater than 0");
-
-        if (external_memory)
-        {
-            buckets = static_cast<EntryType**>(buckets_addr);
-            std::fill_n(buckets, num_buckets, nullptr);
-        }
-        else
-        {
-            buckets = new EntryType*[num_buckets]();
-        } 
+        buckets = new EntryType*[num_buckets]();
     }
     ~IntrusiveCacheMap() 
     {
-        if (!external_memory) delete[] buckets;
+        delete[] buckets;
     }
     IntrusiveCacheMap(const IntrusiveCacheMap&)            = delete;
     IntrusiveCacheMap& operator=(const IntrusiveCacheMap&) = delete;

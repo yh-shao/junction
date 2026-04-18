@@ -1,8 +1,12 @@
 #pragma once
 
+#ifndef CACHELINE_SIZE
+#define CACHELINE_SIZE 64
+#endif
+
 template <typename Key, typename Value>
-struct CacheEntry {
-    void* _freelist_hook;      // 牺牲位：专门给 ObjectPool 存放 next 指针用，这样 ObjectPool 覆写前 8 字节时，只会覆盖这个无用的指针，不会破坏 key。
+struct alignas(CACHELINE_SIZE) CacheEntry {
+    void* _freelist_hook;      // 牺牲位：专门给 ObjectPool 存放 next 指针用，这样 ObjectPool 覆写前 8 字节时，只会覆盖这个无用的指针，不会破坏其它内容
     CacheEntry* hash_next;     // 供 CacheMap 使用的侵入式哈希链表指针
 
     struct list_node  policy_node;  // 供策略使用的链表节点（如果策略需要的话）
@@ -10,7 +14,8 @@ struct CacheEntry {
 
     Key   key;
     Value data;                // 这里直接存放 Value 对象，而不是指针
-    rwmutex_t rw_mtx;          // 读写锁，保护这个 CachEntry 的读写
+    
+    alignas(CACHELINE_SIZE) rwmutex_t rw_mtx;          // 读写锁，保护这个 CachEntry 的读写
 
     volatile int valid;       // 该 CacheEntry 中的 data 是否有效（能否被 get() 返回给用户使用）
     volatile int dirty;       // 表明是否需要写回 backend

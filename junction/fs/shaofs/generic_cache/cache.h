@@ -11,16 +11,19 @@ class Cache {
 public:
     using EntryType = CacheEntry<Key, Value>;
     using Handle    = CacheEntryHandle<Key, Value>;
+
 private:
-    Backend<Key, Value>*            backend;
-    ReplacementPolicy<Key, Value>*  policy;
-    ObjectPool<EntryType>*          entryPool;
-    static constexpr size_t POOL_PADDING = 100; // 防止突发峰值耗尽对象池
+    Backend<Key, Value>*            backend;    // 后端数据库
+    ReplacementPolicy<Key, Value>*  policy;     // 用于记录 victim CacheEntry 是哪个
+    ObjectPool<EntryType>*          entryPool;  // 用于分配 CacheEntry
 
     size_t capacity;
     IntrusiveCacheMap<Key, EntryType, Hash>* hashmap;
     
     spinlock_t shard_lock;    // 全局锁，保护 hashmap、LRU 链表、objpool（因此在这个 cache 框架中使用的 hashmap、LRU 链表、objpool 子模块都无需自带锁）
+
+    uint32_t touch_counter = 0;                       // 概率化计数器
+    static constexpr uint32_t TOUCH_SAMPLE = 16;      // 每 16 次 hit 才 touch 一次 policy（必须是 2 的幂，从而可以使用位运算优化）
 
     // 调用 evict_locked() 前必须持有全局锁，从而没有其它线程可以再访问 Hashmap、LRU 链表，中间可能会临时释放全局锁，函数返回时仍持有全局锁。返回值表示是否成功腾出了一个 CacheEntry
     bool evict_locked()   //  驱逐一个 cache entry，并写回后端（如果 dirty）
@@ -77,7 +80,7 @@ private:
         EntryType* entry = hashmap->find(key);
         if (entry) 
         {
-            policy->touch(entry);
+            if ((++touch_counter & (TOUCH_SAMPLE - 1)) == 0) policy->touch(entry);   // 减少 policy 更新开销
             return Handle(entry);
         }
 
@@ -86,7 +89,7 @@ private:
         {
             if (!evict_locked())   // 容量已满且驱逐失败（所有块都被 Pin 住了），触发调用方降级处理
             {
-                log_err("Allocation failed: capacity full and eviction failed");
+                // log_err("Allocation failed: capacity full and eviction failed");
                 return Handle(nullptr);
             }
 
@@ -109,25 +112,22 @@ private:
     }
 
 public:
-    Cache(size_t cap, Backend<Key, Value>* backend_ptr, ReplacementPolicy<Key, Value>* policy_ptr, void* pool_addr = nullptr, void* map_addr = nullptr) : capacity(cap), backend(backend_ptr), policy(policy_ptr)
+    Cache(size_t cap, Backend<Key, Value>* backend_ptr, ReplacementPolicy<Key, Value>* policy_ptr, void* pool_addr = nullptr) : capacity(cap), backend(backend_ptr), policy(policy_ptr)
     { 
         spin_lock_init(&shard_lock);
-        size_t bucket_count = (capacity * 2 > 0) ? (capacity * 2) : 16;
-        hashmap   = new IntrusiveCacheMap<Key, EntryType, Hash>(bucket_count, map_addr);  // 如果传入了 map_addr，hashmap 将在给定的内存上构建 bucket 数组；否则，它会在堆上自动 new 内存
-        entryPool = new ObjectPool<EntryType>(capacity + POOL_PADDING, pool_addr);        // 如果传入了 pool_addr，ObjectPool 将在给定的内存上构建对象；否则，它会在堆上自动 new 内存
+        hashmap   = new IntrusiveCacheMap<Key, EntryType, Hash>(capacity * 2);  // 根据 Cache 的容量（CacheEntry 的数目）来决定 hashmap bucket 的数目（降低负载因子）
+        entryPool = new ObjectPool<EntryType>(capacity, pool_addr);             // 如果传入了 pool_addr，ObjectPool 将在给定的内存上构建对象；否则，它会在堆上自动 new 内存
     }
     ~Cache() 
     {
+        flush_all();
         delete hashmap; 
         delete entryPool; 
     }
 
-    static size_t calculate_memory_size(size_t capacity) { return (capacity + POOL_PADDING) * sizeof(EntryType); }
-    static size_t calculate_alignment()                  { return alignof(EntryType); }
-
 
     // 独占访问：返回 Handle，调用者可通过 read_access()/write_access() 持锁操作。失败返回 Handle(nullptr)，由调用者自行 fallback
-    Handle getHandle(const Key& key)   
+    Handle getHandle(const Key& key, bool fetch_on_miss)   
     {
         spin_lock(&shard_lock);
         Handle entryHandle = find_or_allocate_locked(key);
@@ -136,18 +136,14 @@ public:
         if (!entryHandle) return Handle(nullptr); // 无法获取该 key 对应的 CacheEntry，触发调用方降级处理
 
         // 此时已经成功获取到一个 CacheEntry（可能是命中也可能是新分配的）
+        EntryType* entry = entryHandle.get_entry();
 
-        // 第一次检查：尝试轻量级的读锁命中
-        {
-            auto acc = entryHandle.read_access(); // 获取读访问器（尝试获取读锁）
-            EntryType* entry = entryHandle.get_entry();
-            if (atomic_read(&entry->valid)) return entryHandle;  // Fast Path: 完美命中内存
-        }
+        // Fast Path: 数据有效或者不需要从后端读取，则直接返回该 CacheEntry，调用者后续通过 read_access()/write_access() 按需加锁
+        if (atomic_read(&entry->valid) || !fetch_on_miss) return entryHandle;   
 
-        // 第二次检查：未能命中，必须获取写锁准备读取后端
+        // Slow path: entry 尚未 valid，需要从后端加载数据
         {
             auto acc = entryHandle.write_access(); // 获取写访问器（尝试获取写锁）
-            EntryType* entry = entryHandle.get_entry();
             if (atomic_read(&entry->valid)) return entryHandle;  // 获取到写锁后，必须再次检查 valid。因为在你等待写锁的期间，可能有其他线程已经完成了读盘操作！
 
             // 此时确信我是唯一持有写锁，且数据无效的线程。开始发起后端 I/O。
@@ -166,59 +162,24 @@ public:
     // 简单读取：拷贝 value 后立即释放，分配失败时自动 fallback 到后端直读
     bool get(const Key& key, Value& value)
     {
-        spin_lock(&shard_lock);
-        Handle entryHandle = find_or_allocate_locked(key);
-        spin_unlock(&shard_lock);
-
-        if (!entryHandle) return backend->read(key, value);  // fallback
-
-        // 第一次检查：尝试轻量级的读锁命中
-        {
-            auto acc = entryHandle.read_access();
-            EntryType* entry = entryHandle.get_entry();
-            if (atomic_read(&entry->valid)) { value = entry->data; return true; }
-        }
-
-        // 第二次检查：未能命中，必须获取写锁准备读取后端
-        {
-            auto acc = entryHandle.write_access();
-            EntryType* entry = entryHandle.get_entry();
-            if (atomic_read(&entry->valid)) { value = entry->data; return true; }
-
-            bool success = backend->read(key, entry->data);
-            if (success)
-            {
-                atomic_write(&entry->dirty, 0);
-                atomic_write(&entry->valid, 1);
-                value = entry->data;
-                return true;
-            }
-        }
-
-        return false;
+        Handle entryHandle = getHandle(key);
+        if (!entryHandle) return backend->read(key, value);   // 降级路径：如果 Cache 无法分配空间（全被 Pin 住）或后端加载彻底失败
+        value = *(entryHandle.read_access());
+        return true;
     }
 
     // 尝试将数据写入到 cache 中，若失败则 fallback 为直接写入到 backend
     bool put(const Key& key, const Value& value) 
     {
-        spin_lock(&shard_lock);
-        Handle entryHandle = find_or_allocate_locked(key);
-        spin_unlock(&shard_lock);
-
-        if (!entryHandle) 
-        {
-            log_err("Put failed: unable to find or allocate cache entry. Falling back to direct backend write.");
-            return backend->write(key, value); // 无法获取该 key 对应的 CacheEntry，触发调用方降级处理
-        }
+        Handle entryHandle = getHandle(key, false);           // 直接覆盖
+        if (!entryHandle) return backend->write(key, value);  // 降级路径：无法获取 CacheEntry 时，直接写后端
 
         {
-            auto acc = entryHandle.write_access(); // 获取写访问器（尝试获取写锁）
-            EntryType* entry = entryHandle.get_entry();
-            entry->data = value;
-            atomic_write(&entry->dirty, 1);
-            atomic_write(&entry->valid, 1);
+            auto acc = entryHandle.write_access();
+            *acc = value;
+            acc.mark_dirty();
+            atomic_write(&entryHandle.get_entry()->valid, 1);
         }
-
         return true;
     }
 
@@ -241,7 +202,7 @@ public:
         return true;
     }
     
-    void flush()   // 调用此函数时，应保证外部没有任何线程并发访问 Cache，例如系统终止时，不然该线程的阻塞时间就太久了。
+    void flush_all()   // 调用此函数时，应保证外部没有任何线程并发访问 Cache，例如系统终止时，不然该线程的阻塞时间就太久了。
     {
         spin_lock(&shard_lock);
 
@@ -252,6 +213,8 @@ public:
             {
                 if (atomic_read(&curr->dirty) && atomic_read(&curr->valid)) 
                 {
+                    Handle h(curr);
+                    auto acc = h.read_access();
                     if (backend->write(curr->key, curr->data)) atomic_write(&curr->dirty, 0); 
                     else log_err("Flush failed during shutdown for a key"); 
                 }
@@ -289,4 +252,6 @@ public:
         } 
         spin_unlock(&shard_lock);
     }
+
+    static size_t CacheEntry_footprint(size_t capacity) { return capacity * sizeof(EntryType); }
 };
