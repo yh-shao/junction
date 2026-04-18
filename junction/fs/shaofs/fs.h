@@ -5,6 +5,10 @@
 #define MYPREFIX                "FSHAO:"
 #define MYPREFIX_LEN            (sizeof(MYPREFIX) - 1)   // 不包括末尾的 \0，值为 6
 
+#ifndef CACHELINE_SIZE
+#define CACHELINE_SIZE 64
+#endif
+
 #define BLOCK_SIZE              4096
 typedef uint64_t BlockID;
 #define INVALID_BLOCK_ID ((BlockID)-1)
