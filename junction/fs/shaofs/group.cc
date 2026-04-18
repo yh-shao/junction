@@ -29,17 +29,9 @@ void get_group_by_blkid(BlockID blk, int* groupid, BlockID* bitmap, BlockID* dat
 	get_group_by_gid(gid, bitmap, datablock_start);
 }
 
-
-static inline void release_group_claim(unsigned int coreid)
-{
-    int old_gid = core_to_group[coreid];
-    if (old_gid >= 0 && old_gid < (int)sb.group_num) bitmap_atomic_clear(gmap, old_gid);
-    core_to_group[coreid] = -1;
-}
-
 void init_group()  
 {
-	memset(core_to_group, -1, sizeof(core_to_group));
+	memset(core_to_group, -1, NCPU * sizeof(int));
 
     GroupDescriptor* disk_gdt = new GroupDescriptor[sb.group_num]();
     storage_read_obj(disk_gdt, sb.group_num * sizeof(GroupDescriptor), sb.gdt_blockstart, 0);
@@ -65,44 +57,30 @@ void init_group()
     delete[] disk_gdt;
 }
 
-static int alloc_one_bit_from_bitmap_locked(bitmap_t bmap, uint32_t nr_bits, uint32_t* hint_io)  // 从 hint 开始环形寻找空闲 bit，并置 1
+static inline void release_group_claim(unsigned int coreid)
 {
-    uint32_t hint = *hint_io;
-    if (hint >= nr_bits) hint = 0;
+    if (unlikely(coreid >= NCPU)) { log_err("invalid core id"); return; }
 
-    for (uint32_t i = 0; i < nr_bits; ++i) 
-    {
-        uint32_t off = hint + i;
-        if (off >= nr_bits) off -= nr_bits;
-
-        if (!bitmap_test(bmap, off)) 
-        {
-            bitmap_set(bmap, off);
-            *hint_io = (off + 1) % nr_bits;
-            return (int)off;
-        }
-    }
-
-    *hint_io = 0;
-    return -1;
+    int old_gid = core_to_group[coreid];
+    if (old_gid >= 0 && old_gid < (int)sb.group_num) bitmap_atomic_clear(gmap, old_gid);
+    core_to_group[coreid] = -1;
 }
 
 bool set_newgroup(unsigned int coreid)
 {
     release_group_claim(coreid);
 
-	static int group_cursor = 0;
-	int start_idx = __sync_fetch_and_add(&group_cursor, 1);
-    if (sb.group_num != 0) start_idx %= sb.group_num;
+	static volatile unsigned int group_cursor = 0;
+    unsigned int start_idx = __atomic_fetch_add(&group_cursor, 1, __ATOMIC_RELAXED);
     
-	for (int i = 0; i < sb.group_num; i++)
+	for (unsigned int i = 0; i < sb.group_num; i++)
 	{
-		int gid = (start_idx + i) % sb.group_num;
+		unsigned int gid = (start_idx + i) % sb.group_num;
         if (__atomic_load_n(&group_info[gid].free_blocks_count, __ATOMIC_RELAXED) == 0) continue;     // free_blocks_count 这里只作为 hint 使用，不加锁
 
 		if (!bitmap_atomic_test_and_set(gmap, gid))       // claim 成功
 		{
-            if (__atomic_load_n(&group_info[gid].free_blocks_count, __ATOMIC_RELAXED) == 0)   // 再快速确认一次，避免 claim 到已经耗尽的组
+            if (unlikely(__atomic_load_n(&group_info[gid].free_blocks_count, __ATOMIC_RELAXED) == 0))   // 再快速确认一次，避免 claim 到已经耗尽的组
             {
                 bitmap_atomic_clear(gmap, gid);
                 continue;
@@ -134,9 +112,9 @@ BlockID alloc_block()
     {
         unsigned int snapshot_coreid;
         int          snapshot_gid;
-        BlockID      bitmap_lba;
-        BlockID      data_startlba; 
+        GroupDescExt* gdesc;
 
+        // 获取当前核所持有的 group （如果当前 group 不可用，会为该核再重新分配一个 group）
         {
             kguard k;
             snapshot_coreid = k->curr_cpu;
@@ -152,12 +130,12 @@ BlockID alloc_block()
                 snapshot_gid = core_to_group[snapshot_coreid];
             }
 
-            bitmap_lba    = group_info[snapshot_gid].bitmap_lba;
-            data_startlba = group_info[snapshot_gid].data_start_lba;
+            gdesc = &group_info[snapshot_gid];
         }
 
 
-        BlockHandle handle = bc_get_handle(bitmap_lba);
+        // 获取这个 group 中的 bitmap 块
+        BlockHandle handle = bc_get_handle(gdesc->bitmap_lba);
         if (unlikely(!handle)) 
         {
             log_err("[alloc_block] failed to get bitmap handle for gid=%d", snapshot_gid);
@@ -170,54 +148,136 @@ BlockID alloc_block()
             return INVALID_BLOCK_ID;
         }
 
-        // 先获取写锁（可能 yield），再进入不可抢占区做校验和 bitmap 操作
+        // 先获取 bitmap 块的写锁（这里可能会发生 uthread yield），再进入不可抢占区做校验和 bitmap 操作
         auto acc = handle.write_access();
         unsigned long* bmap = reinterpret_cast<unsigned long*>(acc->data);
 
+        // 尝试在这个 group 中分配 1 块
         {
             kguard k;
-            unsigned int curr_coreid = k->curr_cpu;
-            int curr_gid = core_to_group[curr_coreid];
+            if (k->curr_cpu != snapshot_coreid || core_to_group[k->curr_cpu] != snapshot_gid) continue;   // 重试（acc 析构释放写锁）
 
-            if (curr_coreid != snapshot_coreid || curr_gid != snapshot_gid) continue;   // 重试（acc 析构释放写锁）
+            SpinGuard g(&gdesc->lock);
+            if (unlikely(gdesc->free_blocks_count == 0)) continue;
 
-            spin_lock(&group_info[snapshot_gid].lock);
-            if (group_info[snapshot_gid].free_blocks_count == 0)
-            {
-                spin_unlock(&group_info[snapshot_gid].lock);
-                continue;
-            }
-
-            uint32_t hint = group_info[snapshot_gid].next_free_hint;
+            uint32_t hint = gdesc->next_free_hint;
             int allocated_offset = alloc_one_bit_from_bitmap_locked(bmap, DATABLOCKS_PERGROUP, &hint);
-            if (allocated_offset >= 0)
+            if (likely(allocated_offset >= 0))
             {
-                group_info[snapshot_gid].next_free_hint = hint;
-                group_info[snapshot_gid].free_blocks_count--;
-
-                BlockID allocated_blk = data_startlba + (uint32_t)allocated_offset;
-
+                gdesc->next_free_hint = hint;
+                gdesc->free_blocks_count--;
                 acc.mark_dirty();
-                spin_unlock(&group_info[snapshot_gid].lock);
 
+                BlockID allocated_blk = gdesc->data_start_lba + (uint32_t)allocated_offset;                
                 // log_info("Core %u allocated block %llu in group %d", curr_coreid, (unsigned long long)allocated_blk, snapshot_gid);
                 return allocated_blk;
             }
 
             // 理论上走到这里，说明 free_blocks_count 和 bitmap 不一致：统计说有空闲，但 bitmap 已满。将其修正为 0，然后重试。
-            log_warn("[alloc_block] gid=%d bitmap full but free_blocks_count=%u, force fix to 0", snapshot_gid, group_info[snapshot_gid].free_blocks_count);
+            log_warn("[alloc_block] gid=%d bitmap full but free_blocks_count=%u, force fix to 0", snapshot_gid, gdesc->free_blocks_count);
 
-            group_info[snapshot_gid].free_blocks_count = 0;
-            group_info[snapshot_gid].next_free_hint = 0;
-
-            spin_unlock(&group_info[snapshot_gid].lock);
+            gdesc->free_blocks_count = 0;
+            gdesc->next_free_hint = 0;
         }
     }
 }
 
+// 批量分配连续物理块，返回实际分配数量。
+// 尽可能在同一个 Block Group 中分配 count 个物理连续的数据块；如果当前组空间不足或存在碎片，它会跨越多次循环（甚至跨越多个 Block Group），拼凑出总计 count 个块，并将它们的 BlockID 记录在 out 数组中。
+int alloc_blocks(BlockID* out, int count)
+{
+    if (unlikely(count <= 0)) return 0;
+    if (count == 1) 
+    { 
+        out[0] = alloc_block(); 
+        return (out[0] != INVALID_BLOCK_ID) ? 1 : 0; 
+    }
+
+    int total_allocated = 0;
+    while (total_allocated < count)
+    {
+        unsigned int snapshot_coreid;
+        int          snapshot_gid;
+        GroupDescExt* gdesc;
+
+        // 获取当前核所持有的 group （如果当前 group 不可用，会为该核再重新分配一个 group）
+        {
+            kguard k;
+            snapshot_coreid = k->curr_cpu;
+            snapshot_gid    = core_to_group[snapshot_coreid];
+
+            if (snapshot_gid < 0 || snapshot_gid >= (int)sb.group_num || __atomic_load_n(&group_info[snapshot_gid].free_blocks_count, __ATOMIC_RELAXED) == 0)
+            {
+                if (!set_newgroup(snapshot_coreid)) 
+                {
+                    log_err("[alloc_blocks] disk is full or no claimable group");
+                    break;
+                }
+                snapshot_gid = core_to_group[snapshot_coreid];
+            }
+
+            gdesc = &group_info[snapshot_gid];
+        }
+
+        // 获取这个 group 中的 bitmap 块
+        BlockHandle handle = bc_get_handle(gdesc->bitmap_lba);
+        if (unlikely(!handle)) 
+        {
+            log_err("[alloc_blocks] failed to get bitmap handle for gid=%d", snapshot_gid);
+            
+            {
+                kguard k;
+                if (k->curr_cpu == snapshot_coreid && core_to_group[snapshot_coreid] == snapshot_gid) release_group_claim(snapshot_coreid);
+            }
+
+            break;
+        }
+
+        // 先获取 bitmap 块的写锁
+        auto acc = handle.write_access();
+        unsigned long* bmap = reinterpret_cast<unsigned long*>(acc->data);
+
+        int got = 0;
+        int start_offset = 0;
+
+        {
+            kguard k;
+            if (unlikely(k->curr_cpu != snapshot_coreid || core_to_group[k->curr_cpu] != snapshot_gid)) continue;
+
+            SpinGuard g(&gdesc->lock);
+
+            if (unlikely(gdesc->free_blocks_count == 0)) continue;
+
+            int want = MIN(count - total_allocated, gdesc->free_blocks_count);
+            uint32_t hint = gdesc->next_free_hint;
+            got = alloc_consecutive_bits_locked(bmap, DATABLOCKS_PERGROUP, &hint, want, &start_offset);
+            if (got > 0)
+            {
+                gdesc->next_free_hint = hint;
+                gdesc->free_blocks_count -= got;
+                acc.mark_dirty();
+            }
+            else
+            {
+                log_warn("[alloc_blocks] gid=%d bitmap full but free_blocks_count=%u, force fix to 0", snapshot_gid, gdesc->free_blocks_count);
+                gdesc->free_blocks_count = 0;
+                gdesc->next_free_hint = 0;
+            }
+        }
+
+        if (got > 0)
+        {
+            for (int i = 0; i < got; i++)
+                out[total_allocated++] = gdesc->data_start_lba + (uint32_t)(start_offset + i);
+        }
+    }
+
+    return total_allocated;
+}
+
 void free_block(BlockID blk)
 {
-    if (!is_datablock(blk)) 
+    if (unlikely(!is_datablock(blk))) 
     {
         log_err("[free_block] attempt to free non-data block or out-of-range block %llu", (unsigned long long)blk);
         return;
@@ -238,17 +298,18 @@ void free_block(BlockID blk)
     unsigned long* bmap = reinterpret_cast<unsigned long*>(acc->data);
 
     uint32_t offset = (uint32_t)(blk - data_start_lba);
-    if (offset >= DATABLOCKS_PERGROUP) 
+    if (unlikely(offset >= DATABLOCKS_PERGROUP)) 
     {
         log_err("[free_block] invalid offset=%u for blk=%llu in group=%u", offset, (unsigned long long)blk, gid);
         return;
     }
 
-    spin_lock(&group_info[gid].lock);
+    GroupDescExt* gdesc = &group_info[gid];
+    
+    SpinGuard g(&gdesc->lock);
 
-    if (!bitmap_test(bmap, offset)) 
+    if (unlikely(!bitmap_test(bmap, offset))) 
     {
-        spin_unlock(&group_info[gid].lock);
         log_warn("[free_block] double free detected for blk=%llu (group=%u, offset=%u)", (unsigned long long)blk, gid, offset);
         return;
     }
@@ -256,20 +317,12 @@ void free_block(BlockID blk)
     bitmap_clear(bmap, offset);  // 清掉 bitmap 中对应 bit
 
     // 更新空闲块计数；做一个上界保护，防止元数据继续漂坏
-    if (group_info[gid].free_blocks_count < DATABLOCKS_PERGROUP) 
-    {
-        group_info[gid].free_blocks_count++;
-    } 
-    else 
-    {
-        log_warn("[free_block] group %u free_blocks_count already saturated (%u), bitmap cleared for blk=%llu", gid, group_info[gid].free_blocks_count, (unsigned long long)blk);
-    }
+    if (likely(gdesc->free_blocks_count < DATABLOCKS_PERGROUP)) gdesc->free_blocks_count++;
+    else log_warn("[free_block] group %u free_blocks_count already saturated (%u), bitmap cleared for blk=%llu", gid, gdesc->free_blocks_count, (unsigned long long)blk);
 
-    if (offset < group_info[gid].next_free_hint) group_info[gid].next_free_hint = offset; // hint 尽量往前推进：若释放的位置比当前 hint 更靠前，则将 hint 移到这里，有利于后续尽快复用刚释放的块，减轻碎片。
+    if (offset < gdesc->next_free_hint) gdesc->next_free_hint = offset; // hint 尽量往前推进：若释放的位置比当前 hint 更靠前，则将 hint 移到这里，有利于后续尽快复用刚释放的块，减轻碎片。
 
     acc.mark_dirty();
-    spin_unlock(&group_info[gid].lock);
-
     // log_info("Freed block %llu in group %u", (unsigned long long)blk, gid);
 }
 
@@ -289,14 +342,15 @@ void sync_gdt(uint32_t gid)
     GroupDescriptor block_buf[BLOCK_SIZE / sizeof(GroupDescriptor)];
     storage_read_obj(block_buf, BLOCK_SIZE, lba, 0);
 
-    spin_lock(&group_info[gid].lock);
-    block_buf[idx_in_block].free_blocks_count = group_info[gid].free_blocks_count;
-    block_buf[idx_in_block].next_free_hint    = group_info[gid].next_free_hint;
-    block_buf[idx_in_block].flags             = group_info[gid].flags;
-    block_buf[idx_in_block].pad1              = 0;
-    block_buf[idx_in_block].pad2[0]           = 0;
-    block_buf[idx_in_block].pad2[1]           = 0;
-    spin_unlock(&group_info[gid].lock);
+    {
+        SpinGuard g(&group_info[gid].lock);
+        block_buf[idx_in_block].free_blocks_count = group_info[gid].free_blocks_count;
+        block_buf[idx_in_block].next_free_hint    = group_info[gid].next_free_hint;
+        block_buf[idx_in_block].flags             = group_info[gid].flags;
+        block_buf[idx_in_block].pad1              = 0;
+        block_buf[idx_in_block].pad2[0]           = 0;
+        block_buf[idx_in_block].pad2[1]           = 0;
+    }
 
     storage_write_obj(block_buf, BLOCK_SIZE, lba, 0);
 }
@@ -312,16 +366,13 @@ void sync_all_gdt()
 
     for (uint32_t i = 0; i < sb.group_num; ++i)   // 如果系统终止前已经停止了所有并发 alloc/free，这里其实不加锁也可以。
     {
-        spin_lock(&group_info[i].lock);
-
+        SpinGuard g(&group_info[i].lock);
         disk_gdt[i].free_blocks_count = group_info[i].free_blocks_count;
         disk_gdt[i].next_free_hint    = group_info[i].next_free_hint;
         disk_gdt[i].flags             = group_info[i].flags;
         disk_gdt[i].pad1              = 0;
         disk_gdt[i].pad2[0]           = 0;
         disk_gdt[i].pad2[1]           = 0;
-
-        spin_unlock(&group_info[i].lock);
     }
 
     storage_write_obj(disk_gdt, sb.group_num * sizeof(GroupDescriptor), sb.gdt_blockstart, 0);

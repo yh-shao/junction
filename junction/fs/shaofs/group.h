@@ -3,7 +3,7 @@
 
 extern int core_to_group[];
 struct alignas(64) GroupDescExt {
-    spinlock_t lock;
+    spinlock_t lock;                // 多个核可能会访问到同一个 group（一个核在进行分配，另一个核在进行释放）
     uint32_t   free_blocks_count;   // 当前空闲数据块数
     uint32_t   next_free_hint;      // 记录上次分配到的位置
     uint32_t   flags;               // 状态标志位
@@ -23,5 +23,7 @@ void get_group_by_blkid(BlockID blk, int* groupid, BlockID* bitmap, BlockID* dat
 bool is_datablock(BlockID block_id);
 
 BlockID alloc_block();
+int alloc_blocks(BlockID* out, int count);  // 批量分配连续块，返回实际分配数量
 void free_block(BlockID blk);
+void sync_gdt(uint32_t gid);
 void sync_all_gdt();
