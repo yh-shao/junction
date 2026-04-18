@@ -6,7 +6,6 @@
 #define MYPREFIX_LEN            (sizeof(MYPREFIX) - 1)   // 不包括末尾的 \0，值为 6
 
 #define BLOCK_SIZE              4096
-struct BlockData { char data[BLOCK_SIZE]; };
 typedef uint64_t BlockID;
 #define INVALID_BLOCK_ID ((BlockID)-1)
 

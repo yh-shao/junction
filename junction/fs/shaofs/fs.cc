@@ -11,6 +11,12 @@ void init_meta()
 {
     storage_read_obj(&sb, sizeof(SuperBlock), SUPERBLOCK_LOCATION, 0);
 
+    if (sb.group_num == 0) 
+    {
+        log_err("invalid group number!");
+        exit(1);
+    }
+
     imap = new unsigned long[BITMAP_LONG_SIZE(sb.inode_num)]();
     storage_read_obj(imap, BITMAP_LONG_SIZE(sb.inode_num) * sizeof(unsigned long), sb.imap_blockstart, 0);
 
