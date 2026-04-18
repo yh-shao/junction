@@ -7,12 +7,12 @@ struct alignas(64) GroupDescExt {
     uint32_t   free_blocks_count;   // 当前空闲数据块数
     uint32_t   next_free_hint;      // 记录上次分配到的位置
     uint32_t   flags;               // 状态标志位
+    uint32_t   owner_count;         // 记录当前有多少个 core 在使用此 group
 
     BlockID    bitmap_lba;                   // 该 group 的 bitmap 起始块
     BlockID    data_start_lba;               // 该 group 的第一个数据块
     uint32_t   group_id;                     // group 编号，便于调试
-    uint32_t   reserved;                     // 补齐/保留
-    GroupDescExt() : free_blocks_count(0), next_free_hint(0), flags(0), bitmap_lba(0), data_start_lba(0), group_id(0), reserved(0) { spin_lock_init(&lock); }  // 初始值
+    GroupDescExt() : free_blocks_count(0), next_free_hint(0), flags(0), owner_count(0), bitmap_lba(0), data_start_lba(0), group_id(0) { spin_lock_init(&lock); }  // 初始值
 };
 extern GroupDescExt* group_info;
 
@@ -25,5 +25,5 @@ bool is_datablock(BlockID block_id);
 BlockID alloc_block();
 int alloc_blocks(BlockID* out, int count);  // 批量分配连续块，返回实际分配数量
 void free_block(BlockID blk);
-void sync_gdt(uint32_t gid);
+void free_extent(const iExtent* ext);
 void sync_all_gdt();
