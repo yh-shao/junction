@@ -30,8 +30,6 @@ extern "C" {
 #define ALIGN(x, k) (((x) + (k) - 1) / (k) * (k))
 #endif
 
-typedef unsigned long* bitmap_t;
-
 struct SpinGuard 
 {
     spinlock_t* m;
@@ -116,3 +114,62 @@ public:
 
     struct kthread* get() const { return k_; }   // 提供一个获取裸指针的普通方法作为备用
 };
+
+/* Bitmap 相关操作 */
+typedef unsigned long* bitmap_t;
+
+// 从 hint 开始环形寻找一个空闲 bit，并置 1
+static inline int alloc_one_bit_from_bitmap_locked(bitmap_t bmap, uint32_t nr_bits, uint32_t* hint_io)  
+{
+    uint32_t hint = (*hint_io >= nr_bits) ? 0 : *hint_io;
+    uint32_t off;
+
+    for (off = hint; off < nr_bits; ++off)         // 从 hint 一路查找到末尾
+        if (!bitmap_test(bmap, off)) goto found;
+    
+    for (off = 0; off < hint; ++off)               // 如果没找到，从头查找到 hint
+        if (!bitmap_test(bmap, off)) goto found;
+
+    // 没有空闲 bit
+    *hint_io = 0;
+    return -1;
+
+found:  // 找到了空闲 bit
+    bitmap_set(bmap, off);
+    *hint_io = (off + 1 == nr_bits) ? 0 : off + 1;
+    return (int)off;
+}
+
+// （尽力）批量分配连续空闲 bit
+// 从 hint 开始，在 bitmap 中环形搜索第一个空闲的 bit，一旦找到第一个空闲 bit，就以它为起点，向后尽量多地分配连续的空闲 bit。当分配数量达到了 requested、或者遇到了被占用的 bit、或者触碰到了位图的物理边界（nr_bits）时，分配停止。
+// 通过 out_start 带回起始位置，并通过返回值告诉调用者实际分配成功了多少个 bit。
+static inline int alloc_consecutive_bits_locked(bitmap_t bmap, uint32_t nr_bits, uint32_t* hint_io, int requested, int* out_start)
+{
+    if (nr_bits == 0 || requested <= 0) return 0;
+
+    uint32_t hint = (*hint_io >= nr_bits) ? 0 : *hint_io;
+    uint32_t off;
+
+    // 寻找第一个空闲位
+    for (off = hint; off < nr_bits; ++off) 
+        if (!bitmap_test(bmap, off)) goto found;
+    for (off = 0; off < hint; ++off) 
+        if (!bitmap_test(bmap, off)) goto found;
+    
+    // 没有空闲位了
+    *hint_io = 0;
+    return 0;
+
+found:   // 从找到的空闲位开始，贪婪地连续分配
+    *out_start = (int)off;
+    int count = 0;
+    while (count < requested && off < nr_bits && !bitmap_test(bmap, off))    // 确保不超额、不越界、且当前位确实空闲
+    {
+        bitmap_set(bmap, off);
+        off++;
+        count++;
+    }
+
+    *hint_io = (off == nr_bits) ? 0 : off;
+    return count;
+}
