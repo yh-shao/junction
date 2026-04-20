@@ -6,7 +6,7 @@
 #include "dir.h"
 
 #define DEFAULT_DENTRYCACHE_CAPACITY 16384
-#define DEFAULT_DENTRY_SHARD_NUM     16
+#define DEFAULT_DENTRY_SHARD_NUM     256
 
 struct DentryKey {     // Dentry 缓存的 Key：由【父目录的 Inode 号】和【当前层级文件名】组合而成
     int  parent_inum;
@@ -52,11 +52,9 @@ class DentryBackend : public Backend<DentryKey, DentryValue> {
 public:
     bool read(const DentryKey& key, DentryValue& value) override
     {
-        file_type_t type;
+        file_type_t type = UNKNOWN;
         int inum = dir_lookup(key.parent_inum, key.name, &type);
-        if (inum == -1) return false; // 文件不存在，返回失败，Cache 保持无效状态
-
-        value.inum = inum;
+        value.inum = inum;   // 若 inum 为 -1，则表示这个元素“不存在”  （Negative Cache）
         value.type = type;
         return true;
     } 
