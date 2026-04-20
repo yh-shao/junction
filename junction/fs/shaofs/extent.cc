@@ -12,18 +12,7 @@ extern "C" {
 
 #define MAX_EXTENTS  (DIRECT_EXTENT_NUM + EXTENTS_PER_BLOCK)
 
-bool block_in_extent(BlockID logical_blk, const iExtent& ext)
-{
-    return (logical_blk >= ext.logical_start && logical_blk < ext.logical_start + ext.block_count);
-}
-
-int get_valid_extent_count(const iExtent* extents, int max_count) 
-{
-    int count = 0;
-    while (count < max_count && extents[count].block_count > 0) count++;
-    return count;
-}
-BlockID lookup_extent(const iExtent* extents, int valid_count, BlockID logical_blk)   // 在有序的 Extent 数组中进行二分查找，若找到，则直接返回物理块号
+BlockID lookup_extent(const iExtent* extents, int valid_count, BlockID logical_blk, iExtent* out_extent)   // 在有序的 Extent 数组中进行二分查找，若找到，则直接返回物理块号
 {
     int left = 0, right = valid_count - 1;
     while (left <= right) 
@@ -36,7 +25,10 @@ BlockID lookup_extent(const iExtent* extents, int valid_count, BlockID logical_b
         else if (logical_blk >= ext.logical_start + ext.block_count) 
             left = mid + 1;
         else   // 命中
+        {
+            if (out_extent) *out_extent = ext;
             return ext.physical_start + (logical_blk - ext.logical_start);  
+        }
     }
     return INVALID_BLOCK_ID;
 }
@@ -60,147 +52,209 @@ int compact_extents_inplace(iExtent* exts, int count)   // 就地排序 + 合并
     return write_pos + 1;
 }
 
-// 约定：调用此函数前，caller 必须持有该 inode 的读锁（无需allocate）或写锁（需要allocate）
-BlockID inode_bmap_locked(DInode* inode_ptr, int inum, BlockID logical_blk, bool allocate, bool* is_new) 
+static BlockID bmap_lookup(MInode* inode, BlockID logical_blk)   // 在 inode 中查找这个 logical_blk，若能找到，则返回对应的实际物理块号
 {
-    if (is_new) *is_new = false; // 默认初始化为老块（并非新分配的块）
-    MInode* minode = static_cast<MInode*>(inode_ptr);
+    if (inode->valid_extent_count == 0) return INVALID_BLOCK_ID;
 
-    // Hint Fast Path: 检查上次查找的 extent 是否命中（顺序访问 O(1)）
-    const iExtent& hint = minode->extent_hint;
-    if (hint.block_count > 0 && block_in_extent(logical_blk, hint)) return hint.physical_start + (logical_blk - hint.logical_start);
+    // Fast Path: Hint 缓存
+    if (spin_try_lock(&inode->hint_lock)) 
+    {
+        iExtent hint = inode->extent_hint;
+        spin_unlock(&inode->hint_lock);
+        if (block_in_extent(logical_blk, hint)) return hint.physical_start + (logical_blk - hint.logical_start);
+    }
 
-    // Fast Path: 尝试在 Direct Extents 中直接命中
-    int direct_count = get_valid_extent_count(inode_ptr->direct_extents, DIRECT_EXTENT_NUM);
-    BlockID phys_blk = lookup_extent(inode_ptr->direct_extents, direct_count, logical_blk);
+    uint32_t total_exts = inode->valid_extent_count, direct_count = direct_extent_count(inode), indirect_count = indirect_extent_count(inode);
+
+    // Fast Path: 单 extent
+    if (total_exts == 1)
+    {
+        const iExtent& ext = inode->direct_extents[0];
+        if (block_in_extent(logical_blk, ext)) 
+        {
+            update_extent_hint(inode, ext);
+            return ext.physical_start + (logical_blk - ext.logical_start);
+        }
+    }
+
+    // 在 direct extents 中进行查找
+    iExtent found;
+    BlockID phys_blk = lookup_extent(inode->direct_extents, direct_count, logical_blk, &found);
     if (phys_blk != INVALID_BLOCK_ID)
     {
-        // 更新 hint
-        for (int i = 0; i < direct_count; i++)
-        {
-            const auto& ext = inode_ptr->direct_extents[i];
-            if (block_in_extent(logical_blk, ext)) { minode->extent_hint = ext; break; }
-        }
+        update_extent_hint(inode, found);
         return phys_blk;
     }
 
-    BlockHandle ind_bh;
-    int indirect_count = 0;
-    if (direct_count == DIRECT_EXTENT_NUM)  // 尝试在 Indirect Extents 中命中
+    // 在 indirect extents 中进行查找
+    if (uses_indirect_block(inode))
     {
-        ind_bh = bc_get_handle(inode_ptr->indirect_extent_block);
+        BlockHandle ind_bh = bc_get_handle(inode->indirect_extent_block);   // TODO：此时如果发生加载，则会阻塞所有需要读取这个 inode 的线程，可以优化为采用 prefetch 策略
         if (unlikely(!ind_bh)) 
         {
-            log_err("[inode_bmap()] Failed to get indirect block [%lu] for inode %d", inode_ptr->indirect_extent_block, inum);
+            log_err("[bmap_lookup_locked()] Failed to get indirect block [%lu] for inode %d", inode->indirect_extent_block, inode->idx);
             return INVALID_BLOCK_ID;
         }
 
         {
-            auto ind_read_acc = ind_bh.read_access();
-            const iExtent* ind_exts = reinterpret_cast<const iExtent*>(ind_read_acc->data);
-            indirect_count = get_valid_extent_count(ind_exts, EXTENTS_PER_BLOCK);
-            phys_blk = lookup_extent(ind_exts, indirect_count, logical_blk);
+            auto acc = ind_bh.read_access();
+            const iExtent* ind_exts = reinterpret_cast<const iExtent*>(acc->data);
+            phys_blk = lookup_extent(ind_exts, indirect_count, logical_blk, &found);
             if (phys_blk != INVALID_BLOCK_ID)
             {
-                // 更新 hint（在释放 indirect block 读锁之前拷贝）
-                for (int i = 0; i < indirect_count; i++)
-                {
-                    const auto& ext = ind_exts[i];
-                    if (block_in_extent(logical_blk, ext)) { minode->extent_hint = ext; break; }
-                }
+                update_extent_hint(inode, found);
+                return phys_blk;
             }
         }
-
-        if (phys_blk != INVALID_BLOCK_ID) return phys_blk;
-    }// 离开作用域，ind_read_acc 析构，自动释放间接块的读锁
-
-    if (allocate == false) return INVALID_BLOCK_ID; // 读取模式遇到空洞，返回
-
-    // 新分配一个块，并加入到现有 extent 数组中
-    BlockID new_phys_blk = alloc_block();
-    if (new_phys_blk == INVALID_BLOCK_ID) return INVALID_BLOCK_ID; // 磁盘已满
-
-    iExtent all_extents[MAX_EXTENTS + 1];   // 栈分配，零堆开销
-    int ext_count = 0;
-    for (int i = 0; i < direct_count; ++i) all_extents[ext_count++] = inode_ptr->direct_extents[i];
-
-    if (ind_bh) // 如果间接块有效（说明该 inode 有用到 indirect extent block），重新获取读锁拷贝其内容
-    {
-        auto ind_read_acc = ind_bh.read_access();
-        const iExtent* ind_exts = reinterpret_cast<const iExtent*>(ind_read_acc->data);
-        indirect_count = get_valid_extent_count(ind_exts, EXTENTS_PER_BLOCK);
-        // for (int i = 0; i < indirect_count; ++i) all_extents.push_back(ind_exts[i]); 
-        for (int i = 0; i < indirect_count; ++i) all_extents[ext_count++] = ind_exts[i];
     }
-    all_extents[ext_count++] = {.logical_start = logical_blk, .physical_start = new_phys_blk, .block_count = 1};
-    ext_count = compact_extents_inplace(all_extents, ext_count);  // 就地压缩，无堆分配
 
+    return INVALID_BLOCK_ID;
+}
+
+static bool bmap_try_append(MInode* inode, BlockID logical_blk, BlockID phys_blk)  // 尝试追加到末尾 extent 中
+{
+    if (inode->valid_extent_count == 0)    // 当前这个 inode 还没有任何分配的块
+    {
+        iExtent new_ext = { .logical_start = logical_blk, .physical_start = phys_blk, .block_count = 1 };
+        inode->direct_extents[0] = new_ext;
+        inode->valid_extent_count = 1;
+        update_extent_hint(inode, new_ext);
+        return true;
+    }
+
+    if (uses_indirect_block(inode))   // 追加到 indirect extent block 中
+    {
+        BlockHandle ind_bh = bc_get_handle(inode->indirect_extent_block);
+        if (unlikely(!ind_bh)) 
+        {
+            log_err("[bmap_try_append()] Failed to get indirect block [%lu] for inode %d", inode->indirect_extent_block, inode->idx);
+            return false;
+        }
+
+        {
+            auto acc = ind_bh.write_access();
+            iExtent* exts = reinterpret_cast<iExtent*>(acc->data);
+            iExtent& last = exts[indirect_extent_count(inode) - 1];
+
+            if (last.logical_start + last.block_count == logical_blk && last.physical_start + last.block_count == phys_blk)
+            {
+                last.block_count++;
+                acc.mark_dirty();
+                update_extent_hint(inode, last);
+                return true;
+            }
+        }
+    }
+    else   // 追加到 direct extents 中
+    {
+        iExtent& last = inode->direct_extents[direct_extent_count(inode) - 1];
+        if (last.logical_start + last.block_count == logical_blk && last.physical_start + last.block_count == phys_blk)
+        {
+            last.block_count++;
+            update_extent_hint(inode, last);
+            return true;
+        }
+    }
+
+    return false; // 无法简单追加，交由 Slow Path 处理
+}
+
+static bool bmap_insert_compact(MInode* inode, BlockID logical_blk, BlockID phys_blk)
+{
+    iExtent all_extents[MAX_EXTENTS + 1];
+    int ext_count = 0;
+
+    // 收集所有的 Extent
+    uint32_t direct_cnt = direct_extent_count(inode);
+    for (uint32_t i = 0; i < direct_cnt; ++i) all_extents[ext_count++] = inode->direct_extents[i];
+
+    BlockHandle ind_bh;
+    if (uses_indirect_block(inode))
+    {
+        ind_bh = bc_get_handle(inode->indirect_extent_block);
+        if (unlikely(!ind_bh)) 
+        {
+            log_err("[inode_bmap_locked()] Failed to get indirect block [%lu] for inode %d", inode->indirect_extent_block, inode->idx);
+            return false;
+        }
+        
+        {
+            auto acc = ind_bh.read_access();
+            const iExtent* exts = reinterpret_cast<const iExtent*>(acc->data);
+            uint32_t ind_cnt = indirect_extent_count(inode);
+            for (uint32_t i = 0; i < ind_cnt; ++i) all_extents[ext_count++] = exts[i];
+        }
+    }
+
+    // 加入新 Extent 并就地合并
+    all_extents[ext_count++] = { .logical_start = logical_blk, .physical_start = phys_blk, .block_count = 1 };
+    ext_count = compact_extents_inplace(all_extents, ext_count);
     if (ext_count > MAX_EXTENTS)
     {
-        log_err("[extent] Extent array overflow for inode %d!", inum);
-        free_block(new_phys_blk); // 事务回滚
-        return INVALID_BLOCK_ID;
+        log_err("[extent] Extent array overflow for inode %d!", inode->idx);
+        return false;
     }
 
-    // 写回 Direct 区域 (直接修改 inode_ptr，因为调用者已经加了写锁)（inode 一定会被修改）
+    if (ext_count > DIRECT_EXTENT_NUM && !ind_bh)    // 需要将 extent 写入到 indirect extent block 中
+    {
+        ind_bh = bc_get_handle(inode->indirect_extent_block);
+        if (unlikely(!ind_bh)) 
+        {
+            log_err("[bmap_insert_compact] Failed to fetch pre-allocated indirect block %lu for inode %d", inode->indirect_extent_block, inode->idx);
+            return false;
+        }
+    }
+
+    // 写回元数据
+    inode->valid_extent_count = ext_count;
     int global_idx = 0;
-    for (int i = 0; i < DIRECT_EXTENT_NUM; ++i) 
+    for (int i = 0; i < DIRECT_EXTENT_NUM; ++i)  // 写回 Direct 区域
     {
-        if (global_idx < ext_count) inode_ptr->direct_extents[i] = all_extents[global_idx++];
-        else 
-        {
-            memset(&inode_ptr->direct_extents[i], 0, sizeof(iExtent) * (DIRECT_EXTENT_NUM - i));
-            break;
-        }
+        if (global_idx < ext_count) inode->direct_extents[i] = all_extents[global_idx++];
+        else { memset(&inode->direct_extents[i], 0, sizeof(iExtent) * (DIRECT_EXTENT_NUM - i)); break; }
     }
 
-    if (ind_bh)
+    if (ext_count > DIRECT_EXTENT_NUM)           // 写回 Indirect 区域
     {
-        auto ind_write_acc = ind_bh.write_access();    // 此时必须获取写锁！
-        iExtent* ind_exts = reinterpret_cast<iExtent*>(ind_write_acc->data);
-        
-        for (int i = 0; i < EXTENTS_PER_BLOCK; ++i) 
+        auto acc = ind_bh.write_access();
+        iExtent* exts = reinterpret_cast<iExtent*>(acc->data);
+        for (int i = 0; i < EXTENTS_PER_BLOCK; ++i)
         {
-            if (global_idx < ext_count) ind_exts[i] = all_extents[global_idx++];
-            else 
-            {
-                memset(&ind_exts[i], 0, sizeof(iExtent) * (EXTENTS_PER_BLOCK - i));
-                break;
-            }
+            if (global_idx < ext_count) exts[i] = all_extents[global_idx++];
+            else { memset(&exts[i], 0, sizeof(iExtent) * (EXTENTS_PER_BLOCK - i)); break; }
         }
-        ind_write_acc.mark_dirty(); // 标记间接块为脏
+        acc.mark_dirty();
     }
 
-    if (is_new) *is_new = true;
-    return new_phys_blk;
+    update_extent_hint(inode, { .logical_start = logical_blk, .physical_start = phys_blk, .block_count = 1 });
+    return true;
 }
-BlockID inode_bmap(int inum, BlockID logical_blk, bool allocate, bool* is_new)
+
+// 约定：调用此函数前，caller 必须持有该 inode 的读锁（无需allocate）或写锁（需要allocate）
+BlockID inode_bmap_locked(MInode* inode_ptr, BlockID logical_blk, bool allocate, bool* is_new)
 {
-    InodeHandle ih = ic_get_inode(inum);
-    if (unlikely(!ih)) 
+    if (is_new) *is_new = false;
+
+    BlockID phys_blk = bmap_lookup(inode_ptr, logical_blk);  // 查找 inode 中是否有该逻辑块号，若有则返回相应的物理块号
+    if (phys_blk != INVALID_BLOCK_ID) return phys_blk;
+
+    if (!allocate) return INVALID_BLOCK_ID;    // 该 inode 中没有该逻辑块号
+
+    // 新分配一个块
+    BlockID new_phys_blk = alloc_block();
+    if (new_phys_blk == INVALID_BLOCK_ID) 
     {
-        log_err("[inode_bmap()] Failed to get inode %d from cache", inum);
+        log_err("[inode_bmap_locked()] Fail to alloc a new block");
         return INVALID_BLOCK_ID;
     }
+    if (is_new) *is_new = true;
 
-    BlockID phys_blk = INVALID_BLOCK_ID;
-    bool newly_allocated = false;
+    // 将新分配的块加入到 inode 中，更新相关 extent 的信息
+    if (bmap_try_append(inode_ptr, logical_blk, new_phys_blk)) return new_phys_blk;     // Fast Path: 尝试快速追加到最后一个 extent 中
+    if (bmap_insert_compact(inode_ptr, logical_blk, new_phys_blk)) return new_phys_blk; // Slow Path: 触发 Extent 数组重排合并
 
-    if (allocate)
-    {
-        auto write_acc = ih.write_access();
-        DInode* inode_ptr = &(*write_acc);
-        phys_blk = inode_bmap_locked(inode_ptr, inum, logical_blk, true, &newly_allocated);
-        if (newly_allocated) write_acc.mark_dirty();
-    }
-    else
-    {
-        auto read_acc = ih.read_access();
-        DInode* inode_ptr = const_cast<MInode*>(&(*read_acc));
-        phys_blk = inode_bmap_locked(inode_ptr, inum, logical_blk, false, is_new);
-    }
-
-    if (is_new) *is_new = newly_allocated;
-
-    return phys_blk;
+    // 异常恢复 (Rollback)
+    free_block(new_phys_blk);
+    if (is_new) *is_new = false;
+    return INVALID_BLOCK_ID;
 }

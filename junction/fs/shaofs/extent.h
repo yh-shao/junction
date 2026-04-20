@@ -3,7 +3,11 @@
 #include "fs.h"
 #include "inode.h"
 
-int get_valid_extent_count(const iExtent* extents, int max_count);
-BlockID lookup_extent(const iExtent* extents, int valid_count, BlockID logical_blk);
-BlockID inode_bmap_locked(DInode* inode_ptr, int inum, BlockID logical_blk, bool allocate, bool* is_new = nullptr);
-BlockID inode_bmap(int inum, BlockID logical_blk, bool allocate, bool* is_new = nullptr);
+BlockID lookup_extent(const iExtent* extents, int valid_count, BlockID logical_blk, iExtent* out_extent = nullptr);
+BlockID inode_bmap_locked(MInode* inode_ptr, BlockID logical_blk, bool allocate, bool* is_new);
+
+static inline bool block_in_extent(BlockID logical_blk, const iExtent& ext)
+{
+    if (ext.block_count == 0) return false;
+    return (logical_blk >= ext.logical_start && logical_blk < ext.logical_start + ext.block_count);
+}
