@@ -96,7 +96,8 @@ typedef struct {
 	uint64_t    ctime;                              // 创建时间
 	uint64_t    mtime;                              // 修改时间
 	uint64_t    atime;                              // 访问时间
-	char        pad[56];
+    uint32_t    valid_extent_count;                 // 有效的 extent 数量
+	char        pad[52];
 } DInode;     // disk inode (256B)
 
 extern SuperBlock sb;

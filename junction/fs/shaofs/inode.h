@@ -24,7 +24,6 @@ struct MInode : public DInode
 
 int alloc_inum();
 void free_inum(int inum);
-bool uses_indirect_block(const DInode* ino);
 
 static inline void update_extent_hint(MInode* inode, const iExtent& ext) 
 {
@@ -33,4 +32,17 @@ static inline void update_extent_hint(MInode* inode, const iExtent& ext)
         inode->extent_hint = ext;
         spin_unlock(&inode->hint_lock);
     }
+}
+
+static inline bool uses_indirect_block(const MInode* inode) 
+{
+    return inode->valid_extent_count > DIRECT_EXTENT_NUM;
+}
+static inline uint32_t direct_extent_count(const MInode* inode)
+{
+    return MIN(inode->valid_extent_count, (uint32_t)DIRECT_EXTENT_NUM);
+}
+static inline uint32_t indirect_extent_count(const MInode* inode)
+{
+    return inode->valid_extent_count - direct_extent_count(inode);
 }
