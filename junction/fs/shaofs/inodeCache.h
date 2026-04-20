@@ -6,7 +6,7 @@
 #include "blockCache.h"
 
 #define DEFAULT_INODECACHE_CAPACITY 8192
-#define DEFAULT_INODE_SHARD_NUM     128
+#define DEFAULT_INODE_SHARD_NUM     256
 
 class InodeBackend : public Backend<int, MInode> {
 public:
@@ -63,5 +63,3 @@ InodeHandle ic_get_inode(int inum);
 void ic_flush_all();
 bool ic_flush_inode(int inum);     // 将指定 inode 刷写到后端（如果在缓存中且为脏）
 bool ic_free_inode(int inum);
-
-void print_inode_info(int inum);
