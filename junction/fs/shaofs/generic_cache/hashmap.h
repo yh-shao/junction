@@ -21,7 +21,34 @@ private:
 
     Hash hasher;
 
-    inline size_t get_bucket_idx(const Key& key) const { return hasher(key) & (num_buckets - 1); }   
+    static inline size_t mix_for_bucket(size_t h)
+    {
+        if constexpr (sizeof(size_t) >= sizeof(uint64_t))
+        {
+            uint64_t x = static_cast<uint64_t>(h);
+            x ^= x >> 33;
+            x *= 0xff51afd7ed558ccdULL;
+            x ^= x >> 33;
+            x *= 0xc4ceb9fe1a85ec53ULL;
+            x ^= x >> 33;
+            return static_cast<size_t>(x);
+        }
+        else
+        {
+            uint32_t x = static_cast<uint32_t>(h);
+            x ^= x >> 16;
+            x *= 0x7feb352dU;
+            x ^= x >> 15;
+            x *= 0x846ca68bU;
+            x ^= x >> 16;
+            return static_cast<size_t>(x);
+        }
+    }
+
+    inline size_t get_bucket_idx(const Key& key) const
+    {
+        return mix_for_bucket(hasher(key)) & (num_buckets - 1);
+    }   
 
 public:
     IntrusiveCacheMap(size_t buckets_count)  : num_buckets(std::bit_ceil(buckets_count)), current_size(0)
@@ -46,6 +73,19 @@ public:
             curr = curr->hash_next;
         }
         return nullptr;
+    }
+
+    size_t probe_depth(const Key& key) const
+    {
+        size_t depth = 0;
+        EntryType* curr = buckets[get_bucket_idx(key)];
+        while (curr)
+        {
+            depth++;
+            if (curr->key == key) return depth;
+            curr = curr->hash_next;
+        }
+        return 0;
     }
 
     void insert(EntryType* entry)   // 将 entry 串到链上（零拷贝）
