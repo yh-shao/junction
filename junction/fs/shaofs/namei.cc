@@ -68,6 +68,11 @@ static int namex(const char* path, bool nameiparent, char* name)  // nameiparent
             next_inum = read_acc->inum;
             type = read_acc->type;
         }
+        if (next_inum == -1) 
+        {
+            log_err("[namei] Path component '%s' not found.", name);
+            return -1;
+        }
 
         // 安全检查：如果路径还没解析完，但当前节点已经不是目录了，则是非法的；比如想解析 "/a/b/c"，但 "b" 只是个普通文本文件，不能再往下钻了
         if (*path != '\0' && type != DIRECTORY) 

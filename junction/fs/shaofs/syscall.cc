@@ -271,7 +271,7 @@ static void fill_stat_from_inode(const MInode* inode, int inum, struct stat *st)
 
     // 统计已分配的物理块数（st_blocks 单位为 512B 扇区）
     uint64_t allocated_blocks = 0;
-    int direct_count = get_valid_extent_count(inode->direct_extents, DIRECT_EXTENT_NUM);
+    int direct_count = direct_extent_count(inode);
     for (int i = 0; i < direct_count; i++)
         allocated_blocks += inode->direct_extents[i].block_count;
 
@@ -283,7 +283,7 @@ static void fill_stat_from_inode(const MInode* inode, int inum, struct stat *st)
         {
             auto ind_acc = ind_bh.read_access();
             const iExtent* ind_exts = reinterpret_cast<const iExtent*>(ind_acc->data);
-            int indirect_count = get_valid_extent_count(ind_exts, EXTENTS_PER_BLOCK);
+            int indirect_count = indirect_extent_count(inode);
             for (int i = 0; i < indirect_count; i++) allocated_blocks += ind_exts[i].block_count;
         }
     }
@@ -340,7 +340,7 @@ int my_fsync(int inum)
         if (!read_acc->used) return -ENOENT;
 
         // 刷写 direct extents 引用的物理块
-        int direct_count = get_valid_extent_count(read_acc->direct_extents, DIRECT_EXTENT_NUM);
+        int direct_count = direct_extent_count(&(*read_acc));
         for (int i = 0; i < direct_count; i++)
         {
             const iExtent& ext = read_acc->direct_extents[i];
@@ -359,7 +359,7 @@ int my_fsync(int inum)
             {
                 auto ind_acc = ind_bh.read_access();
                 const iExtent* ind_exts = reinterpret_cast<const iExtent*>(ind_acc->data);
-                int indirect_count = get_valid_extent_count(ind_exts, EXTENTS_PER_BLOCK);
+                int indirect_count = indirect_extent_count(&(*read_acc));
                 for (int i = 0; i < indirect_count; i++)
                 {
                     const iExtent& ext = ind_exts[i];

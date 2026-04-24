@@ -141,6 +141,7 @@ int dir_add_entry(int dir_inum, const char* name, int inum, file_type_t type)
     new_entry.inum = inum;
     new_entry.filetype = type;
     strncpy(new_entry.name, name, NAMESIZ);
+    new_entry.name[NAMESIZ - 1] = '\0';
 
     ssize_t written = file_write(dir_inum, (const char*)&new_entry, target_offset, sizeof(Dirent));
     if (written != sizeof(Dirent))
