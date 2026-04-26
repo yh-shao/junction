@@ -52,6 +52,13 @@ void prewarm_dsa_driver()
     }
 
     req_total_size = offsetof(struct dsa_req, job) + DSA_HWpath_job_size;
+    if (dsa_req_pool_init(req_total_size) != 0)
+    {
+        log_info("[Pre-warm] Warning: Could not initialize DSA request cache. Falling back to CPU memcpy.\n");
+        req_total_size = 0;
+        return;
+    }
+
     dsa_ready = 1;
     log_info("[Pre-warm] DSA Hardware driver loaded successfully.\n");
 }
@@ -64,7 +71,7 @@ void dsa_copy(void *dst, const void *src, size_t len)
         return;
     }
     
-    struct dsa_req* req = (struct dsa_req*)malloc(req_total_size);
+    struct dsa_req* req = dsa_req_alloc();
     if (!req)
     {
         memcpy(dst, src, len);
@@ -74,7 +81,7 @@ void dsa_copy(void *dst, const void *src, size_t len)
     dml_status_t init_status = dml_init_job(DML_PATH_HW, &req->job);
     if (unlikely(init_status != DML_STATUS_OK))
     {
-        free(req);
+        dsa_req_free(req);
         memcpy(dst, src, len);
         return;
     }
@@ -90,7 +97,7 @@ void dsa_copy(void *dst, const void *src, size_t len)
     {
         log_info("DSA job submission failed with status %d, falling back to CPU memcpy", status);
         dml_finalize_job(&req->job);
-        free(req);
+        dsa_req_free(req);
         memcpy(dst, src, len);
         return;
     }
