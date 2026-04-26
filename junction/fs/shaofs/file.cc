@@ -5,6 +5,7 @@
 #include "extent.h"
 #include <vector>
 #include "group.h"
+#include "dsa.h"
 
 // 释放 inode 持有的所有数据块（direct + indirect extents）。调用前必须持有 inode 写锁。
 static void free_inode_data_blocks(MInode* inode_ptr)
@@ -118,7 +119,8 @@ ssize_t file_read(int inum, char* buf, off_t offset, size_t len)
 
                 {
                     auto block_read_acc = bh.read_access();     // 获取这一个物理块的共享读锁
-                    memcpy(buf + bytes_read, block_read_acc->data + blk_offset, copy_len);
+                    // memcpy(buf + bytes_read, block_read_acc->data + blk_offset, copy_len);
+                    dsa_copy(buf + bytes_read, block_read_acc->data + blk_offset, copy_len);  // 使用 DSA 加速内存复制，释放 CPU 资源
                 }  // 自动释放物理块读锁
             }
         }
