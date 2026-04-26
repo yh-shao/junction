@@ -145,6 +145,7 @@ set(CUSTOM_GLIBC_INTERPRETER_PATH
 )
 
 add_compile_definitions(JUNCTION_INSTALL_DIR=\"${CMAKE_SOURCE_DIR}/install\")
+add_compile_definitions(DIRECT_STORAGE)   # 添加这个宏到当前目录及其子目录下的所有 C/C++ 源文件中 （struct kthread 的定义与是否定义了 DIRECT_STORAGE 宏有关）
 
 if(EXISTS ${CUSTOM_GLIBC_INTERPRETER_PATH})
   message("Setting custom ld.so interpreter to ${CUSTOM_GLIBC_INTERPRETER_PATH}")
