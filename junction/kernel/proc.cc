@@ -369,7 +369,7 @@ Status<std::pair<std::shared_ptr<Process>, Thread *>> Process::CreateInit(
   auto proc = std::make_shared<Process>(*pid, std::move(*mm), fsr);
 
   thread_t *th = thread_create(nullptr, 0);
-  LOG(INFO) << "[Process::CreateInit] Created uthread " << th;
+  // LOG(INFO) << "[Process::CreateInit] Created uthread " << th;
   if (!th) return MakeError(ENOMEM);
 
   Thread *tstate = reinterpret_cast<Thread *>(th->junction_tstate_buf);
@@ -396,7 +396,7 @@ Status<std::shared_ptr<Process>> Process::CreateProcessVfork(
 
 Status<Thread *> Process::CreateThreadMain(const Thread &oldth) {
   thread_t *th = thread_create(nullptr, 0);
-  LOG(INFO) << "[Process::CreateThreadMain] Created uthread " << th;
+  // LOG(INFO) << "[Process::CreateThreadMain] Created uthread " << th;
   if (!th) return MakeError(ENOMEM);
 
   Thread *tstate = reinterpret_cast<Thread *>(th->junction_tstate_buf);
@@ -410,7 +410,7 @@ Status<Thread *> Process::CreateThreadMain(const Thread &oldth) {
 
 Status<Thread *> Process::CreateThread(const Thread &oldth) {
   thread_t *th = thread_create(nullptr, 0);
-  LOG(INFO) << "[Process::CreateThread] Created uthread " << th;
+  // LOG(INFO) << "[Process::CreateThread] Created uthread " << th;
   if (unlikely(!th)) return MakeError(ENOMEM);
 
   Status<pid_t> tid = AllocPid();
