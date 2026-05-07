@@ -1,13 +1,10 @@
 message(STATUS "Building junction filesystem")
 
-find_library(DML_LIB   # 查找 libdml (通常在 /usr/local/lib 或 /usr/lib64)
-    NAMES dml 
+find_library(DML_LIB   # 查找 libdml 静态库，避免运行时依赖 libdml.so
+    NAMES libdml.a
     PATHS /usr/local/lib /usr/local/lib64 /usr/lib /usr/lib64
-    NO_DEFAULT_PATH    # 以此优先查找指定路径，若失败去掉此行可查系统默认
+    NO_DEFAULT_PATH
 )
-if (NOT DML_LIB)       # 如果上面找不到，尝试在默认系统路径找
-    find_library(DML_LIB NAMES dml)
-endif()
 
 find_path(DML_INCLUDE_DIR   # 查找 dml.h 头文件路径
     NAMES dml/dml.h 
@@ -20,7 +17,7 @@ if (DML_LIB AND DML_INCLUDE_DIR)   # 检查是否找到
     message(STATUS "Found Intel DML Library: ${DML_LIB}")
     message(STATUS "Found Intel DML Header: ${DML_INCLUDE_DIR}")
 else()
-    message(FATAL_ERROR "Could NOT find Intel DML library. Please install it to /usr/local")
+    message(FATAL_ERROR "Could NOT find Intel DML static library. Please install libdml.a to /usr/local/lib")
 endif()
 
 add_library(fs
