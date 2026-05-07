@@ -1083,7 +1083,7 @@ Status<void> InitMyFs()
   init_block_cache();
   init_inode_cache();
   init_dentry_cache();
-  prewarm_dsa_driver();  // 预热 DSA 驱动
+  dsa_init(nullptr);
 
   // TODO: 
   // set rootdir 

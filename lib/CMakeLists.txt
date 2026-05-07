@@ -57,12 +57,6 @@ separate_arguments(CALADAN_RUNTIME_LIBS UNIX_COMMAND "${CALADAN_RUNTIME_LIBS}")
 string(REPLACE "LDFLAGS =" " " CALADAN_RUNTIME_LDFLAGS "${CALADAN_RUNTIME_LDFLAGS}")
 separate_arguments(CALADAN_RUNTIME_LDFLAGS UNIX_COMMAND "${CALADAN_RUNTIME_LDFLAGS}")
 
-list(APPEND CALADAN_RUNTIME_LIBS 
-    "/usr/local/lib/libdml.a" 
-    "uuid" 
-    "stdc++"
-)
-
 add_library(caladan_runtime STATIC IMPORTED GLOBAL)
 add_dependencies(caladan_runtime caladan_src)
 set_target_properties(caladan_runtime PROPERTIES IMPORTED_LOCATION ${CALADAN_PATH}/libruntime.a)
