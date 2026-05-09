@@ -1079,6 +1079,7 @@ ino_t AllocateInodeNumber() {
 
 Status<void> InitMyFs()
 {
+  log_info("Start to init My FS!");
   init_meta();
   init_block_cache();
   init_inode_cache();
@@ -1088,7 +1089,7 @@ Status<void> InitMyFs()
   // TODO: 
   // set rootdir 
   // set CWD
-  log_info("My FS init over");
+  log_info("My FS init over!");
   return {};
 }
 

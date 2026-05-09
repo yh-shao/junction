@@ -2,7 +2,7 @@
 #include "utili.h"
 
 #define SHAOFS                  517
-#define MYPREFIX                "FSHAO:"
+#define MYPREFIX                "FSHAO"
 #define MYPREFIX_LEN            (sizeof(MYPREFIX) - 1)   // 不包括末尾的 \0，值为 6
 
 #ifndef CACHELINE_SIZE
