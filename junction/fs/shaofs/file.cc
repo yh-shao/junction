@@ -4,8 +4,10 @@
 #include "file.h"
 #include "extent.h"
 #include <vector>
+#include <utility>
 #include "group.h"
 #include "dsa.h"
+#include <boost/container/small_vector.hpp>
 
 // 释放 inode 持有的所有数据块（direct + indirect extents）。调用前必须持有 inode 写锁。
 static void free_inode_data_blocks(MInode* inode_ptr)
@@ -76,7 +78,23 @@ void final_flush()
 	// log_info("[flush] duration: %lu us", (after_flush - before_flush) / cycles_per_us);
 }
 
-ssize_t file_read(int inum, char* buf, off_t offset, size_t len)
+static constexpr size_t kFileBatchCopyMin = 64 * 1024;  // 64k
+
+template <typename VecType>
+static void append_segment(VecType& vecs, const Segment& seg)
+{
+    if (seg.len == 0) return;
+    if (!vecs.empty())
+    {
+        Segment& last = vecs.back();
+        char* last_dst_end = static_cast<char*>(last.dst) + last.len;
+        const char* last_src_end = static_cast<const char*>(last.src) + last.len;
+        if (last_dst_end == seg.dst && last_src_end == seg.src) { last.len += seg.len; return; }
+    }
+    vecs.push_back(seg);
+}
+
+static ssize_t file_read_blockwise(int inum, char* buf, off_t offset, size_t len)
 {   
     if (len == 0) return 0;
 
@@ -119,8 +137,8 @@ ssize_t file_read(int inum, char* buf, off_t offset, size_t len)
 
                 {
                     auto block_read_acc = bh.read_access();     // 获取这一个物理块的共享读锁
-                    // memcpy(buf + bytes_read, block_read_acc->data + blk_offset, copy_len);
-                    dsa_copy(buf + bytes_read, block_read_acc->data + blk_offset, copy_len);  // 使用 DSA 加速内存复制，释放 CPU 资源
+                    // dsa_copy(buf + bytes_read, block_read_acc->data + blk_offset, copy_len);
+                    memcpy(buf + bytes_read, block_read_acc->data + blk_offset, copy_len);
                 }  // 自动释放物理块读锁
             }
         }
@@ -132,7 +150,88 @@ ssize_t file_read(int inum, char* buf, off_t offset, size_t len)
     return bytes_read;
 }
 
-ssize_t file_write(int inum, const char* buf, off_t offset, size_t len)
+static ssize_t file_read_batch(int inum, char* buf, off_t offset, size_t len)
+{
+    if (len == 0) return 0;
+
+    InodeHandle ih = ic_get_inode(inum);
+    if (unlikely(!ih))
+    {
+        log_err("[file_read] Failed to get inode %d from cache", inum);
+        return -1;
+    }
+
+    using ReadAcc = decltype(std::declval<BlockHandle>().read_access());
+    const size_t max_blocks = dsa_batch_task_num;
+    boost::container::small_vector<BlockHandle, max_blocks> handles;
+    boost::container::small_vector<ReadAcc, max_blocks> accessors;
+    boost::container::small_vector<Segment, max_blocks> vecs;
+    
+    uint64_t bytes_read = 0;
+    while (bytes_read < len)
+    {
+        uint64_t batch_bytes = 0;
+
+        {
+            auto read_acc = ih.read_access();
+            if (!read_acc->used || offset + bytes_read >= read_acc->file_size) break;
+
+            handles.clear();
+            accessors.clear();
+            vecs.clear();
+
+            for (size_t blocks = 0; blocks < max_blocks && bytes_read + batch_bytes < len; blocks++)
+            {
+                uint64_t current_offset = offset + bytes_read + batch_bytes;
+                if (current_offset >= read_acc->file_size) break;
+
+                uint64_t logical_blk = current_offset / BLOCK_SIZE, blk_offset  = current_offset % BLOCK_SIZE;
+                uint64_t actual_remain = read_acc->file_size - current_offset;
+                uint64_t request_remain = len - bytes_read - batch_bytes;
+                uint64_t copy_len = MIN(BLOCK_SIZE - blk_offset, MIN(request_remain, actual_remain));
+                if (copy_len == 0) break;
+
+                BlockID phys_blk = inode_bmap_locked(const_cast<MInode*>(&(*read_acc)), logical_blk, false, nullptr);
+                if (phys_blk == INVALID_BLOCK_ID)
+                {
+                    memset(buf + bytes_read + batch_bytes, 0, copy_len);
+                    batch_bytes += copy_len;
+                    continue;
+                }
+
+                BlockHandle bh = bc_get_handle(phys_blk);
+                if (unlikely(!bh))
+                {
+                    log_err("[file_read] Failed to read physical block %lu", phys_blk);
+                    return bytes_read;
+                }
+
+                handles.emplace_back(std::move(bh));
+                accessors.emplace_back(handles.back().read_access());
+                append_segment(vecs, {buf + bytes_read + batch_bytes, accessors.back()->data + blk_offset, copy_len});
+                batch_bytes += copy_len;
+            }
+
+            if (!vecs.empty()) dsa_copyv(vecs.data(), vecs.size());
+            vecs.clear();
+            accessors.clear();
+            handles.clear();
+        }
+
+        if (batch_bytes == 0) break;
+        bytes_read += batch_bytes;
+    }
+
+    return bytes_read;
+}
+
+ssize_t file_read(int inum, char* buf, off_t offset, size_t len)
+{
+    if (len >= kFileBatchCopyMin) return file_read_batch(inum, buf, offset, len);
+    return file_read_blockwise(inum, buf, offset, len);
+}
+
+static ssize_t file_write_blockwise(int inum, const char* buf, off_t offset, size_t len)
 {
     if (len == 0) return 0;
 
@@ -175,7 +274,7 @@ ssize_t file_write(int inum, const char* buf, off_t offset, size_t len)
                     }
 
                     auto block_write_acc = bh.write_access(); // 获取 Block 独占写锁保证单块安全
-                    memcpy(block_write_acc->data + blk_offset, buf + bytes_written, copy_len);
+                    dsa_copy(block_write_acc->data + blk_offset, buf + bytes_written, copy_len);
                     block_write_acc.mark_dirty();
 
                     bytes_written += copy_len;
@@ -213,7 +312,7 @@ ssize_t file_write(int inum, const char* buf, off_t offset, size_t len)
             {
                 auto block_write_acc = bh.write_access();
                 if (is_new_block && copy_len < BLOCK_SIZE) memset(block_write_acc->data, 0, BLOCK_SIZE);   // 新分配的块若未写满，必须填 0
-                memcpy(block_write_acc->data + blk_offset, buf + bytes_written, copy_len);
+                dsa_copy(block_write_acc->data + blk_offset, buf + bytes_written, copy_len);
                 block_write_acc.mark_dirty();
             }
 
@@ -226,6 +325,104 @@ ssize_t file_write(int inum, const char* buf, off_t offset, size_t len)
     }
 
     return (bytes_written == 0 && len > 0) ? -1 : bytes_written;
+}
+
+static ssize_t file_write_batch_existing(int inum, const char* buf, off_t offset, size_t len)
+{
+    if (len == 0) return 0;
+
+    InodeHandle ih = ic_get_inode(inum);
+    if (unlikely(!ih))
+    {
+        log_err("[file_write] Failed to get inode %d from cache", inum);
+        return -1;
+    }
+
+    using WriteAcc = decltype(std::declval<BlockHandle>().write_access());
+    const size_t max_blocks = dsa_batch_task_num;
+    boost::container::small_vector<BlockHandle, max_blocks> handles;
+    boost::container::small_vector<WriteAcc, max_blocks> accessors;
+    boost::container::small_vector<Segment, max_blocks> vecs;
+
+    uint64_t bytes_written = 0;
+    while (bytes_written < len)
+    {
+        uint64_t batch_bytes = 0;
+        bool stop_batching = false;
+
+        {
+            auto read_acc = ih.read_access();
+            if (!read_acc->used)
+            {
+                log_err("[file_write] Inode %d is not in use", inum);
+                return bytes_written > 0 ? bytes_written : -1;
+            }
+
+            handles.clear();
+            accessors.clear();
+            vecs.clear();
+
+            for (size_t blocks = 0; blocks < max_blocks && bytes_written + batch_bytes < len; blocks++)
+            {
+                uint64_t current_offset = offset + bytes_written + batch_bytes;
+                uint64_t logical_blk = current_offset / BLOCK_SIZE, blk_offset  = current_offset % BLOCK_SIZE;
+                uint64_t copy_len = MIN(BLOCK_SIZE - blk_offset, len - bytes_written - batch_bytes);
+                if (copy_len == 0) break;
+
+                if (current_offset + copy_len > read_acc->file_size)
+                {
+                    stop_batching = true;
+                    break;
+                }
+
+                BlockID phys_blk = inode_bmap_locked(const_cast<MInode*>(&(*read_acc)), logical_blk, false, nullptr);
+                if (phys_blk == INVALID_BLOCK_ID)
+                {
+                    stop_batching = true;
+                    break;
+                }
+
+                BlockHandle bh = bc_get_handle(phys_blk);
+                if (unlikely(!bh))
+                {
+                    log_err("[file_write] Fast path failed to get cache handle");
+                    return bytes_written;
+                }
+
+                handles.emplace_back(std::move(bh));
+                accessors.emplace_back(handles.back().write_access());
+                append_segment(vecs, {accessors.back()->data + blk_offset, buf + bytes_written + batch_bytes, copy_len});
+                batch_bytes += copy_len;
+            }
+
+            if (!vecs.empty())
+            {
+                dsa_copyv(vecs.data(), vecs.size());
+                for (auto& acc : accessors) acc.mark_dirty();
+            }
+            vecs.clear();
+            accessors.clear();
+            handles.clear();
+        }
+
+        bytes_written += batch_bytes;
+        if (batch_bytes == 0 || stop_batching) break;
+    }
+
+    return bytes_written;
+}
+
+ssize_t file_write(int inum, const char* buf, off_t offset, size_t len)
+{
+    if (len < kFileBatchCopyMin) return file_write_blockwise(inum, buf, offset, len);
+
+    ssize_t batch_written = file_write_batch_existing(inum, buf, offset, len);
+    if (batch_written < 0) return batch_written;
+    if (static_cast<size_t>(batch_written) == len) return batch_written;
+
+    ssize_t rest = file_write_blockwise(inum, buf + batch_written, offset + batch_written, len - batch_written);
+    if (rest < 0) return batch_written > 0 ? batch_written : rest;
+    return batch_written + rest;
 }
 
 
