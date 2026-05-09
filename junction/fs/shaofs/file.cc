@@ -8,6 +8,9 @@
 #include "group.h"
 #include "dsa.h"
 #include <boost/container/small_vector.hpp>
+extern "C" {
+#include "runtime/runtime.h"
+}
 
 // 释放 inode 持有的所有数据块（direct + indirect extents）。调用前必须持有 inode 写锁。
 static void free_inode_data_blocks(MInode* inode_ptr)
@@ -65,8 +68,10 @@ void truncate_inode(int inum)
 
 void final_flush()
 {
-	// atomic64_write(&runtime_info->spdk_uipi, 0);  // 停止让 IOKernel 检查 SPDK 完成情况
-	// barrier();
+#if IO_PREEMPT
+	atomic64_write(&runtime_info->spdk_uipi, 0);  // 停止让 IOKernel 检查 SPDK 完成情况
+	barrier();
+#endif
 
 	RuntimeFSBaseGuard g;
 	// uint64_t before_flush = rdtsc();
@@ -458,7 +463,7 @@ ssize_t file_read_direct(int inum, char* buf, off_t offset, size_t len)
             if (phys_blk == INVALID_BLOCK_ID) memset(buf + bytes_read, 0, copy_len);  // 处理文件空洞 (Hole)：直接将对应的用户 Buffer 填 0，无需下发 I/O
             else
             {
-                // bc_flush_block(phys_blk);  // 若该块在 cache 中且为脏，先刷盘保证一致性，从而 Direct I/O 能读到 Cache 中尚未落盘的脏数据 （为什么不直接从 Cache 中读取呢？这里还是直接点，简化逻辑）
+                bc_flush_block(phys_blk);  // 若该块在 cache 中且为脏，先刷盘保证 Direct I/O 能读到最新数据
                 if (storage_read_obj(buf + bytes_read, copy_len, phys_blk, blk_offset) != 0) break;
             }
         }
@@ -504,13 +509,14 @@ ssize_t file_write_direct(int inum, const char* buf, off_t offset, size_t len)
                 phys_blk = inode_bmap_locked(const_cast<MInode*>(&(*read_acc)), logical_blk, false, nullptr);
                 if (phys_blk != INVALID_BLOCK_ID) 
                 {
-                    // bc_invalidate_block(phys_blk);  // 关键：Direct I/O 写入磁盘前，如果该物理块在 Block Cache 中，必须将其失效（或者刷盘后失效），否则后续的 Buffered Read 会读到 Cache 中的旧数据
+                    bc_flush_block(phys_blk);
 
                     if (storage_write_obj(buf + bytes_written, copy_len, phys_blk, blk_offset) != 0) 
                     {
                         log_err("[file_write_direct] Failed to write to physical block %lu", phys_blk);
                         break;
                     }
+                    bc_invalidate_block(phys_blk);
                     use_fast_path = true;
                 }
             }
@@ -535,7 +541,7 @@ ssize_t file_write_direct(int inum, const char* buf, off_t offset, size_t len)
             phys_blk = inode_bmap_locked(&*write_acc, logical_blk, true, &is_new_block);
             if (phys_blk == INVALID_BLOCK_ID) break;
 
-            // bc_invalidate_block(phys_blk);   // 新分配的块大概率不在 Cache 中，但如果是复用的被释放的块，为了安全依然 invalidate 一下
+            bc_flush_block(phys_blk);
 
             int ret = 0;
             if (is_new_block) 
@@ -543,6 +549,7 @@ ssize_t file_write_direct(int inum, const char* buf, off_t offset, size_t len)
             else 
                 ret = storage_write_obj(buf + bytes_written, copy_len, phys_blk, blk_offset);
             if (unlikely(ret != 0)) break;
+            bc_invalidate_block(phys_blk);
 
             uint64_t new_end_pos = current_offset + copy_len;
             if (new_end_pos > write_acc->file_size) write_acc->file_size = new_end_pos;

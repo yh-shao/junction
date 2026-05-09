@@ -48,4 +48,5 @@ void init_block_cache(size_t capacity, size_t shard_num)
 
 BlockHandle bc_get_handle(BlockID id) { return get_block_cache().getHandle(id);   }
 bool bc_flush_block(BlockID id)       { return get_block_cache().flush_entry(id); }
+void bc_invalidate_block(BlockID id)  {        get_block_cache().invalidate(id);  }
 void bc_flush_all()                   {        get_block_cache().flush_all();     }
