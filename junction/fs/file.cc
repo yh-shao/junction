@@ -680,7 +680,7 @@ long usys_newfstatat(int dirfd, const char *c_path, struct stat *statbuf,
 
   if (USE_SHAOFS(c_path))
   {
-    const char* realpath = c_path + MYPREFIX_LEN;
+    const char* realpath = SHAOFS_REALPATH(c_path);
     return my_newfstatat(realpath, statbuf);
   }
 

@@ -28,6 +28,10 @@ typedef uint64_t BlockID;
 #define DIRECT_EXTENT_NUM       6                   // 每个 inode 中的 direct extent 数目
 #define DEFAULT_EXTENT_LENGTH   10                  // 为目录文件预分配的块数
 
+#ifndef IO_PREEMPT
+#define IO_PREEMPT              0                   // 是否启用 IOKernel 的 IO 完成抢占
+#endif
+
 #define BMAPNUM_PERGROUP        1                   // 每个 group 中 bitmap 占多少个块
 #define DATABLOCKS_PERGROUP     (BMAPNUM_PERGROUP * BLOCK_SIZE * 8)  // 4096*8=32768
 #define TOTALBLOCKS_PERGROUP    (BMAPNUM_PERGROUP + DATABLOCKS_PERGROUP) 
@@ -105,4 +109,16 @@ extern bitmap_ptr_t imap;
 extern bitmap_ptr_t gmap;
 
 void init_meta();
-static inline bool USE_SHAOFS(const char *pathname) { return (strncmp(pathname, MYPREFIX, MYPREFIX_LEN) == 0); }
+
+static inline const char* SHAOFS_REALPATH(const char* pathname)
+{
+    if (pathname == nullptr) return nullptr;
+    if (strncmp(pathname, MYPREFIX, MYPREFIX_LEN) != 0) return nullptr;
+
+    const char *p = pathname + MYPREFIX_LEN;
+    if (*p == ':') p++;
+    if (*p == '\0') return "/";
+    if (*p != '/') return nullptr;
+    return p;
+}
+static inline bool USE_SHAOFS(const char *pathname) { return SHAOFS_REALPATH(pathname) != nullptr; }

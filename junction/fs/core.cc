@@ -414,9 +414,8 @@ long usys_mknodat(int dirfd, const char *pathname, mode_t mode, dev_t dev) {
 }
 
 long usys_mkdir(const char *pathname, mode_t mode) {
-  if (strncmp(pathname, MYPREFIX, MYPREFIX_LEN) == 0)
+  if (const char* realpath = SHAOFS_REALPATH(pathname))
   {
-    const char* realpath = pathname + MYPREFIX_LEN;
     // log_info("[usys_mkdir(%s)] This is a shaofs path.", realpath);
     return my_mkdir(realpath, mode);
   }
@@ -525,9 +524,8 @@ long usys_renameat2(int olddirfd, const char *oldpath, int newdirfd,
 }
 
 long usys_openat(int dirfd, const char *pathname, int flags, mode_t mode) {
-  if (strncmp(pathname, MYPREFIX, MYPREFIX_LEN) == 0)   // 判断 pathname 是否具有指定前缀（从而识别用的是 shaofs）
+  if (const char* realpath = SHAOFS_REALPATH(pathname))   // 判断 pathname 是否具有指定前缀（从而识别用的是 shaofs）
   {
-    const char* realpath = pathname + MYPREFIX_LEN;  // 去除前缀，取出实际路径
     int inum = my_open(realpath, flags, mode);
     // log_info("opened file inum: %d", inum);
     if (inum < 0)

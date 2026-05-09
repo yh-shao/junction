@@ -2,6 +2,9 @@
 #include "utili.h"
 #include <cstring>
 #include "group.h"
+extern "C" {
+#include "runtime/runtime.h"
+}
 
 SuperBlock sb;
 bitmap_ptr_t imap;
@@ -48,6 +51,8 @@ void init_meta()
 
     init_group();
 
-    // barrier();
-    // atomic64_write(&runtime_info->spdk_uipi, 1);   // 之后让 IOKernel 检查 SPDK 完成情况
+#if IO_PREEMPT
+    barrier();
+    atomic64_write(&runtime_info->spdk_uipi, 1);   // 之后让 IOKernel 检查 SPDK 完成情况
+#endif
 }
