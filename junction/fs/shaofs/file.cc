@@ -7,6 +7,7 @@
 #include <utility>
 #include "group.h"
 #include "dsa.h"
+#include "journal.h"
 #include <boost/container/small_vector.hpp>
 extern "C" {
 #include "runtime/runtime.h"
@@ -75,10 +76,11 @@ void final_flush()
 
 	RuntimeFSBaseGuard g;
 	// uint64_t before_flush = rdtsc();
-	storage_write_obj(imap, BITMAP_LONG_SIZE(sb.inode_num) * sizeof(unsigned long), sb.imap_blockstart, 0);
+    journal_write_metadata(imap, BITMAP_LONG_SIZE(sb.inode_num) * sizeof(unsigned long), sb.imap_blockstart, 0);
 	sync_all_gdt();
 	ic_flush_all();
 	bc_flush_all();
+    journal_mark_clean();
 	// uint64_t after_flush = rdtsc();
 	// log_info("[flush] duration: %lu us", (after_flush - before_flush) / cycles_per_us);
 }
@@ -313,6 +315,7 @@ static ssize_t file_write_blockwise(int inum, const char* buf, off_t offset, siz
                 log_err("[file_write] Failed to get cache handle for physical block %lu", phys_blk);
                 break;
             }
+            if (write_acc->type == DIRECTORY) journal_register_metadata_block(phys_blk);
 
             {
                 auto block_write_acc = bh.write_access();
@@ -540,6 +543,7 @@ ssize_t file_write_direct(int inum, const char* buf, off_t offset, size_t len)
 
             phys_blk = inode_bmap_locked(&*write_acc, logical_blk, true, &is_new_block);
             if (phys_blk == INVALID_BLOCK_ID) break;
+            if (write_acc->type == DIRECTORY) journal_register_metadata_block(phys_blk);
 
             bc_flush_block(phys_blk);
 

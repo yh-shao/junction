@@ -31,10 +31,15 @@ typedef uint64_t BlockID;
 #ifndef IO_PREEMPT
 #define IO_PREEMPT              0                   // 是否启用 IOKernel 的 IO 完成抢占
 #endif
+#ifndef CRASH_CONSISTENCY
+#define CRASH_CONSISTENCY       1                   // 是否启用 metadata journal + recovery
+#endif
 
 #define BMAPNUM_PERGROUP        1                   // 每个 group 中 bitmap 占多少个块
 #define DATABLOCKS_PERGROUP     (BMAPNUM_PERGROUP * BLOCK_SIZE * 8)  // 4096*8=32768
 #define TOTALBLOCKS_PERGROUP    (BMAPNUM_PERGROUP + DATABLOCKS_PERGROUP) 
+
+#define DEFAULT_JOURNAL_BLOCKS  4096                // 16MB redo journal, placed at disk tail
 
 typedef enum {
     UNKNOWN = 0,
@@ -64,6 +69,9 @@ typedef struct {
     uint64_t       gdt_blocknum;                 // group descriptor table 占用的块数
 
     BlockID        group_blockstart;             // 第一个 group 的起始块（它的 bitmap）
+
+    BlockID        journal_blockstart;           // Journal 区域起始块（盘尾预留）
+    uint64_t       journal_blocknum;             // Journal 区域块数
 
     uint32_t       root_inode;                   // root 目录对应的 inode 号
 } SuperBlock;

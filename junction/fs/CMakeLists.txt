@@ -1,5 +1,7 @@
 message(STATUS "Building junction filesystem")
 
+option(SHAOFS_CRASH_CONSISTENCY "Enable ShaOFS metadata journal" ON)
+
 find_library(DML_LIB   # 查找 libdml 静态库，避免运行时依赖 libdml.so
     NAMES libdml.a
     PATHS /usr/local/lib /usr/local/lib64 /usr/lib /usr/lib64
@@ -45,9 +47,14 @@ add_library(fs
   shaofs/dentryCache.cc
   shaofs/extent.cc
   shaofs/dsa.cc
+  shaofs/journal.cc
   shaofs/syscall.cc
   shaofs/namei.cc
   shaofs/dir.cc
+)
+
+target_compile_definitions(fs PRIVATE
+  CRASH_CONSISTENCY=$<IF:$<BOOL:${SHAOFS_CRASH_CONSISTENCY}>,1,0>
 )
 
 target_include_directories(fs PRIVATE ${DML_INCLUDE_DIR})   # 添加头文件包含路径

@@ -1,6 +1,7 @@
 #include "group.h"
 #include "fs.h"
 #include "blockCache.h"
+#include "journal.h"
 
 int core_to_group[NCPU];   // 每个 core 从哪个 group 中分配空闲块
 GroupDescExt* group_info;
@@ -326,7 +327,7 @@ void sync_all_gdt()
         disk_gdt[i].pad2[1]           = 0;
     }
 
-    storage_write_obj(disk_gdt, sb.group_num * sizeof(GroupDescriptor), sb.gdt_blockstart, 0);
+    journal_write_metadata(disk_gdt, sb.group_num * sizeof(GroupDescriptor), sb.gdt_blockstart, 0);
 
     delete[] disk_gdt;
 

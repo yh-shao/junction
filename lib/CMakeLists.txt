@@ -42,13 +42,15 @@ endif()
 
 set(ENV{ROOT_PATH} ${CALADAN_PATH})
 execute_process(
-  COMMAND make -f ${CALADAN_PATH}/build/shared.mk print-RUNTIME_LIBS
+  COMMAND make --no-print-directory -f ${CALADAN_PATH}/build/shared.mk print-RUNTIME_LIBS
   OUTPUT_VARIABLE CALADAN_RUNTIME_LIBS
+  OUTPUT_STRIP_TRAILING_WHITESPACE
 )
 
 execute_process(
-  COMMAND make -f ${CALADAN_PATH}/build/shared.mk print-LDFLAGS
+  COMMAND make --no-print-directory -f ${CALADAN_PATH}/build/shared.mk print-LDFLAGS
   OUTPUT_VARIABLE CALADAN_RUNTIME_LDFLAGS
+  OUTPUT_STRIP_TRAILING_WHITESPACE
 )
 
 string(REPLACE "RUNTIME_LIBS =" " " CALADAN_RUNTIME_LIBS "${CALADAN_RUNTIME_LIBS}")

@@ -60,6 +60,7 @@ struct BlockData {
     BlockData(BlockData&&)                 = delete;
     BlockData& operator=(BlockData&&)      = delete;
 };
+bool bc_write_backend(BlockID id, const BlockData& value);
 
 class NVMeSSD : public Backend<BlockID, BlockData> {
 public:
@@ -71,10 +72,7 @@ public:
     }
     bool write(const BlockID& key, BlockData const& value)
     {
-        // int ret = storage_write(static_cast<const void*>(value.data), key, 1);
-        // log_info("write to block %lu", key);                                                                    
-        // return (ret == 0);
-        return DMA_write_block(static_cast<const void*>(value.data), key);
+        return bc_write_backend(key, value);
     }
 
     static NVMeSSD& getInstance()   // singleton，全局只有 1 个 NVMeSSD 实例

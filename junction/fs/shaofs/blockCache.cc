@@ -1,5 +1,6 @@
 #include "fs.h"
 #include "blockCache.h"
+#include "journal.h"
 #include "utili.h"
 #include "generic_cache/backend.h"
 #include <cstring>
@@ -50,3 +51,11 @@ BlockHandle bc_get_handle(BlockID id) { return get_block_cache().getHandle(id); 
 bool bc_flush_block(BlockID id)       { return get_block_cache().flush_entry(id); }
 void bc_invalidate_block(BlockID id)  {        get_block_cache().invalidate(id);  }
 void bc_flush_all()                   {        get_block_cache().flush_all();     }
+
+bool bc_write_backend(BlockID id, const BlockData& value)
+{
+#if CRASH_CONSISTENCY
+    if (journal_is_metadata_block(id)) return journal_commit_single(id, value.data);
+#endif
+    return DMA_write_block(static_cast<const void*>(value.data), id);
+}
