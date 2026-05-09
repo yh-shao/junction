@@ -249,14 +249,10 @@ void UintrFinishYield(u_sigframe *uintr_frame, thread_t *th, void *xsave_buf,
   void *stack = perthread_read(runtime_stack);
 
   // switch to the runtime stack and re-enable user interrupts
-  LOG(INFO) << "GET UINTR, check cede or yield --------------------";
   if (preempt_cede_needed(myk()))
     __nosave_switch_setui(thread_finish_cede, stack);
   else
-  {
-    LOG(INFO) << "GET UINTR for yielding uthread";
     __nosave_switch_setui(thread_finish_yield, stack);
-  }
 
   std::unreachable();
 }
@@ -330,7 +326,6 @@ inline bool __nofp InterruptNeeded(thread_t *th) {
   bool need = false;
   if (likely(k->q_ptrs != nullptr)) need = preempt_cede_needed(k) | preempt_yield_needed(k) | storage_available_completions(k);
   putk();
-  if (!need) LOG(INFO) << "---------------------- get an UINTR, but no need to cede/yield";
   // return preempt_cede_needed(k) | preempt_yield_needed(k);
   return need;
 }
@@ -348,7 +343,6 @@ extern "C" __nofp void uintr_entry(u_sigframe *uintr_frame) {
   if (!preempt_enabled() ||
       unlikely(IsOnRuntimeStack(uintr_frame->rsp) || !xsave_enabled_bitmap)) {
     perthread_andi(preempt_cnt, 0x7fffffff);
-    LOG(INFO) << "GET UINTR, but defered.";
     return;
   }
 
@@ -365,7 +359,6 @@ extern "C" __nofp void uintr_entry(u_sigframe *uintr_frame) {
   // if (!have_io && !InterruptNeeded(th)) return;
 
   if (!InterruptNeeded(th)) return;
-  LOG(INFO) << "GET an UINTR, need to handle--------";
 
   const uint64_t in_use_xfeatures = GetActiveXstates();
   assert((in_use_xfeatures & xsave_enabled_bitmap) == in_use_xfeatures);
