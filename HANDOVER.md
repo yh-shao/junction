@@ -1,11 +1,13 @@
 # Project Handover / ShaOFS 全局项目交接与 AI 上下文恢复文档
 
-> **文档版本**: v4.0 | **最后更新**: 2026-05-09
+> **文档版本**: v4.1 | **最后更新**: 2026-05-09
 > **目的**: 使任何 AI Code Agent 读取本文档后，能瞬间加载全部项目上下文，无缝继续开发。
 
 > **2026-05-06 补充说明**: 本文档保留了 2026-04-10 之前关于 ShaOFS 架构、测试和优化的历史沉淀。本次交接修正了与当前代码明显不一致的事实，并追加了 FIO-on-Junction 适配、补丁管理脚本和当前验证状态。历史性能测试结果可能不可靠，已从本文档移除；正式性能数据应以重新跑出的 benchmark 原始输出为准。
 
 > **2026-05-09 补充说明**: 本次交接追加了 ShaOFS 的 I/O completion driven preemption（`IO_PREEMPT`）机制、相关 Caladan/IOKernel 改动、针对性 benchmark 和最新验证结果。当前 `build/CMakeCache.txt` 中 `SHAOFS_IO_PREEMPT=ON`，但 CMake option 默认值仍为 OFF，后续实验应在报告中明确构建开关状态。
+
+> **2026-05-09 晚些时候补充说明**: 本次交接追加了 ShaOFS 的简单 crash consistency 支持。当前实现是 **metadata-only redo journal + dirty mount repair**：mkfs 在盘尾预留 journal 区，ShaOFS 在 `CRASH_CONSISTENCY=1` 时对元数据块写入做 redo logging，并在异常退出后的下一次 mount 中 replay/repair。当前 `build/CMakeCache.txt` 中 `SHAOFS_CRASH_CONSISTENCY=ON`，`junction/fs/CMakeLists.txt` 的默认值也是 ON。
 
 ---
 
@@ -29,6 +31,7 @@ ShaOFS 是一个构建在 **Junction LibOS + Caladan uthread runtime** 之上的
 | **LibOS** | [Junction](https://github.com/JunctionOS/junction)（NSDI 2024）— 用户态内核，拦截 syscall |
 | **存储后端** | SPDK NVMe 驱动（直接设备访问，无内核参与） |
 | **I/O 抢占** | ShaOFS 可选开启 `IO_PREEMPT`：IOKernel 观察 Runtime SPDK completion queue，发现 I/O 完成后向对应 kthread/core 发送 yield/UIPI，使 Runtime 优先执行 storage softirq 和刚完成 I/O 的 uthread |
+| **Crash consistency** | ShaOFS 可选开启 `CRASH_CONSISTENCY`：metadata-only redo journal，journal 区位于盘尾，异常退出后执行 committed transaction replay 和 dirty mount repair |
 | **硬件加速** | Intel DSA/DML（运行时硬件路径可选，当前代码通过 `dsa_init()` 初始化；硬件不可用时回退到 CPU memcpy。构建期目前要求能找到静态 `libdml.a` 和 `dml/dml.h`） |
 | **构建系统** | CMake + Make，封装脚本 `scripts/build.sh` |
 | **磁盘格式化** | 自定义 mkfs 工具（`/home/syh/mkfs/mkfs.sh`） |
@@ -128,7 +131,20 @@ Block 1:          Inode Bitmap (1 block, tracks 32768 inodes)
 Block 2-2049:     Inode Table (2048 blocks, 16 inodes/block × 256B)
 Block 2050-34817: Indirect Extent Blocks (1 block per inode, 32768 blocks)
 Block 34818-N:    Group Descriptor Table (GDT)
-Block N+1...:     Data Groups (repeating: 1 bitmap block + 32768 data blocks)
+Block N+1...J-1:  Data Groups (repeating: 1 bitmap block + 32768 data blocks)
+Block J...end:    Journal Area (default 4096 blocks, 16MB, placed at disk tail)
+                  J = sb.journal_blockstart
+```
+
+mkfs 侧实现位于 `/home/syh/mkfs/fs.h` 和 `/home/syh/mkfs/mkfs.c`。当前 `DEFAULT_JOURNAL_BLOCKS=4096`，`build_superblock()` 会把 `journal_blockstart` 设置为 `total_blocknum - journal_blocknum`，再只用 journal 之前的空间计算 data group 数。`init_data_groups()` 会清空 journal 区。
+
+ShaOFS journal 区内部约定：
+
+```
+sb.journal_blockstart:                     transaction header
+sb.journal_blockstart + 1:                 transaction entry table
+sb.journal_blockstart + 2 ...:             logged metadata block images
+sb.journal_blockstart + journal_blocknum-1 mount dirty marker
 ```
 
 ### 2.4 I/O completion driven preemption 路径（2026-05-09）
@@ -207,6 +223,7 @@ junction/fs/shaofs/                    ← 我们的项目代码
 │
 ├── blockCache.h/cc                    ← NVMeSSD backend (DMA_read/write_block)
 │                                        bc_get_handle, bc_flush_block, bc_invalidate_block, bc_flush_all
+│                                        CRASH_CONSISTENCY=1 时 metadata block 写回走 journal_commit_single()
 ├── inodeCache.h/cc                    ← InodeBackend (通过 Block Cache 读写 inode table)
 │                                        ic_get_inode, ic_alloc_inode, ic_free_inode, ic_flush_inode
 ├── dentryCache.h/cc                   ← DentryBackend (调用 dir_lookup 从磁盘读)
@@ -227,6 +244,10 @@ junction/fs/shaofs/                    ← 我们的项目代码
 ├── utili.h                            ← SpinGuard, ReadGuard, WriteGuard, RuntimeFSBaseGuard,
 │                                        kguard, atomic_read/write/inc/dec
 ├── dsa.h/cc                           ← Intel DSA/DML 初始化、异步 copy/copyv，硬件不可用时回退 CPU memcpy
+├── journal.h/cc                       ← metadata-only redo journal + dirty mount repair
+│                                        journal_init/recover/mark_dirty/mark_clean,
+│                                        journal_write_metadata, journal_commit_single,
+│                                        journal_build_metadata_map
 ├── OPTIMIZATION_REPORT.md             ← 优化报告
 └── IOPS_BENCHMARK_REPORT.md           ← IOPS 测试报告
 ```
@@ -268,6 +289,9 @@ junction/fs/shaofs/                    ← 我们的项目代码
 | `shaofs_preempt_iops.c` | 抢占机制测试 | 构造长 CPU-bound uthread 干扰连续 O_DIRECT reads，观察抢占对 IOPS 和最大延迟的影响 |
 | `shaofs_iopreempt_bench.c` | 抢占机制测试 | 早期/通用抢占 benchmark，保留作参考 |
 | `shaofs_storage_st.config` | 运行配置 | 单 runtime kthread + storage enabled 的 Junction config，适合验证 IO_PREEMPT 机制 |
+| `journal_layout_probe.c` | Crash consistency 测试 | 打开 ShaOFS 根路径，确认带 journal 字段的新 superblock 可以正常 mount |
+| `journal_recovery_prepare.c` | Crash consistency 测试 | 创建目录和文件，`--crash` 模式下写入/flush 后循环等待，供外部 `timeout -s KILL` 模拟崩溃 |
+| `journal_recovery_check.c` | Crash consistency 测试 | 下一次 mount 后检查崩溃前创建的目录、文件大小和数据内容是否恢复一致 |
 
 ---
 
@@ -293,6 +317,8 @@ typedef struct {
     BlockID  gdt_blockstart;
     uint64_t gdt_blocknum;
     BlockID  group_blockstart;      // 第一个 data group 的起始 LBA
+    BlockID  journal_blockstart;    // Journal 区域起始 LBA（盘尾预留）
+    uint64_t journal_blocknum;      // Journal 区域块数
     uint32_t root_inode;            // 0
 } SuperBlock;
 
@@ -368,9 +394,11 @@ extern GroupDescExt* group_info;    // 所有 group 的内存描述符数组
 | **最大 extent 数/文件** | **176** | 6 direct + 170 indirect |
 | `DATABLOCKS_PERGROUP` | 32768 | 每个 group 的数据块数 |
 | `TOTALBLOCKS_PERGROUP` | 32769 | 1 bitmap + 32768 data |
+| `DEFAULT_JOURNAL_BLOCKS` | 4096 | 默认 journal 区大小，位于盘尾，约 16MB |
 | `ROOT_INO` | 0 | 根目录 inode 编号 |
 | `MYPREFIX` | `"FSHAO"` | 当前 shaofs 识别前缀；`SHAOFS_REALPATH()` 同时接受 `FSHAO/path` 和 `FSHAO:/path`，会把 `FSHAO`、`FSHAO:` 映射为 `/`，并拒绝 `FSHAOabc` 这类伪前缀。FIO 命令仍建议优先用 `FSHAO/` 规避未转义冒号分隔问题 |
 | `IO_PREEMPT` | 默认 0 | 是否启用 IOKernel 检查 SPDK completion 并抢占目标 Runtime core；可由 CMake `SHAOFS_IO_PREEMPT=ON` 定义为 1 |
+| `CRASH_CONSISTENCY` | 默认 1 | 是否启用 ShaOFS metadata journal；可由 CMake `SHAOFS_CRASH_CONSISTENCY=OFF` 定义为 0 |
 | `NAMESIZ` | 255 | 文件名最大长度 |
 | `NCPU` | 256 | Caladan 最大 CPU 数 |
 | `RUNTIME_STACK_SIZE` | 512KB | uthread 栈大小 |
@@ -534,6 +562,98 @@ dir_delete_entry()→ DirWriteGuard (rwmutex_wrlock)
 - 当前 uthread 长时间处于 `preempt_disable()`、runtime stack 或不适合被中断的状态，UIPI 会被延迟处理。
 - completion rate 极高时，需要评估 UIPI/coalescing 开销，避免 IOKernel 自身成为瓶颈。
 
+### 5.8 Crash consistency：metadata-only redo journal + dirty repair
+
+**设计目标**：当前 ShaOFS 没有实现完整 POSIX 级事务语义，也不 journal 普通文件数据块。本机制的目标是在学术测试场景下，以较低 CPU/IO 开销保证异常退出后盘上元数据回到合法、自洽状态，避免 inode bitmap、group bitmap、GDT、inode table 和目录项互相矛盾。
+
+**构建开关**：
+
+- CMake option：`SHAOFS_CRASH_CONSISTENCY`，定义在 `junction/fs/CMakeLists.txt`，默认 ON。
+- 编译宏：`CRASH_CONSISTENCY`，默认在 `junction/fs/shaofs/fs.h` 中为 1。
+- 关闭时 `journal.h` 中相关 API 退化为 no-op 或原始 `storage_write_obj()`，系统行为尽量接近原始实现。
+
+**journal transaction 格式**：
+
+- `JournalHeader`：magic/version/state/entry_count/seq/checksum。
+- `JournalEntry`：home block、journal image block、image checksum。
+- 单个事务最多 `kMaxJournalEntries=64` 个 metadata block；当前主要使用 `journal_commit_single()` 做单块事务。
+- checksum 使用 FNV-1a，用于发现 torn header、torn entry 或 image 损坏。
+
+**正常 metadata 写入流程**：
+
+```
+journal_commit_blocks(blocks, images, count)
+    │
+    ├─ 获取 journal_lock，串行化 journal 区复用
+    ├─ 校验目标块属于 metadata block
+    ├─ 将每个 4KB metadata 新镜像写到 journal image block
+    ├─ 写 entry table
+    ├─ 写 state=COMMITTED 的 transaction header
+    ├─ 将镜像写回各自 home block
+    └─ 清空 transaction header
+```
+
+这里采用 redo journal：崩溃恢复时，如果看到 checksum 正确且 `COMMITTED` 的 header，就把 journal image 重新写回 home block。普通数据块不进入 journal，仍直接走 SPDK/DMA 写盘路径。
+
+**metadata block 判定**：
+
+- `block < sb.group_blockstart`：superblock、imap、inode table、indirect extent blocks、GDT 等固定元数据。
+- 每个 data group 的 bitmap block。
+- 已登记的目录数据块。
+- journal 区自身。
+
+目录块比较特殊，因为它们物理上位于 data group 内。当前通过 `journal_build_metadata_map()` 在 mount 时扫描目录 inode 的 extents，并通过 `journal_register_metadata_block()` 在新目录块分配后登记。
+
+**mount / shutdown 流程**：
+
+```
+init_meta()
+    ├─ 读取 superblock
+    ├─ journal_init()
+    ├─ journal_recover()
+    ├─ journal_mark_dirty()
+    ├─ 读取 imap / gmap
+    ├─ journal_build_metadata_map()
+    └─ init_group()
+
+final_flush()
+    ├─ journal_write_metadata(imap)
+    ├─ sync_all_gdt() → journal_write_metadata(GDT)
+    ├─ ic_flush_all()
+    ├─ bc_flush_all()
+    └─ journal_mark_clean()
+```
+
+`journal_mark_dirty()` 写在 journal 区最后一个块。正常退出时 `journal_mark_clean()` 清掉它；如果进程被 `SIGKILL`、崩溃或 timeout 强杀，下一次 mount 会看到 dirty marker。
+
+**恢复流程**：
+
+`journal_recover()` 会先检查 transaction header：
+
+- header 无效或版本不认识：清 header，进入 repair。
+- entry_count 不合法：清 header，进入 repair。
+- checksum 不匹配：认为事务 torn/incomplete，清 header，进入 repair。
+- `state=COMMITTED` 且 checksum 正确：replay image blocks 到 home blocks，然后进入 repair。
+- 其他非空状态：清 header，进入 repair。
+
+随后如果 dirty marker 存在，或 transaction 检查阶段判断需要修复，则执行 `repair_filesystem_state()`：
+
+1. 读取整张 inode table。
+2. 清理明显非法 inode：`UNKNOWN`、extent 数超界、extent 指向非法 data block 的 inode 会被置空。
+3. 从 live inode 重新构造 inode bitmap。
+4. 根据 live inode 的 direct/indirect extents 重新构造所有 group bitmap。
+5. 重新计算 GDT 的 `free_blocks_count` 和 `next_free_hint`。
+6. 扫描目录块，删除指向无效 inode 或 filetype 不匹配的目录项。
+7. 通过 journal 写回 imap、group bitmap、GDT、inode table。
+8. 清 dirty marker。
+
+**语义边界**：
+
+- 当前机制保证 crash 后文件系统元数据合法、自洽，不保证每个 syscall 具有完整原子持久化语义。
+- 普通文件数据不 journal；崩溃后数据内容取决于崩溃前实际写盘情况。
+- 某些不完整创建可能在 repair 中被清理为“目录项不存在”或“inode 不再 live”，这是当前简化设计的预期行为。
+- dirty repair 会扫描 inode table 和 group bitmap，异常退出后的第一次 mount 会比 clean mount 慢；正常 clean shutdown 不走 repair。
+
 ---
 
 ## 第六章：环境配置与运行指令
@@ -559,6 +679,20 @@ cmake --build build --target junction_run -- -j$(nproc)
 ```
 
 注意：CMake option 默认值是 OFF；当前会话结束时 `build/CMakeCache.txt` 中为 `SHAOFS_IO_PREEMPT:BOOL=ON`。
+
+启用/关闭 ShaOFS crash consistency：
+
+```bash
+cd /home/syh/MyProj1/junction
+cmake -S . -B build -DSHAOFS_CRASH_CONSISTENCY=ON
+cmake --build build --target junction_run -- -j$(nproc)
+
+# 如需回到无 journal 的旧行为：
+cmake -S . -B build -DSHAOFS_CRASH_CONSISTENCY=OFF
+cmake --build build --target junction_run -- -j$(nproc)
+```
+
+注意：CMake option 默认值是 ON；当前会话结束时 `build/CMakeCache.txt` 中为 `SHAOFS_CRASH_CONSISTENCY:BOOL=ON`。
 
 ### 6.2 格式化磁盘
 
@@ -636,13 +770,52 @@ cd /home/syh/MyProj1/junction/build/junction
 printf 'syh2syh\n' | sudo -S timeout 20s ./junction_run ../../junction/fs/mytest/shaofs_storage_st.config -- mytest/test_direct_io
 ```
 
-### 6.5 sudo 密码
+### 6.5 编译并运行 crash consistency 测试
+
+编译：
+
+```bash
+cd /home/syh/MyProj1/junction
+mkdir -p build/junction/mytest
+gcc -O2 junction/fs/mytest/journal_layout_probe.c -o build/junction/mytest/journal_layout_probe -lpthread
+gcc -O2 junction/fs/mytest/journal_recovery_prepare.c -o build/junction/mytest/journal_recovery_prepare -lpthread
+gcc -O2 junction/fs/mytest/journal_recovery_check.c -o build/junction/mytest/journal_recovery_check -lpthread
+```
+
+干净格式化并启动 IOKernel：
+
+```bash
+printf 'syh2syh\n' | sudo -S pkill -9 iokerneld 2>/dev/null || true
+cd /home/syh/mkfs && printf 'syh2syh\n' | sudo -S bash ./mkfs.sh
+
+cd /home/syh/MyProj1/junction
+printf 'syh2syh\n' | sudo -S lib/caladan/iokerneld ias
+```
+
+在另一个 shell 模拟崩溃并检查恢复：
+
+```bash
+cd /home/syh/MyProj1/junction/build/junction
+
+# 先制造一个非 clean shutdown。退出码 137 是 SIGKILL 预期结果。
+printf 'syh2syh\n' | sudo -S timeout -s KILL 2s ./junction_run caladan_test.config -- \
+  mytest/journal_recovery_prepare --crash
+
+# 下一次 mount 应输出 "[journal] previous mount was dirty, repairing metadata state"，
+# 并且检查程序应报告 journal recovery check failures=0。
+printf 'syh2syh\n' | sudo -S timeout 60s ./junction_run caladan_test.config -- \
+  mytest/journal_recovery_check
+
+printf 'syh2syh\n' | sudo -S pkill -9 iokerneld
+```
+
+### 6.6 sudo 密码
 
 ```
 syh2syh
 ```
 
-### 6.6 在 Junction 中运行 FIO（2026-05-06 当前流程）
+### 6.7 在 Junction 中运行 FIO（2026-05-06 当前流程）
 
 FIO 源码位于 `junction/fs/mytest/benchmark/fio`，这是一个独立 git 仓库。为了让它能在 Junction 中启动，当前采用“FIO 内部降级 + 构建配置”的方式，不修改 Junction 源码。
 
@@ -856,6 +1029,19 @@ FIO 默认会使用 SysV shared memory（`shmget()` 等），而 Junction 当前
 
 另外，ShaOFS direct I/O 路径目前仍存在 SPDK DMA buffer 与用户 buffer 之间的 memcpy；为了保证 cached/direct 一致性，direct read/write 还会涉及 cache flush/invalidate。这些都会影响最终吞吐。
 
+### 7.13 GOTCHA 12：Crash consistency 当前是 metadata-only，不是完整事务文件系统
+
+当前 `CRASH_CONSISTENCY` 机制只 journal 元数据块，并通过 dirty mount repair 保证元数据自洽。不要把它描述成完整 POSIX crash consistency 或 ext4 data=journal 等价实现。
+
+需要特别注意：
+
+- 普通文件数据块不 journal；崩溃后数据内容只取决于已完成的底层写。
+- 多块元数据更新没有合并成一个高层语义事务；每个 metadata block 通常单独 redo，崩溃后靠 repair 兜底。
+- `repair_filesystem_state()` 可能清除指向无效 inode 的目录项，这表示不完整操作被回滚到“合法但可能丢失该新文件/目录项”的状态。
+- journal 区复用由单个 `journal_lock` 串行化；这是为了正确性和实现简单，元数据密集负载下可能成为瓶颈。
+- dirty repair 会扫描整张 inode table 和所有 group bitmap；非 clean shutdown 后第一次 mount 会明显慢于 clean mount。
+- 修改目录块写入路径时，必须继续维护 `journal_register_metadata_block()` / `journal_build_metadata_map()`，否则目录块可能被当作普通数据块绕过 journal。
+
 ---
 
 ## 第八章：当前代码状态与测试结果
@@ -904,6 +1090,7 @@ FIO 默认会使用 SysV shared memory（`shmget()` 等），而 Junction 当前
 - **目录读写锁**：`dir_lookup` 并发读，`dir_add/delete` 排他写
 - **I/O completion driven preemption**：`IO_PREEMPT` 开启时，IOKernel 检查 SPDK completion 并触发目标 Runtime core yield；Runtime 优先运行 storage softirq 和完成 I/O 的 uthread
 - **ShaOFS 前缀解析**：`SHAOFS_REALPATH()` 同时支持 `FSHAO/path` 与 `FSHAO:/path`，并拒绝 `FSHAOabc` 伪前缀
+- **Crash consistency**：`CRASH_CONSISTENCY=1` 时启用 metadata-only redo journal；clean shutdown 清 dirty marker，异常退出后 replay/repair
 
 ### 8.4 2026-05-09 `IO_PREEMPT` 验证结果
 
@@ -966,6 +1153,49 @@ lat_us p50=9 p90=9 p99=13 max=102
 - 当前已构建的 FIO 二进制可执行，`fio --version` 输出 `fio-3.42-22-g7215-dirty`。
 - 本次会话中曾验证过一个接近目标参数的 FIO 命令可在 Junction 中跑完并输出报告。历史性能数字不写入本文档；后续正式 benchmark 必须重新运行并保存原始输出。
 
+### 8.6 2026-05-09 crash consistency 验证结果
+
+本次验证使用默认 `SHAOFS_CRASH_CONSISTENCY=ON` 构建；同时确认 `SHAOFS_CRASH_CONSISTENCY=OFF` 可以成功编译。测试前重新执行过 `/home/syh/mkfs/mkfs.sh`，mkfs 输出包含：
+
+```text
+Journal: start=234419030 blocks=4096
+```
+
+已验证：
+
+```text
+journal_layout_probe:
+shaofs mount ok
+
+journal_recovery_prepare --crash:
+由 timeout -s KILL 2s 强杀，退出码 137，模拟非 clean shutdown
+
+journal_recovery_check:
+[journal] previous mount was dirty, repairing metadata state
+journal recovery check failures=0
+```
+
+最终二进制上还回归了：
+
+```text
+test_fsync: 32 passed, 0 failed
+test_dir:   22 passed, 0 failed
+```
+
+性能 sanity check：
+
+```text
+baseline before journal:
+bench_seq_rw 32: Write 0.4981s, 64.24 MB/s, 16445 IOPS; Read 0.0037s, 8679.14 MB/s, 2221861 IOPS
+4KB_iops:        9,455,148.78 IOPS, 36,934.17 MB/s
+
+after CRASH_CONSISTENCY=ON:
+bench_seq_rw 32: Write 0.4978s, 64.29 MB/s, 16457 IOPS; Read 0.0034s, 9467.46 MB/s, 2423669 IOPS
+4KB_iops:        9,438,393.29 IOPS, 36,868.72 MB/s
+```
+
+这些数字说明当前 metadata-only journal 对该组读密集/顺序小规模 sanity benchmark 没有明显断崖式性能下降。正式论文性能数据仍应重新跑完整 benchmark 并保存原始输出。
+
 ---
 
 ## 第九章：已知缺陷与待办事项
@@ -983,6 +1213,8 @@ lat_us p50=9 p90=9 p99=13 max=102
 9. **`MYPREFIX` 与测试路径书写存在历史不一致**：当前代码定义为 `"FSHAO"`，`SHAOFS_REALPATH()` 已兼容 `FSHAO/...` 与 `FSHAO:/...`，但 FIO 当前源码仍将未转义 `:` 作为 filename/directory 分隔符，因此 FIO 命令建议写 `FSHAO/`；若恢复 `FSHAO:`，必须设计并验证 FIO 参数转义方案。
 10. **`IO_PREEMPT` 只在特定场景下显著收益**：它主要解决 CPU-bound uthread 阻塞 SPDK completion poll 的问题；没有 CPU-bound 干扰、kthread 充足或大块顺序吞吐场景下，收益可能较小甚至需要评估额外 UIPI 开销。
 11. **当前构建缓存开启了 `SHAOFS_IO_PREEMPT`**：`build/CMakeCache.txt` 当前为 ON，但 CMake 默认值仍为 OFF。做性能对比时必须明确重新 configure，避免把 ON/OFF 结果混淆。
+12. **Crash consistency 不是完整事务语义**：当前只保证异常退出后元数据合法、自洽；普通数据块不 journal，不完整创建/写入可能被 repair 清理或留下已落盘的数据内容。
+13. **Journal metadata map 依赖目录 extent 登记**：如果后续新增目录扩容、rename、unlink/rmdir 或新的目录写路径，必须确保新目录块被 `journal_register_metadata_block()` 登记，否则该目录块写回可能绕过 journal。
 
 ### 9.2 优先待办任务
 
@@ -1022,6 +1254,18 @@ lat_us p50=9 p90=9 p99=13 max=102
 - 当前 `check_spdk_and_preempt()` 在 dataplane loop 中遍历 runtime/kthread。
 - 对少量 Runtime 的学术实验可接受；若扩展到更多 Runtime，应评估 bitmap/event/coalescing，避免 IOKernel 忙等扫描成为瓶颈。
 
+**Task 9: 完善 crash consistency 语义测试**
+- 当前已有 SIGKILL dirty-mount 恢复测试，但还没有覆盖 torn transaction header、坏 checksum、目录块事务 replay、inode table 单块 replay 等更细粒度场景。
+- 建议编写离线磁盘破坏工具或 Junction 内部测试 hook，构造 journal header/image/home block 的不同崩溃点。
+
+**Task 10: 评估 journal 粒度和批量事务**
+- 当前主要是单 metadata block redo，正确性靠 dirty repair 兜底。
+- 后续可把一个 syscall 的多个元数据块合并为小事务，减少不完整操作被 repair 清理的概率，并减少多次 header 写。
+
+**Task 11: 优化 dirty repair 的 mount 成本**
+- 当前 repair 会扫描完整 inode table 和所有 group bitmap。
+- 学术测试中只要避免非 clean shutdown，正常路径不受影响；如果要频繁 crash/recover 实验，需要记录 repair 耗时并考虑按需扫描或 checkpoint。
+
 ---
 
 ## 第十章：文件修改历史总览
@@ -1040,7 +1284,7 @@ lat_us p50=9 p90=9 p99=13 max=102
 | `shaofs/syscall.h` | Feature | 新增 my_fstat, my_newfstatat, my_fsync |
 | `shaofs/syscall.cc` | Feature + perf | 实现 fstat/newfstatat/fsync；移除热路径日志；my_read/write 支持 direct 分派 |
 | `shaofs/blockCache.h` | Feature + fix | NVMeSSD 后端改用 DMA_read/write_block；新增 bc_flush_block |
-| `shaofs/blockCache.cc` | Feature | 新增 bc_flush_block；新增 bc_invalidate_block 用于 direct write 后失效旧 cache entry |
+| `shaofs/blockCache.cc` | Feature | 新增 bc_flush_block；新增 bc_invalidate_block 用于 direct write 后失效旧 cache entry；CRASH_CONSISTENCY=1 时 metadata block 写回走 journal |
 | `generic_cache/cache.h` | Feature | 新增 flush_entry(key) |
 | `generic_cache/sharded_cache.h` | Feature | 转发 flush_entry |
 | `junction/fs/file.cc` | Feature | usys_read/write/pread64/pwrite64 传递 O_DIRECT flag；usys_fstat/newfstatat/fsync 添加 SHAOFS dispatch；newfstatat 使用 SHAOFS_REALPATH |
@@ -1051,6 +1295,19 @@ lat_us p50=9 p90=9 p99=13 max=102
 | `junction/fs/shaofs/dsa.cc` | Perf + fallback | 当前实现使用 DML 硬件路径、Caladan `runtime_async_park` 和 per-thread tcache；硬件/提交失败时回退 CPU memcpy |
 | `junction/fs/shaofs/dsa.h` | Feature | 暴露 `dsa_init`、`dsa_copy`、`dsa_copyv` 和 `ShaofsDsaOptions`；`dsa_batch_task_num=32` |
 | `junction/fs/CMakeLists.txt` | Build | 当前查找静态 `libdml.a` 和 `dml/dml.h`，找不到会 FATAL |
+| `junction/fs/CMakeLists.txt` | Build | 新增 `SHAOFS_CRASH_CONSISTENCY` option，默认 ON，并把 `shaofs/journal.cc` 纳入 fs library |
+| `lib/CMakeLists.txt` | Build fix | Caladan `shared.mk` 查询改用 `make --no-print-directory` 并 strip trailing whitespace，避免 nested make 输出污染 linker flags |
+| `shaofs/fs.h` | Crash consistency | SuperBlock 新增 `journal_blockstart` / `journal_blocknum`；新增 `CRASH_CONSISTENCY` 和 `DEFAULT_JOURNAL_BLOCKS` |
+| `shaofs/fs.cc` | Crash consistency | mount 时执行 `journal_init()` / `journal_recover()` / `journal_mark_dirty()`，并扫描目录 extents 建立 metadata map |
+| `shaofs/journal.h` | New | journal API 和 `CRASH_CONSISTENCY=0` no-op fallback |
+| `shaofs/journal.cc` | New | metadata-only redo journal、dirty mount marker、transaction replay、dirty repair |
+| `shaofs/file.cc` | Crash consistency | final_flush 通过 journal 写 imap，clean shutdown 清 dirty marker；目录块分配后登记为 metadata block |
+| `shaofs/group.cc` | Crash consistency | GDT sync 改为 `journal_write_metadata()` |
+| `/home/syh/mkfs/fs.h` | Crash consistency | mkfs 侧 SuperBlock 同步新增 journal 字段和 `DEFAULT_JOURNAL_BLOCKS` |
+| `/home/syh/mkfs/mkfs.c` | Crash consistency | mkfs 在盘尾预留并清空 journal 区，data group 只使用 journal 前空间 |
+| `junction/fs/mytest/journal_layout_probe.c` | New test | 验证 journal superblock 布局可 mount |
+| `junction/fs/mytest/journal_recovery_prepare.c` | New test | 构造崩溃前文件/目录状态，`--crash` 配合 SIGKILL |
+| `junction/fs/mytest/journal_recovery_check.c` | New test | 验证 dirty mount repair 后目录、文件大小和数据内容 |
 | `junction/fs/mytest/benchmark/fio/filesetup.c` | FIO adapter | 补丁后识别 `FSHAO/`、`FSHAO:/`，并容忍 ShaOFS 上 `ftruncate` 不支持 |
 | `junction/fs/mytest/benchmark/fio/helper_thread.c` | FIO adapter | 补丁后 `timerfd_create/settime` 失败不再 assert，回退 select timeout |
 | `junction/fs/mytest/benchmark/patch/fio_changes.patch` | Handover artifact | 保存 FIO 适配源码补丁 |
@@ -1161,7 +1418,7 @@ printf 'syh2syh\n' | sudo -S lib/caladan/iokerneld ias
 
 ### 12.3 本次确认的客观状态
 
-- `HANDOVER.md` 在顶层 git 中仍是 untracked 文件；本次直接在该文件上增量更新。
+- 2026-05-09 crash consistency 交接整理时重新检查：`HANDOVER.md` 当前是 tracked modified 文件，不是 untracked 文件。
 - 顶层工作区和 `lib/caladan` 子仓库均存在既有 dirty/untracked 状态。不要假设所有 dirty 文件都是当前 Agent 创建的。
 - `junction/fs/mytest/iops.c`、`junction/fs/mytest/testwholepath.c` 在本次整理前已是 modified，未在本次文档整理中修改。
 - 本次新增/依赖的抢占测试文件包括 `shaofs_preempt_latency.c`、`shaofs_preempt_iops.c`、`shaofs_iopreempt_bench.c` 和 `shaofs_storage_st.config`。
@@ -1177,3 +1434,85 @@ printf 'syh2syh\n' | sudo -S lib/caladan/iokerneld ias
 - 未验证 `IO_PREEMPT` 在多 kthread、多 Runtime、高 completion rate 或真实 FIO 混合负载下的收益边界。
 - 未验证 DSA/DML 硬件路径是否实际启用；测试输出中曾出现 DSA 执行失败并回退 CPU memcpy 的提示。
 - 未确认 `DIRECTPATH DISABLED` 的根因；因此当前抢占 benchmark 不能作为最终带宽数字使用。
+
+---
+
+## 第十三章：2026-05-09 crash consistency 交接整理验证记录
+
+### 13.1 本次实际检查过的内容
+
+```bash
+sed -n '1,260p' HANDOVER.md
+sed -n '260,620p' HANDOVER.md
+sed -n '620,1040p' HANDOVER.md
+sed -n '1040,1420p' HANDOVER.md
+find junction/fs/shaofs -maxdepth 1 -type f | sort
+find junction/fs/mytest -maxdepth 1 -type f | sort
+sed -n '1,180p' junction/fs/CMakeLists.txt
+sed -n '1,180p' junction/CMakeLists.txt
+grep -n 'SHAOFS_IO_PREEMPT\|SHAOFS_CRASH_CONSISTENCY' build/CMakeCache.txt
+nl -ba junction/fs/shaofs/journal.h | sed -n '1,140p'
+nl -ba junction/fs/shaofs/journal.cc | sed -n '1,260p'
+nl -ba junction/fs/shaofs/journal.cc | sed -n '260,620p'
+nl -ba junction/fs/shaofs/fs.cc | sed -n '1,110p'
+nl -ba junction/fs/shaofs/blockCache.cc | sed -n '1,120p'
+nl -ba junction/fs/shaofs/file.cc | sed -n '60,95p;300,325p;532,552p'
+nl -ba junction/fs/shaofs/group.cc | sed -n '318,335p'
+nl -ba /home/syh/mkfs/mkfs.c | sed -n '78,140p;180,230p'
+git -C /home/syh/MyProj1/junction status --short HANDOVER.md
+git -C /home/syh/MyProj1/junction diff --check -- <current crash-consistency files>
+```
+
+### 13.2 本次实际运行过的构建和测试
+
+本轮 crash consistency 开发和交接整理中运行过以下关键命令和测试：
+
+```bash
+cmake -S . -B build -DSHAOFS_CRASH_CONSISTENCY=OFF
+cmake --build build --target junction_run -- -j$(nproc)
+cmake -S . -B build -DSHAOFS_CRASH_CONSISTENCY=ON
+cmake --build build --target junction_run -- -j$(nproc)
+
+gcc -O2 junction/fs/mytest/journal_layout_probe.c -o build/junction/mytest/journal_layout_probe -lpthread
+gcc -O2 junction/fs/mytest/journal_recovery_prepare.c -o build/junction/mytest/journal_recovery_prepare -lpthread
+gcc -O2 junction/fs/mytest/journal_recovery_check.c -o build/junction/mytest/journal_recovery_check -lpthread
+gcc -O2 junction/fs/mytest/test_fsync.c -o build/junction/mytest/test_fsync -lpthread
+gcc -O2 junction/fs/mytest/test_dir.c -o build/junction/mytest/test_dir -lpthread
+gcc -O2 junction/fs/mytest/bench_seq_rw.c -o build/junction/mytest/bench_seq_rw -lpthread
+gcc -O2 junction/fs/mytest/4KB_iops.c -o build/junction/mytest/4KB_iops -lpthread
+
+cd /home/syh/mkfs && printf 'syh2syh\n' | sudo -S bash ./mkfs.sh
+printf 'syh2syh\n' | sudo -S lib/caladan/iokerneld ias
+```
+
+已验证：
+
+- `SHAOFS_CRASH_CONSISTENCY=OFF` 构建成功。
+- `SHAOFS_CRASH_CONSISTENCY=ON` 构建成功，最终 `build/CMakeCache.txt` 当前为 `SHAOFS_CRASH_CONSISTENCY:BOOL=ON`。
+- mkfs 输出 `Journal: start=234419030 blocks=4096`。
+- `journal_layout_probe` 可以正常 mount 带 journal 字段的新 superblock。
+- `timeout -s KILL 2s ./junction_run ... journal_recovery_prepare --crash` 以退出码 137 模拟非 clean shutdown。
+- 下一次运行 `journal_recovery_check` 时 mount 阶段输出 `[journal] previous mount was dirty, repairing metadata state`，检查结果 `journal recovery check failures=0`。
+- `test_fsync` 通过：`32 passed, 0 failed`。
+- `test_dir` 通过：`22 passed, 0 failed`。
+- `bench_seq_rw 32` 最终结果：写 `64.29 MB/s`，读 `9467.46 MB/s`，数据校验 PASS。
+- `4KB_iops 4 FSHAO:/base_iops 1048576 100 0 20000 0` 最终结果：`9438393.29 IOPS`，`36868.72 MB/s`。
+- 测试结束后已执行 `pkill -9 iokerneld`，并用 `pgrep -a iokerneld` / `pgrep -a junction_run` 确认没有残留进程。
+
+### 13.3 本次确认的客观状态
+
+- `junction/fs/CMakeLists.txt` 当前包含 `option(SHAOFS_CRASH_CONSISTENCY ... ON)`，并将 `shaofs/journal.cc` 纳入 `fs` library。
+- `junction/fs/shaofs/fs.h` 当前包含 `CRASH_CONSISTENCY` 默认值、`DEFAULT_JOURNAL_BLOCKS=4096`、`SuperBlock::journal_blockstart` 和 `SuperBlock::journal_blocknum`。
+- `/home/syh/mkfs/fs.h` 和 `/home/syh/mkfs/mkfs.c` 已同步 journal 布局；`mkfs.c` 会把盘尾 4096 blocks 预留并清零。
+- `lib/CMakeLists.txt` 的 `make -f shared.mk print-*` 查询已加 `--no-print-directory` 和 `OUTPUT_STRIP_TRAILING_WHITESPACE`，这是为修复当前环境下 linker flags 被 nested make 输出污染的问题。
+- 顶层工作区仍存在大量既有 modified/untracked 文件；本次 crash consistency 开发新增/修改了 ShaOFS journal 相关文件和测试，但不要把所有 dirty 文件都归因于本次修改。
+- `/home/syh/mkfs` 目录不是顶层 Junction git 的一部分；其中 `fs.h` / `mkfs.c` 是本轮 crash consistency 需要同步维护的外部格式化工具文件。
+
+### 13.4 本次未重新验证的内容
+
+- 未重新运行完整 `scripts/build.sh`，只用 CMake build 了 `junction_run` target。
+- 未重新运行完整 ShaOFS 单元测试套件，只回归了 `test_fsync`、`test_dir` 和 crash recovery 测试。
+- 未重新运行 FIO target benchmark。
+- 未重新跑 ext4 对比测试。
+- 未构造 torn transaction header、坏 checksum、journal image 损坏、home block 部分写等细粒度崩溃点；当前 crash 测试是进程级 `SIGKILL` dirty mount 场景。
+- 未验证 `CRASH_CONSISTENCY=OFF` 的运行时行为，仅验证了它可以成功编译。
