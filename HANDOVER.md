@@ -1,6 +1,6 @@
 # Project Handover / ShaOFS 全局项目交接与 AI 上下文恢复文档
 
-> **文档版本**: v4.1 | **最后更新**: 2026-05-09
+> **文档版本**: v4.2 | **最后更新**: 2026-05-10
 > **目的**: 使任何 AI Code Agent 读取本文档后，能瞬间加载全部项目上下文，无缝继续开发。
 
 > **2026-05-06 补充说明**: 本文档保留了 2026-04-10 之前关于 ShaOFS 架构、测试和优化的历史沉淀。本次交接修正了与当前代码明显不一致的事实，并追加了 FIO-on-Junction 适配、补丁管理脚本和当前验证状态。历史性能测试结果可能不可靠，已从本文档移除；正式性能数据应以重新跑出的 benchmark 原始输出为准。
@@ -8,6 +8,8 @@
 > **2026-05-09 补充说明**: 本次交接追加了 ShaOFS 的 I/O completion driven preemption（`IO_PREEMPT`）机制、相关 Caladan/IOKernel 改动、针对性 benchmark 和最新验证结果。当前 `build/CMakeCache.txt` 中 `SHAOFS_IO_PREEMPT=ON`，但 CMake option 默认值仍为 OFF，后续实验应在报告中明确构建开关状态。
 
 > **2026-05-09 晚些时候补充说明**: 本次交接追加了 ShaOFS 的简单 crash consistency 支持。当前实现是 **metadata-only redo journal + dirty mount repair**：mkfs 在盘尾预留 journal 区，ShaOFS 在 `CRASH_CONSISTENCY=1` 时对元数据块写入做 redo logging，并在异常退出后的下一次 mount 中 replay/repair。当前 `build/CMakeCache.txt` 中 `SHAOFS_CRASH_CONSISTENCY=ON`，`junction/fs/CMakeLists.txt` 的默认值也是 ON。
+
+> **2026-05-10 补充说明**: 本次交接追加了 Filebench-on-Junction 适配、`alloc_inum()` 越过 8192 inode 的修复，以及 x86 FS base 保存/恢复策略。当前 Filebench 适配仅修改 Filebench 源码并通过 patch 管理，不修改 Junction；它把 Filebench procflow 从 fork/exec/wait 模型降级为进程内 pthread 模型，并绕过 Junction 当前不支持或不稳定的 `personality()`、SysV semaphore、部分清理命令和日志栈缓冲路径。当前 `alloc_inum()` 已按 `INODENUM=32768` 全范围扫描 inode bitmap；本轮验证越过了 8192 inode，但尚未完整验证 32768 inode 耗尽边界。
 
 ---
 
@@ -260,6 +262,8 @@ junction/fs/shaofs/                    ← 我们的项目代码
 | **`junction/fs/core.cc`** | `usys_openat` 和 `usys_mkdir` 中用 `SHAOFS_REALPATH()` 识别 `FSHAO/path`、`FSHAO:/path` 并转发 |
 | **`junction/fs/file.h`** | `kFlagDirect=O_DIRECT`, `kFlagTruncate=O_TRUNC`, `FromFlags()`, `File` 类定义 |
 | **`junction/kernel/signal.cc`** | Junction UINTR 入口；`InterruptNeeded()` 当前同时检查 preempt cede/yield 和 `storage_available_completions(k)` |
+| **`lib/caladan/inc/runtime/thread.h`** | `thread_t` 定义；当前新增 `runtime_fsbase_depth`，用于区分用户 FS base 与 runtime FS base 区域 |
+| **`lib/caladan/runtime/sched.c`** | uthread 调度与 FS base 保存/恢复；`thread_save_fsbase()` / `thread_fsbase_to_run()` 避免 ShaOFS guard 内 park 时污染用户 TLS |
 | **`lib/caladan/iokernel/main.c`** | dataplane 中的 `check_spdk_and_preempt()`，负责跨 Runtime 检查 SPDK completion 并触发 yield |
 | **`lib/caladan/iokernel/sched.c`** | `sched_yield_on_core()`；当前读取 live `q_ptrs->rcu_gen`，避免 stale metrics 导致持续抢占失效 |
 | **`lib/caladan/runtime/storage.c`** | SPDK submit/completion 与 `storage_softirq`；`spdk_uipi` 开启时 completion callback 用 `thread_ready_head()` 唤醒 I/O uthread |
@@ -279,6 +283,8 @@ junction/fs/shaofs/                    ← 我们的项目代码
 | `test_dir.c` | 单元测试 | 22 项目录操作检查（ROOT_INO fix, 并发 lookup） |
 | `test_tools.c` | 集成测试 | 24 项（创建目录树 + stat + read + 目录枚举） |
 | `test_direct_io.c` | 单元测试 | 35 项 O_DIRECT 检查（整块/部分块/跨模式一致性） |
+| `test_many_inodes.c` | 回归测试 | 顺序创建大量小文件，用于验证 inode bitmap 分配能越过 inode cache 容量 |
+| `test_many_inodes_read_threads.c` | 回归测试 | 创建大量 16KB 文件后用 3 个 pthread 反复整文件读取并校验内容，用于覆盖 Filebench 类似读负载 |
 | `test_barrier_sleep.c` | 兼容性测试 | pthread_barrier + sleep() 在 Junction 中的正确性 |
 | `myls.c` | 工具 | 列出 shaofs 目录内容 |
 | `mystat.c` | 工具 | 显示文件元数据 |
@@ -654,6 +660,90 @@ final_flush()
 - 某些不完整创建可能在 repair 中被清理为“目录项不存在”或“inode 不再 live”，这是当前简化设计的预期行为。
 - dirty repair 会扫描 inode table 和 group bitmap，异常退出后的第一次 mount 会比 clean mount 慢；正常 clean shutdown 不走 repair。
 
+### 5.9 FS base 保存/恢复策略（2026-05-10）
+
+**背景问题**：ShaOFS 调用 Caladan runtime、SPDK、DML 或 runtime libc 相关路径时，需要把 x86 `%fs` 切到 Caladan runtime TLS。用户程序自己的 `%fs` 则指向用户 libc/TLS 区域，里面包括 stack canary、`errno`、pthread TLS 等。如果 ShaOFS 在 runtime FS base 下发生 uthread park/yield，而调度器把当前 `%fs` 直接保存到 `thread_t::fsbase`，就会把用户 TLS 状态污染成 runtime TLS，后续回到用户程序可能出现 stack smashing、SIGSEGV 或随机 TLS 错乱。
+
+**当前状态字段**：
+
+- `thread_t::fsbase`：保存用户线程自己的 FS base。对 Junction 用户线程来说，它应代表用户 libc/TLS，而不是临时 runtime TLS。
+- `perthread runtime_fsbase`：每个 runtime kthread 的 Caladan/Junction runtime FS base，定义在 `lib/caladan/runtime/sched.c`。
+- `thread_t::runtime_fsbase_depth`：当前 uthread 是否处在“主动切换到 runtime FS base 的区域”内；用 depth 支持嵌套 guard。
+
+**普通用户代码执行时**：
+
+```
+runtime_fsbase_depth == 0
+park/yield 时 thread_save_fsbase() 保存当前 %fs 到 thread_t::fsbase
+resume 时 thread_fsbase_to_run() 返回 thread_t::fsbase
+```
+
+**进入 ShaOFS runtime-FS 区域时**：
+
+`junction/fs/shaofs/utili.h:RuntimeFSBaseGuard` 构造函数只在很短的切换窗口内 `preempt_disable()`：
+
+```
+preempt_disable()
+prev_fs_base_ = _readfsbase_u64()
+thread_self()->runtime_fsbase_depth++
+_writefsbase_u64(perthread_read(runtime_fsbase))
+preempt_enable()
+```
+
+注意：它不会在整个 ShaOFS syscall 生命周期内保持 preempt disabled，因为 ShaOFS 内部可能等待 SPDK I/O、获取 `rwmutex`、cache miss 后 park 或 yield。长时间禁用抢占会触发 Caladan 调度器对 `preempt_cnt` 的断言。
+
+**ShaOFS guard 内发生 park/yield 时**：
+
+`thread_park_and_unlock_np()` 和 `thread_park_and_preempt_enable()` 当前调用 `thread_save_fsbase(curth)`。其逻辑是：
+
+```
+fsbase = _readfsbase_u64()
+if (th->runtime_fsbase_depth && fsbase == perthread_read(runtime_fsbase))
+    return;              // 不覆盖 thread_t::fsbase
+th->fsbase = fsbase;
+```
+
+因此线程在 ShaOFS guard 内 park 时，调度器不会把 runtime FS base 写进 `thread_t::fsbase`。用户 TLS 状态得以保留。
+
+**恢复一个 park 在 ShaOFS guard 内的线程时**：
+
+`jmp_thread()` / `jmp_thread_direct()` 不再直接 `set_fsbase(th->fsbase)`，而是调用 `thread_fsbase_to_run(th)`：
+
+- `runtime_fsbase_depth > 0`：恢复到当前 kthread 的 `runtime_fsbase`，继续执行 ShaOFS/runtime 代码。
+- `runtime_fsbase_depth == 0`：恢复到 `thread_t::fsbase`，回到用户 TLS。
+- `has_fsbase == false` 的 runtime-only thread 会默认使用 `runtime_fsbase` 初始化 `th->fsbase`。
+
+**退出 ShaOFS runtime-FS 区域时**：
+
+`RuntimeFSBaseGuard` 析构函数再次只在短窗口内关闭抢占，恢复构造时保存的 `prev_fs_base_`，然后递减 `runtime_fsbase_depth`。嵌套 guard 可以正确工作：内层退出后仍保持 runtime FS base，最外层退出才恢复用户 FS base。
+
+**和 Junction 原有 `RuntimeLibcGuard` 的区别**：
+
+`junction/bindings/runtime.h:RuntimeLibcGuard` 会在整个 guard 生命周期内关闭抢占并切换到 runtime FS base，这适合很短、不会 yield 的 runtime libc 调用。ShaOFS 的 `RuntimeFSBaseGuard` 是 depth-aware 且允许 guard 内 yield 的版本，专门用于文件系统 I/O 路径。
+
+**后续维护铁律**：
+
+如果新增代码路径满足“切换到 runtime FS base，并且期间可能 park/yield”，必须使用或复用当前 `runtime_fsbase_depth` 策略。否则会重新引入用户 TLS 被 runtime TLS 污染的问题。
+
+### 5.10 inode 分配与 32768 inode 支持（2026-05-10）
+
+ShaOFS 的 inode 上限来自 `INODENUM=32768` 和一块 inode bitmap；inode cache 容量 `DEFAULT_INODECACHE_CAPACITY=8192` 只是内存缓存容量，不应限制文件系统可创建 inode 数。
+
+本轮曾在约 8192 inode 附近遇到 inode 分配失败。根因是 allocator 逻辑把可分配范围错误限制在缓存容量附近，混淆了“inode cache entry 数量”和“盘上 inode bitmap 容量”。当前 `junction/fs/shaofs/inode.cc:alloc_inum()` 已改为：
+
+```
+static volatile unsigned int cursor;
+start = atomic_fetch_add(&cursor, 1);
+for i in [0, INODENUM):
+    idx = (start + i) % INODENUM;
+    if (!bitmap_atomic_test_and_set(imap, idx)) return idx;
+return -1;
+```
+
+这表示分配器会按 `INODENUM` 全范围环形扫描 inode bitmap，可以越过 8192 cache capacity。`ic_alloc_inode()` 获取 inode cache entry 失败时会释放刚分配的 inum，避免 bitmap 泄漏。
+
+当前已通过 `test_many_inodes` 和 `test_many_inodes_read_threads` 覆盖 10000 文件级别场景；完整创建接近 32768 个 inode 的耗尽边界尚未在本次交接整理中重新验证。
+
 ---
 
 ## 第六章：环境配置与运行指令
@@ -916,6 +1006,80 @@ printf 'syh2syh\n' | sudo -S timeout 60s ./junction_run caladan_test.config -- \
 printf 'syh2syh\n' | sudo -S pkill -9 iokerneld
 ```
 
+### 6.8 在 Junction 中运行 Filebench（2026-05-10 当前流程）
+
+Filebench 源码位于 `junction/fs/mytest/benchmark/filebench`。当前策略是只修改 Filebench 内部并用 patch 管理，不修改 Junction 源码。
+
+相关文件：
+
+| Path | Purpose |
+|------|---------|
+| `junction/fs/mytest/benchmark/filebench` | Filebench 源码和构建产物目录 |
+| `junction/fs/mytest/benchmark/patch/filebench_changes.patch` | Junction 适配补丁，覆盖 `aslr.c`、`fb_cvar.c`、`fb_localfs.c`、`fileset.c`、`flowop_library.c`、`ipc.c`、`misc.c`、`procflow.c` |
+| `junction/fs/mytest/benchmark/patch/toggle_filebench.sh` | 补丁 apply/revert + 自动 `configure`/`make` 的管理脚本 |
+| `junction/fs/mytest/benchmark/patch/example.f` | 当前 Filebench 示例 workload：10000 个 16KB 文件，2 个 process instances，每个 3 个 reader threads，`readwholefile` 跑 60s |
+
+将 Filebench 切换并构建为 Junction 适配版：
+
+```bash
+cd /home/syh/MyProj1/junction
+junction/fs/mytest/benchmark/patch/toggle_filebench.sh apply
+```
+
+`apply` 会执行补丁应用，并用以下 configure cache 变量禁用 SysV semaphore 相关探测结果：
+
+```bash
+ac_cv_func_ftok=no \
+ac_cv_func_semget=no \
+ac_cv_func_semop=no \
+ac_cv_func_semtimedop=no \
+./configure
+make -j "$(nproc)"
+```
+
+恢复 Filebench 普通源码状态并按默认配置重建：
+
+```bash
+cd /home/syh/MyProj1/junction
+junction/fs/mytest/benchmark/patch/toggle_filebench.sh revert
+```
+
+当前 Filebench 适配补丁的核心变化：
+
+1. `aslr.c`：`linux_disable_aslr()` 直接返回。当前测试环境已全局关闭 ASLR，且 Junction 不实现 `personality()`。
+2. `ipc.c`：在 configure 禁用 `ftok/semget/semop/semtimedop` 后，Filebench 不再创建 SysV semaphore；`shm_semkey` 置 0。Filebench 仍使用自己的共享内存结构，但在 Junction 内主要以单进程多线程模型运行。
+3. `procflow.c` / `procflow.h`：不再 `fork()` / `exec()` / `waitpid()` worker procflow；每个 procflow monitor 改为 `pthread_create()` 在当前进程内运行，然后由它创建配置中的 Filebench worker threads。用户曾提示 Junction 可能支持 `vfork()`，但当前实际补丁选择 pthread 降级，避免引入 exec/shm 地址传递和 wait 语义问题。
+4. `fb_localfs.c`：`fb_lfs_recur_rm()` 遇到 `FSHAO:/` 或 `FSHAO/` 路径直接返回，避免通过 `system("rm -rf ...")` 清理 ShaOFS 路径。
+5. `fb_cvar.c`：cvar 目录不可用时降级为 verbose log，不让 benchmark 因缺少 cvar 插件目录失败。
+6. `fileset.c` / `ipc.c`：修复若干 `strncpy` 未保证 NUL 结尾的问题，避免 Junction/Filebench 长路径下字符串截断或未终止。
+7. `fileset.c`：`fileset_mkdir()` 的 `dirs[65536]` 栈数组改为动态数组，避免 Junction uthread 512KB 栈被大栈对象压垮。
+8. `misc.c`：`filebench_log()` 的 128KB 栈上缓冲改为全局缓冲并加 pthread mutex，避免日志路径消耗过大 uthread 栈；同时改用 `vsnprintf()`。
+9. `flowop_library.c`：修正 debug log 打印 `threadflow->tf_fd[fd]` 结构体的问题，改为打印 `fd_num`。
+
+推荐运行方式：
+
+```bash
+# 先确保没有旧 IOKernel 持有设备，然后重新格式化
+cd /home/syh/MyProj1/junction
+printf 'syh2syh\n' | sudo -S pkill -9 iokerneld 2>/dev/null || true
+cd /home/syh/mkfs && printf 'syh2syh\n' | sudo -S bash ./mkfs.sh
+
+# shell 1: 启动 IOKernel
+cd /home/syh/MyProj1/junction
+printf 'syh2syh\n' | sudo -S lib/caladan/iokerneld ias
+
+# shell 2: 运行 Filebench，务必使用 timeout 防死锁
+cd /home/syh/MyProj1/junction/build/junction
+printf 'syh2syh\n' | sudo -S timeout 90s ./junction_run caladan_test.config -- \
+  /home/syh/MyProj1/junction/junction/fs/mytest/benchmark/filebench/filebench \
+  -f /home/syh/MyProj1/junction/junction/fs/mytest/benchmark/patch/example.f
+
+# 结束后清理
+printf 'syh2syh\n' | sudo -S pkill -9 iokerneld
+```
+
+当前 `example.f` 使用 `path="FSHAO:"`。ShaOFS 的 `SHAOFS_REALPATH()` 同时支持 `FSHAO:`、`FSHAO:/...` 和 `FSHAO/...`；但其他工具如 FIO 对冒号有特殊解析，Filebench 是否会在所有 workload 语法中同样安全使用冒号仍建议按 workload 实测确认。
+
 ---
 
 ## 第七章：踩坑记录与高危警告（最重要）
@@ -1042,6 +1206,38 @@ FIO 默认会使用 SysV shared memory（`shmget()` 等），而 Junction 当前
 - dirty repair 会扫描整张 inode table 和所有 group bitmap；非 clean shutdown 后第一次 mount 会明显慢于 clean mount。
 - 修改目录块写入路径时，必须继续维护 `journal_register_metadata_block()` / `journal_build_metadata_map()`，否则目录块可能被当作普通数据块绕过 journal。
 
+### 7.14 GOTCHA 13：FS base guard 内允许 yield，但不能污染用户 TLS
+
+ShaOFS 的 `RuntimeFSBaseGuard` 与 Junction 原有 `RuntimeLibcGuard` 不同。`RuntimeLibcGuard` 在整个 guard 生命周期内关闭抢占，只适合短小且不会 yield 的 libc/runtime 调用；ShaOFS guard 只在切换 `%fs` 和更新 `runtime_fsbase_depth` 时短暂关闭抢占，随后允许 I/O、锁等待和 uthread park。
+
+修改相关代码时必须同时理解：
+
+- `junction/fs/shaofs/utili.h:RuntimeFSBaseGuard`
+- `lib/caladan/inc/runtime/thread.h:thread::runtime_fsbase_depth`
+- `lib/caladan/runtime/sched.c:thread_save_fsbase()`
+- `lib/caladan/runtime/sched.c:thread_fsbase_to_run()`
+- `lib/caladan/runtime/sched.c:thread_park_and_unlock_np()` / `thread_park_and_preempt_enable()`
+- `lib/caladan/runtime/sched.c:jmp_thread()` / `jmp_thread_direct()`
+
+不要把 ShaOFS guard 改回“整个作用域 `preempt_disable()`”；这会在 ShaOFS 内部 park/yield 时触发 Caladan 调度器 preempt count 断言。也不要在 `runtime_fsbase_depth > 0` 且当前 `%fs == runtime_fsbase` 时保存到 `thread_t::fsbase`；这会污染用户程序 TLS，典型表现是 stack smashing 或 Filebench 并发读崩溃。
+
+### 7.15 GOTCHA 14：inode cache 容量不是 inode 总量
+
+`DEFAULT_INODECACHE_CAPACITY=8192` 只是 inode cache 的可驻留 entry 数。ShaOFS 盘上 inode 总数是 `INODENUM=32768`，由 inode bitmap 决定。任何 inode 分配逻辑都不能用 cache capacity 作为扫描上限。
+
+当前 `alloc_inum()` 已按 `INODENUM` 全范围环形扫描；如果后续重构 inode cache 或 allocator，必须保留这个语义。否则 Filebench `entries=10000` 这类测试会在约 8192 inode 附近再次失败。
+
+### 7.16 GOTCHA 15：Filebench 当前是“单进程多线程降级版”
+
+当前 Filebench patch 为了适配 Junction，改变了 Filebench 的 procflow 执行模型：不再 fork worker process，而是在同一进程内用 pthread 运行 procflow monitor 和 worker threads。这足以跑通当前 ShaOFS 学术读负载，但不是 Filebench 上游语义的完整等价实现。
+
+使用 Filebench 结果时需要明确：
+
+- `process name=...,instances=N` 当前会变成同一 Junction 进程内的 N 个 procflow monitor pthread，而不是 N 个 OS process。
+- 当前补丁没有修改核心 flowop I/O 操作，例如 open/readwholefile/closefile 的实际文件 I/O 逻辑仍走 Filebench 原有 flowop。
+- 涉及多进程隔离、进程级资源统计、真实 fork/exec 行为的 Filebench workload 不应直接拿当前 patch 的结果做结论。
+- `toggle_filebench.sh apply` 后 Filebench 子仓库处于 modified/dirty 状态是预期的；源码修改应通过 `filebench_changes.patch` 管理，不要直接手改子仓库后忘记更新 patch。
+
 ---
 
 ## 第八章：当前代码状态与测试结果
@@ -1153,7 +1349,16 @@ lat_us p50=9 p90=9 p99=13 max=102
 - 当前已构建的 FIO 二进制可执行，`fio --version` 输出 `fio-3.42-22-g7215-dirty`。
 - 本次会话中曾验证过一个接近目标参数的 FIO 命令可在 Junction 中跑完并输出报告。历史性能数字不写入本文档；后续正式 benchmark 必须重新运行并保存原始输出。
 
-### 8.6 2026-05-09 crash consistency 验证结果
+### 8.6 2026-05-10 当前 Filebench 状态
+
+- `junction/fs/mytest/benchmark/filebench` 是 Filebench 源码目录；当前通过 `junction/fs/mytest/benchmark/patch/filebench_changes.patch` 管理 Junction 适配修改。
+- `toggle_filebench.sh apply` 会应用补丁，并用 `ac_cv_func_ftok=no ac_cv_func_semget=no ac_cv_func_semop=no ac_cv_func_semtimedop=no ./configure` 重新配置，然后执行 `make -j $(nproc)`。
+- 当前补丁覆盖 8 个 Filebench 源文件：`aslr.c`、`fb_cvar.c`、`fb_localfs.c`、`fileset.c`、`flowop_library.c`、`ipc.c`、`misc.c`、`procflow.c`；`procflow.h` 当前源码也包含 `pthread_t pf_tid` 字段，用于进程内 procflow monitor。
+- 适配后的 Filebench 不再依赖 `personality()` 关闭 ASLR，不再创建 SysV semaphore，不再 fork/exec worker process，也避免了 Filebench 日志和 mkdir 路径中的大栈对象。
+- 本轮会话中曾使用 `example.f` 在 Junction 上跑通 60s Filebench 读 whole-file workload：10000 个 16KB 文件，2 个 process instances，每个 3 个 reader threads。记录到的输出约为 `79454650 ops`、`1324058 ops/s`、`6.9GB/s`、`0.0ms/op`、`0.660ms` latency；这些是本轮调试验证数字，不是正式论文 benchmark，后续必须重新运行并保存完整 stdout/stderr、退出码和构建开关状态。
+- 当前 Filebench 结果是在 `DIRECTPATH DISABLED` 环境下得到的，不能直接解释为最终 NVMe 极限带宽。
+
+### 8.7 2026-05-09 crash consistency 验证结果
 
 本次验证使用默认 `SHAOFS_CRASH_CONSISTENCY=ON` 构建；同时确认 `SHAOFS_CRASH_CONSISTENCY=OFF` 可以成功编译。测试前重新执行过 `/home/syh/mkfs/mkfs.sh`，mkfs 输出包含：
 
@@ -1215,6 +1420,9 @@ bench_seq_rw 32: Write 0.4978s, 64.29 MB/s, 16457 IOPS; Read 0.0034s, 9467.46 MB
 11. **当前构建缓存开启了 `SHAOFS_IO_PREEMPT`**：`build/CMakeCache.txt` 当前为 ON，但 CMake 默认值仍为 OFF。做性能对比时必须明确重新 configure，避免把 ON/OFF 结果混淆。
 12. **Crash consistency 不是完整事务语义**：当前只保证异常退出后元数据合法、自洽；普通数据块不 journal，不完整创建/写入可能被 repair 清理或留下已落盘的数据内容。
 13. **Journal metadata map 依赖目录 extent 登记**：如果后续新增目录扩容、rename、unlink/rmdir 或新的目录写路径，必须确保新目录块被 `journal_register_metadata_block()` 登记，否则该目录块写回可能绕过 journal。
+14. **FS base 策略是针对 ShaOFS 的混合修复，不是 Junction 全局 TLS 架构终局**：当前已经覆盖 ShaOFS guard 内 park/yield 的场景，但其他隐式进入 runtime libc 且可能 yield 的路径仍需单独审计。
+15. **Filebench patch 改变 procflow 执行模型**：当前 Filebench 适配版用于跑通 Junction/ShaOFS 学术负载；它不是对上游 Filebench 多进程语义的完整兼容。
+16. **32768 inode 边界尚未完整耗尽验证**：当前已修复约 8192 inode 附近失败的问题，并验证过 10000 文件级别场景；完整创建到接近 `INODENUM=32768` 后的行为仍应补充压力测试。
 
 ### 9.2 优先待办任务
 
@@ -1266,6 +1474,20 @@ bench_seq_rw 32: Write 0.4978s, 64.29 MB/s, 16457 IOPS; Read 0.0034s, 9467.46 MB
 - 当前 repair 会扫描完整 inode table 和所有 group bitmap。
 - 学术测试中只要避免非 clean shutdown，正常路径不受影响；如果要频繁 crash/recover 实验，需要记录 repair 耗时并考虑按需扫描或 checkpoint。
 
+**Task 12: 固化 Filebench 正式 benchmark 脚本**
+- 基于 `toggle_filebench.sh apply`、重新 mkfs、启动 IOKernel、`timeout` 运行 Filebench、清理 IOKernel 的流程写自动化脚本。
+- 每次记录 Filebench stdout/stderr、退出码、Junction `DIRECTPATH` 状态、`SHAOFS_IO_PREEMPT` / `SHAOFS_CRASH_CONSISTENCY` 构建开关和 Filebench patch 状态。
+- 明确论文中如何解释 Filebench `process` 被降级为 pthread 的限制。
+
+**Task 13: 完整验证 inode 上限**
+- 扩展 `test_many_inodes.c` 或新增测试，创建接近 `INODENUM=32768` 的 inode，记录成功数量和耗尽时错误码。
+- 覆盖 clean shutdown 后 remount，再随机读取这些文件，确认 inode bitmap、inode table、dentry/path lookup 与 journal repair 不引入不一致。
+
+**Task 14: 继续审计 FS base / TLS 入口**
+- 当前 ShaOFS `RuntimeFSBaseGuard` 已处理 guard 内 yield 的问题。
+- 仍需检查 Junction 其他 runtime libc 调用点、lazy binding、signal trampoline、interrupt/syscall entry 等是否存在未 guard 或 guard 后可能 yield 的路径。
+- 如果新增可 yield 的 runtime-FS 区域，应复用 `runtime_fsbase_depth`，而不是使用会长时间禁用抢占的 `RuntimeLibcGuard`。
+
 ---
 
 ## 第十章：文件修改历史总览
@@ -1276,6 +1498,7 @@ bench_seq_rw 32: Write 0.4978s, 64.29 MB/s, 16457 IOPS; Read 0.0034s, 9467.46 MB
 | `shaofs/file.cc` | Perf + feature | 拆分 file_write 锁范围；新增 truncate_inode + free_inode_data_blocks；新增 file_read/write_direct |
 | `shaofs/file.h` | Feature | 新增 file_read/write_direct, truncate_inode 声明 |
 | `shaofs/inode.h` | Perf + refactor | MInode 新增 extent_hint；dir_mtx 从 mutex_t 升级为 rwmutex_t |
+| `shaofs/inode.cc` | Bug fix | `alloc_inum()` 按 `INODENUM=32768` 全范围环形扫描 inode bitmap，避免把 inode cache 容量 8192 误当作 inode 上限 |
 | `shaofs/extent.cc` | Perf | inode_bmap_locked 增加 hint fast path + hint 更新 |
 | `shaofs/inodeCache.cc` | Bug fix + feature | ic_free_inode 实现完整块释放；新增 ic_flush_inode |
 | `shaofs/inodeCache.h` | Feature | 新增 ic_flush_inode 声明 |
@@ -1312,6 +1535,16 @@ bench_seq_rw 32: Write 0.4978s, 64.29 MB/s, 16457 IOPS; Read 0.0034s, 9467.46 MB
 | `junction/fs/mytest/benchmark/fio/helper_thread.c` | FIO adapter | 补丁后 `timerfd_create/settime` 失败不再 assert，回退 select timeout |
 | `junction/fs/mytest/benchmark/patch/fio_changes.patch` | Handover artifact | 保存 FIO 适配源码补丁 |
 | `junction/fs/mytest/benchmark/patch/toggle_fio.sh` | Tooling | 一键 apply/revert FIO 补丁，并自动重新 configure/make |
+| `junction/fs/mytest/benchmark/filebench/aslr.c` | Filebench adapter | 补丁后不再调用 `personality()` 禁用 ASLR，要求宿主环境全局关闭 ASLR |
+| `junction/fs/mytest/benchmark/filebench/ipc.c` | Filebench adapter | 补丁后可在 configure 禁用 SysV semaphore 的状态下运行；修复字符串复制 NUL 结尾问题 |
+| `junction/fs/mytest/benchmark/filebench/procflow.c` | Filebench adapter | 补丁后用 pthread 在进程内运行 procflow monitor，绕过 Junction 不支持 fork/exec/wait worker 进程的问题 |
+| `junction/fs/mytest/benchmark/filebench/misc.c` | Filebench adapter | `filebench_log()` 大栈缓冲改为全局互斥缓冲并使用 `vsnprintf()` |
+| `junction/fs/mytest/benchmark/filebench/fileset.c` | Filebench adapter | 动态分配 mkdir 路径栈，避免 512KB uthread 栈被大数组压垮 |
+| `junction/fs/mytest/benchmark/filebench/fb_localfs.c` | Filebench adapter | 跳过对 `FSHAO:/` / `FSHAO/` 的 `system("rm -rf ...")` 清理 |
+| `junction/fs/mytest/benchmark/filebench/fb_cvar.c` | Filebench adapter | cvar 目录不可用时降级为 verbose log |
+| `junction/fs/mytest/benchmark/patch/filebench_changes.patch` | Handover artifact | 保存 Filebench 适配源码补丁 |
+| `junction/fs/mytest/benchmark/patch/toggle_filebench.sh` | Tooling | 一键 apply/revert Filebench 补丁，并自动重新 configure/make |
+| `junction/fs/mytest/benchmark/patch/example.f` | Benchmark config | 当前用于 Junction/ShaOFS 的 Filebench 示例 workload |
 | `lib/caladan/iokernel/main.c` | IO_PREEMPT | dataplane 中启用 `check_spdk_and_preempt()`，检查 SPDK completion 并批量发送 yield/UIPI |
 | `lib/caladan/iokernel/sched.c` | IO_PREEMPT bug fix | `sched_yield_on_core()` 改读 live `q_ptrs->rcu_gen`，修复持续 I/O 场景下 yield 去重错误 |
 | `lib/caladan/iokernel/ksched.h` | Perf | 移除发送 UIPI 热路径日志 |
@@ -1321,6 +1554,11 @@ bench_seq_rw 32: Write 0.4978s, 64.29 MB/s, 16457 IOPS; Read 0.0034s, 9467.46 MB
 | `junction/fs/mytest/shaofs_preempt_latency.c` | New test | CPU-bound 干扰下的单次 I/O 延迟测试 |
 | `junction/fs/mytest/shaofs_preempt_iops.c` | New test | CPU-bound 干扰下的连续 O_DIRECT read IOPS 测试 |
 | `junction/fs/mytest/shaofs_storage_st.config` | Test config | 单 kthread storage runtime 配置，用于 IO_PREEMPT 实验 |
+| `lib/caladan/inc/runtime/thread.h` | FS base fix | `thread_t` 新增 `runtime_fsbase_depth`，表示 uthread 处于 runtime FS base 区域的嵌套深度 |
+| `lib/caladan/runtime/sched.c` | FS base fix | 调度器用 `thread_save_fsbase()` / `thread_fsbase_to_run()` 区分用户 FS base 与 runtime FS base，修复 ShaOFS guard 内 park 污染 TLS |
+| `junction/fs/shaofs/utili.h` | FS base fix | `RuntimeFSBaseGuard` 更新 `runtime_fsbase_depth`，只在切换窗口短暂禁用抢占，guard 内允许 yield |
+| `junction/fs/mytest/test_many_inodes.c` | New test | 验证创建大量 inode 能越过 inode cache 容量 |
+| `junction/fs/mytest/test_many_inodes_read_threads.c` | New test | 大量小文件创建后多 pthread 读整文件并校验数据 |
 
 ---
 
@@ -1516,3 +1754,68 @@ printf 'syh2syh\n' | sudo -S lib/caladan/iokerneld ias
 - 未重新跑 ext4 对比测试。
 - 未构造 torn transaction header、坏 checksum、journal image 损坏、home block 部分写等细粒度崩溃点；当前 crash 测试是进程级 `SIGKILL` dirty mount 场景。
 - 未验证 `CRASH_CONSISTENCY=OFF` 的运行时行为，仅验证了它可以成功编译。
+
+---
+
+## 第十四章：2026-05-10 Filebench / inode / FS base 交接整理验证记录
+
+### 14.1 本次实际检查过的内容
+
+```bash
+sed -n '1,1500p' HANDOVER.md
+sed -n '1,220p' lib/caladan/inc/runtime/thread.h
+sed -n '1,150p;560,625p;800,850p' lib/caladan/runtime/sched.c
+sed -n '60,115p' junction/fs/shaofs/utili.h
+sed -n '1,110p' junction/bindings/runtime.h
+sed -n '1,180p' junction/fs/shaofs/inode.cc
+sed -n '1,220p' junction/fs/shaofs/inodeCache.h
+sed -n '1,280p' junction/fs/shaofs/inodeCache.cc
+sed -n '1,130p' junction/fs/shaofs/fs.h
+sed -n '1,220p' /home/syh/mkfs/fs.h
+sed -n '70,150p;180,240p' /home/syh/mkfs/mkfs.c
+sed -n '1,220p' junction/fs/mytest/benchmark/patch/toggle_filebench.sh
+sed -n '1,620p' junction/fs/mytest/benchmark/patch/filebench_changes.patch
+sed -n '1,240p' junction/fs/mytest/benchmark/patch/example.f
+sed -n '1,260p' junction/fs/mytest/test_many_inodes.c
+sed -n '1,300p' junction/fs/mytest/test_many_inodes_read_threads.c
+sed -n '1,220p' junction/fs/mytest/benchmark/filebench/procflow.h
+sed -n '1,220p' junction/fs/mytest/benchmark/filebench/procflow.c
+sed -n '1,180p' junction/fs/mytest/benchmark/filebench/aslr.c
+git -C /home/syh/MyProj1/junction status --short
+git -C /home/syh/MyProj1/junction/junction/fs/mytest/benchmark/filebench status --short
+sed -n '/SHAOFS_IO_PREEMPT/,+2p;/SHAOFS_CRASH_CONSISTENCY/,+2p' build/CMakeCache.txt
+```
+
+### 14.2 本轮会话中已运行过的关键构建和测试
+
+以下记录来自 2026-05-10 本轮开发调试过程；本次最后的文档整理阶段没有重新跑这些长测试。
+
+已运行并确认过的关键项：
+
+- `toggle_filebench.sh apply` 可以应用 Filebench patch 并重新构建 Filebench。
+- ShaOFS 重新构建过 `junction_run`，最终 `build/CMakeCache.txt` 中 `SHAOFS_IO_PREEMPT=ON`、`SHAOFS_CRASH_CONSISTENCY=ON`。
+- `test_many_inodes` 创建 10000 个小文件通过，用于验证 inode 分配越过 8192 cache capacity。
+- `test_many_inodes_read_threads` 创建 10000 个 16KB 文件后，用 3 个 pthread 循环读整文件并校验内容通过。
+- Filebench `example.f` 在 Junction 上跑通 60s，没有 timeout 或崩溃；示例输出约为 `1324058 ops/s`、`6.9GB/s`。
+- 测试过程中使用 `timeout` 包裹 `junction_run`，并在结束后清理 IOKernel。
+
+### 14.3 本次确认的客观状态
+
+- `lib/caladan/inc/runtime/thread.h` 当前 `thread_t` 包含 `runtime_fsbase_depth`。
+- `lib/caladan/runtime/sched.c` 当前存在 `thread_save_fsbase()` 和 `thread_fsbase_to_run()`；park 路径调用 `thread_save_fsbase()`，resume 路径调用 `thread_fsbase_to_run()`。
+- `junction/fs/shaofs/utili.h:RuntimeFSBaseGuard` 当前只在 FS base 切换窗口短暂禁用抢占，并维护 `runtime_fsbase_depth`。
+- `junction/bindings/runtime.h:RuntimeLibcGuard` 仍是整个 guard 生命周期内禁用抢占的短调用 guard；不要把它直接用于 ShaOFS 可 yield 路径。
+- `junction/fs/shaofs/inode.cc:alloc_inum()` 当前按 `INODENUM` 全范围扫描 inode bitmap，`DEFAULT_INODECACHE_CAPACITY=8192` 不再限制可分配 inode 总数。
+- `junction/fs/shaofs/fs.h` 当前 `MYPREFIX` 仍是 `"FSHAO"`，`SHAOFS_REALPATH()` 兼容可选冒号。
+- `junction/fs/mytest/benchmark/patch/filebench_changes.patch` 当前是 Filebench 适配的唯一补丁载体；不要直接修改 Filebench 子仓库后忘记更新该 patch。
+- Filebench 子仓库当前显示多个 modified 文件是预期的 patch applied 状态；同时还存在 autotools/configure/build 生成文件，不能简单把整个子仓库 dirty 状态都当作源码改动。
+
+### 14.4 本次未重新验证的内容
+
+- 未重新运行完整 `scripts/build.sh`。
+- 未重新运行完整 ShaOFS 单元测试套件。
+- 未重新运行 FIO target benchmark。
+- 未重新运行 Filebench benchmark；本章记录的是本轮会话中此前跑通过的结果。
+- 未完整创建到 `INODENUM=32768` 的 inode 耗尽边界。
+- 未验证 Filebench 适配对所有 workload 类型的兼容性；当前只确认 `example.f` 这类读 whole-file workload 可以跑通。
+- 未进一步审计 Junction 所有 runtime libc / lazy binding / signal trampoline / syscall entry 的 FS base 策略；当前确认的是 ShaOFS guard 内 yield 场景的修复。
