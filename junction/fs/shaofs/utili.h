@@ -74,13 +74,21 @@ class RuntimeFSBaseGuard    // 切换到 runtime 的 fsbase，在析构时恢复
  public:
   [[nodiscard]] RuntimeFSBaseGuard() noexcept 
   {
+    preempt_disable();
     prev_fs_base_ = _readfsbase_u64();
+    thread_t* th = thread_self();
+    if (th) th->runtime_fsbase_depth++;
     _writefsbase_u64(perthread_read(runtime_fsbase));
+    preempt_enable();
   }
 
   ~RuntimeFSBaseGuard() 
   {
+    preempt_disable();
     _writefsbase_u64(prev_fs_base_);
+    thread_t* th = thread_self();
+    if (th && th->runtime_fsbase_depth) th->runtime_fsbase_depth--;
+    preempt_enable();
   }
 
  private:
