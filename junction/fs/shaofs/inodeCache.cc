@@ -45,10 +45,18 @@ InodeHandle ic_alloc_inode(file_type_t type, int inum)    // 如果 inum != -1 �
         inum = alloc_inum();
         new_alloc_inum = true;
     }
+    else
+    {
+        if (inum < 0 || inum >= INODENUM || bitmap_atomic_test_and_set(imap, inum))
+        {
+            log_err("[ic_alloc_inode()] Fail to allocate requested inode %d", inum);
+            return InodeHandle();
+        }
+        new_alloc_inum = true;
+    }
     if (inum == -1) 
     {
         log_err("[ic_alloc_inode()] Fail to allocate a new inode: invalid inum");
-        if (new_alloc_inum) free_inum(inum);
         return InodeHandle(); // 返回空 Handle
     }
 
@@ -56,18 +64,16 @@ InodeHandle ic_alloc_inode(file_type_t type, int inum)    // 如果 inum != -1 �
     if (!handle) 
     {
         log_err("[ic_alloc_inode()] Fail to allocate a new inode CacheEntry");
+        if (new_alloc_inum) free_inum(inum);
         return InodeHandle();
     }
 
     {
         auto write_acc = handle.write_access();   // 获取排他写锁，对 inode 的内容进行初始化
-        if (write_acc->used) 
-        {
-            log_err("[ic_alloc_inode()] Inode %d is already in use!", inum);
-            return InodeHandle();
-        }
         memset(static_cast<DInode*>(&(*write_acc)), 0, sizeof(DInode));
+        rwmutex_init(&write_acc->dir_mtx);
         memset(&write_acc->extent_hint, 0, sizeof(write_acc->extent_hint));
+        spin_lock_init(&write_acc->hint_lock);
         write_acc->idx = inum;
         write_acc->used = true;
         write_acc->type = type;
