@@ -74,6 +74,7 @@ InodeHandle ic_alloc_inode(file_type_t type, int inum)    // 如果 inum != -1 �
         rwmutex_init(&write_acc->dir_mtx);
         memset(&write_acc->extent_hint, 0, sizeof(write_acc->extent_hint));
         spin_lock_init(&write_acc->hint_lock);
+        atomic_write(&write_acc->has_dirty_data_cache, 0);
         write_acc->idx = inum;
         write_acc->used = true;
         write_acc->type = type;
@@ -127,6 +128,7 @@ bool ic_free_inode(int inum)   // 释放该 inode 持有的所有资源，inum �
         write_acc->valid_extent_count = 0;
         memset(write_acc->direct_extents, 0, sizeof(write_acc->direct_extents));
         memset(&write_acc->extent_hint, 0, sizeof(write_acc->extent_hint));
+        atomic_write(&write_acc->has_dirty_data_cache, 0);
 
         write_acc.mark_dirty();
     }

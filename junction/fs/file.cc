@@ -227,6 +227,12 @@ ssize_t usys_read(int fd, void *buf, size_t len) {
   if (f->get_inode() && f->get_inode()->get_mode() == SHAOFS)
   {
     bool direct = f->get_flags() & kFlagDirect;
+    if (direct && f->get_shaofs_direct_read_hint()->valid)
+    {
+      ssize_t ret = file_read_direct_hint(f->get_shaofs_direct_read_hint(), (char*)buf, f->get_off_ref(), len);
+      if (ret >= 0) f->get_off_ref() += ret;
+      return ret;
+    }
     return my_read(f->get_inode()->get_inum(), buf, &f->get_off_ref(), len, direct);
   }
 
@@ -254,6 +260,7 @@ ssize_t usys_write(int fd, const void *buf, size_t len) {
   {
     int inum = f->get_inode()->get_inum();
     bool direct = f->get_flags() & kFlagDirect;
+    f->get_shaofs_direct_read_hint()->valid = false;
     if (f->get_flags() & O_APPEND) f->get_off_ref() = my_lseek(inum, 0, SEEK_END, 0);
     return my_write(inum, buf, &f->get_off_ref(), len, direct);
   }
@@ -271,6 +278,7 @@ ssize_t usys_pread64(int fd, void *buf, size_t len, off_t offset) {
   if (f->get_inode() && f->get_inode()->get_mode() == SHAOFS)
   {
     bool direct = f->get_flags() & kFlagDirect;
+    if (direct && f->get_shaofs_direct_read_hint()->valid) return file_read_direct_hint(f->get_shaofs_direct_read_hint(), (char*)buf, offset, len);
     return my_read(f->get_inode()->get_inum(), buf, &offset, len, direct);
   }
 
@@ -553,6 +561,7 @@ ssize_t usys_pwrite64(int fd, const void *buf, size_t len, off_t offset) {
   if (f->get_inode() && f->get_inode()->get_mode() == SHAOFS)
   {
     bool direct = f->get_flags() & kFlagDirect;
+    f->get_shaofs_direct_read_hint()->valid = false;
     return my_write(f->get_inode()->get_inum(), buf, &offset, len, direct);
   }
 

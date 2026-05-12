@@ -17,6 +17,7 @@ extern "C" {
 #include "junction/bindings/sync.h"
 #include "junction/fs/poll.h"
 #include "junction/fs/procfs/procfs.h"
+#include "junction/fs/shaofs/file.h"
 #include "junction/snapshot/cereal.h"
 
 namespace junction {
@@ -188,6 +189,7 @@ class File : public std::enable_shared_from_this<File> {
   [[nodiscard]] bool is_readable() const { return mode_ != FileMode::kWrite; }
   [[nodiscard]] bool is_writeable() const { return mode_ != FileMode::kRead; }
   [[nodiscard]] off_t &get_off_ref() { return off_; }
+  [[nodiscard]] DirectReadHint *get_shaofs_direct_read_hint() { return &shaofs_direct_read_hint_; }
   [[nodiscard]] bool is_nonblocking() const {
     return get_flags() & kFlagNonblock;
   }
@@ -266,6 +268,7 @@ class File : public std::enable_shared_from_this<File> {
   unsigned int flags_;
   const FileMode mode_;
   off_t off_{0};
+  DirectReadHint shaofs_direct_read_hint_{};
   bool poll_source_setup_{false};
   PollSource poll_;
   Inode *const ino_;

@@ -72,6 +72,8 @@ struct seccomp_data {
 #define arch_nr (offsetof(struct seccomp_data, arch))
 #define ip_msb (offsetof(struct seccomp_data, instruction_pointer) + 4)
 #define ip_lsb (offsetof(struct seccomp_data, instruction_pointer) + 0)
+#define arg1_msb (offsetof(struct seccomp_data, args[1]) + 4)
+#define arg1_lsb (offsetof(struct seccomp_data, args[1]) + 0)
 
 #ifndef __x86_64__
 #error "Currently only supports x86-64"
@@ -176,6 +178,14 @@ static uint32_t base_end_hi =
       BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, ksys_end_addr_hi, 0, 3),    \
       BPF_STMT(BPF_LD + BPF_W + BPF_ABS, ip_lsb),                     \
       BPF_JUMP(BPF_JMP + BPF_JGT + BPF_K, ksys_end_addr_low, 1, 0),   \
+      BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_ALLOW)
+
+#define ALLOW_IOCTL_REQUEST(request)                                       \
+  EXAMINE_SYSCALL, BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, __NR_ioctl, 0, 5), \
+      BPF_STMT(BPF_LD + BPF_W + BPF_ABS, arg1_lsb),                       \
+      BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, static_cast<uint32_t>(static_cast<uint64_t>(request)), 0, 3),   \
+      BPF_STMT(BPF_LD + BPF_W + BPF_ABS, arg1_msb),                       \
+      BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, static_cast<uint32_t>(static_cast<uint64_t>(request) >> 32), 0, 1),  \
       BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_ALLOW)
 
 #define ALLOW_SYSCALL(name)                                                \

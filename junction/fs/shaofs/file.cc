@@ -8,9 +8,21 @@
 #include "group.h"
 #include "dsa.h"
 #include "journal.h"
+#include <cstdint>
 #include <boost/container/small_vector.hpp>
 extern "C" {
 #include "runtime/runtime.h"
+}
+
+static constexpr size_t USER_DMA_ALIGNMENT = 2 * 1024 * 1024;
+static inline bool user_dma_request_ok(const void* buf, off_t offset, size_t len)   // 只有满足该条件的 buffer 才能直接参与 O_DIRECT I/O 的用户 DMA；否则直接返回错误，不回退到 bounce buffer + memcpy 了
+{
+    return offset >= 0 && (static_cast<uint64_t>(offset) & (BLOCK_SIZE - 1)) == 0 && (reinterpret_cast<uintptr_t>(buf) & (USER_DMA_ALIGNMENT - 1)) == 0 && (len & (USER_DMA_ALIGNMENT - 1)) == 0;
+}
+
+static inline void mark_inode_data_cache_dirty(MInode* inode)
+{
+    atomic_write(&inode->has_dirty_data_cache, 1);
 }
 
 // 释放 inode 持有的所有数据块（direct + indirect extents）。调用前必须持有 inode 写锁。
@@ -64,6 +76,7 @@ void truncate_inode(int inum)
     if (!write_acc->used || write_acc->file_size == 0) return;
 
     free_inode_data_blocks(&*write_acc);
+    atomic_write(&write_acc->has_dirty_data_cache, 0);
     write_acc.mark_dirty();
 }
 
@@ -283,6 +296,7 @@ static ssize_t file_write_blockwise(int inum, const char* buf, off_t offset, siz
                     auto block_write_acc = bh.write_access(); // 获取 Block 独占写锁保证单块安全
                     dsa_copy(block_write_acc->data + blk_offset, buf + bytes_written, copy_len);
                     block_write_acc.mark_dirty();
+                    mark_inode_data_cache_dirty(const_cast<MInode*>(&(*read_acc)));
 
                     bytes_written += copy_len;
                     fast_path_success = true;
@@ -322,6 +336,7 @@ static ssize_t file_write_blockwise(int inum, const char* buf, off_t offset, siz
                 if (is_new_block && copy_len < BLOCK_SIZE) memset(block_write_acc->data, 0, BLOCK_SIZE);   // 新分配的块若未写满，必须填 0
                 dsa_copy(block_write_acc->data + blk_offset, buf + bytes_written, copy_len);
                 block_write_acc.mark_dirty();
+                mark_inode_data_cache_dirty(&*write_acc);
             }
 
             uint64_t new_end_pos = current_offset + copy_len;
@@ -407,6 +422,7 @@ static ssize_t file_write_batch_existing(int inum, const char* buf, off_t offset
             {
                 dsa_copyv(vecs.data(), vecs.size());
                 for (auto& acc : accessors) acc.mark_dirty();
+                mark_inode_data_cache_dirty(const_cast<MInode*>(&(*read_acc)));
             }
             vecs.clear();
             accessors.clear();
@@ -435,10 +451,11 @@ ssize_t file_write(int inum, const char* buf, off_t offset, size_t len)
 
 
 /* O_DIRECT I/O */
-// 目前是实现是绕过 Block Cache，使用 storage_read_obj/storage_write_obj 直接访问磁盘，但是内部还是会分配临时 SPDK DMA buffer 并 memcpy 到/从用户 buffer，并不是真正的零拷贝（有待修改）
 ssize_t file_read_direct(int inum, char* buf, off_t offset, size_t len)
 {
     if (len == 0) return 0;
+    if (!user_dma_request_ok(buf, offset, len)) return -EINVAL;   // O_DIRECT 使用严格的用户 buffer DMA 合约；不满足条件或注册失败时直接返回错误。
+    if (storage_prepare_user_dma(buf, len) != 0) return -EIO;
 
     InodeHandle ih = ic_get_inode(inum);
     if (unlikely(!ih)) return -1;
@@ -460,17 +477,132 @@ ssize_t file_read_direct(int inum, char* buf, off_t offset, size_t len)
             uint64_t request_remain = len - bytes_read;
             copy_len = MIN(BLOCK_SIZE - blk_offset, MIN(request_remain, actual_remain));
             if (copy_len == 0) break;
+            if (blk_offset != 0 || (copy_len % BLOCK_SIZE) != 0) break;
 
             phys_blk = inode_bmap_locked(const_cast<MInode*>(&(*read_acc)), logical_blk, false, nullptr);
+        }
 
-            if (phys_blk == INVALID_BLOCK_ID) memset(buf + bytes_read, 0, copy_len);  // 处理文件空洞 (Hole)：直接将对应的用户 Buffer 填 0，无需下发 I/O
-            else
+        if (phys_blk == INVALID_BLOCK_ID)
+        {
+            memset(buf + bytes_read, 0, copy_len);  // 处理文件空洞 (Hole)：直接将对应的用户 Buffer 填 0，无需下发 I/O
+        }
+        else
+        {
+            char* dst = buf + bytes_read;
+            if (atomic_read(&ih.get_entry()->data.has_dirty_data_cache) && !bc_flush_block(phys_blk)) break;  // 若该块在 cache 中且为脏，先刷盘保证 Direct I/O 能读到最新数据
+
+            if (storage_read_aligned(dst, phys_blk, copy_len / BLOCK_SIZE) != 0) break;
+        }
+
+        bytes_read += copy_len;
+    }
+
+    return bytes_read;
+}
+
+bool file_prepare_direct_read_hint(int inum, DirectReadHint* hint)
+{
+    if (!hint) return false;
+    RuntimeFSBaseGuard g;
+
+    hint->valid = false;
+    hint->extent_count = 0;
+    hint->file_size = 0;
+    hint->has_dirty_data_cache = nullptr;
+
+    InodeHandle ih = ic_get_inode(inum);
+    if (unlikely(!ih)) return false;
+
+    auto read_acc = ih.read_access();
+    if (!read_acc->used || read_acc->valid_extent_count == 0 || read_acc->valid_extent_count > DIRECT_READ_HINT_MAX_EXTENTS) return false;
+
+    uint32_t hint_count = 0;
+    uint32_t direct_count = direct_extent_count(&*read_acc);
+    for (uint32_t i = 0; i < direct_count; i++)
+        hint->extents[hint_count++] = read_acc->direct_extents[i];
+
+    if (uses_indirect_block(&*read_acc))
+    {
+        BlockHandle ind_bh = bc_get_handle(read_acc->indirect_extent_block);
+        if (!ind_bh) return false;
+
+        auto ind_acc = ind_bh.read_access();
+        const iExtent* ind_exts = reinterpret_cast<const iExtent*>(ind_acc->data);
+        uint32_t indirect_count = indirect_extent_count(&*read_acc);
+        for (uint32_t i = 0; i < indirect_count; i++)
+            hint->extents[hint_count++] = ind_exts[i];
+    }
+
+    if (hint_count != read_acc->valid_extent_count) return false;
+
+    hint->file_size = read_acc->file_size;
+    hint->extent_count = hint_count;
+    hint->has_dirty_data_cache = &ih.get_entry()->data.has_dirty_data_cache;
+    hint->valid = true;
+    return true;
+}
+
+ssize_t file_read_direct_hint(const DirectReadHint* hint, char* buf, off_t offset, size_t len)
+{
+    if (!hint || !hint->valid) return -1;
+    if (len == 0) return 0;
+    if (!user_dma_request_ok(buf, offset, len)) return -EINVAL;
+    if (storage_prepare_user_dma(buf, len) != 0) return -EIO;
+    if (static_cast<uint64_t>(offset) >= hint->file_size) return 0;
+
+    RuntimeFSBaseGuard g;
+
+    uint64_t bytes_read = 0;
+    while (bytes_read < len)
+    {
+        uint64_t current_offset = offset + bytes_read;
+        uint64_t logical_blk = current_offset / BLOCK_SIZE, blk_offset = current_offset % BLOCK_SIZE;
+        uint64_t actual_remain = hint->file_size - current_offset;
+        uint64_t request_remain = len - bytes_read;
+        if (blk_offset != 0) break;
+
+        iExtent ext = {};
+        for (uint32_t i = 0; i < hint->extent_count; i++)
+        {
+            if (block_in_extent(logical_blk, hint->extents[i]))
             {
-                bc_flush_block(phys_blk);  // 若该块在 cache 中且为脏，先刷盘保证 Direct I/O 能读到最新数据
-                if (storage_read_obj(buf + bytes_read, copy_len, phys_blk, blk_offset) != 0) break;
+                ext = hint->extents[i];
+                break;
             }
         }
 
+        uint64_t copy_len;
+        BlockID phys_blk;
+        if (ext.block_count == 0)
+        {
+            copy_len = MIN(BLOCK_SIZE, MIN(request_remain, actual_remain));
+            memset(buf + bytes_read, 0, copy_len);
+            bytes_read += copy_len;
+            continue;
+        }
+
+        uint64_t extent_blocks = ext.block_count - (logical_blk - ext.logical_start);
+        uint64_t max_blocks = MIN(extent_blocks, MIN(request_remain, actual_remain) / BLOCK_SIZE);
+        if (max_blocks == 0) break;
+        copy_len = max_blocks * BLOCK_SIZE;
+        phys_blk = ext.physical_start + (logical_blk - ext.logical_start);
+
+        char* dst = buf + bytes_read;
+        if (atomic_read(hint->has_dirty_data_cache))
+        {
+            bool flush_ok = true;
+            for (uint64_t i = 0; i < max_blocks; i++)
+            {
+                if (!bc_flush_block(phys_blk + i))
+                {
+                    flush_ok = false;
+                    break;
+                }
+            }
+            if (!flush_ok) break;
+        }
+
+        if (storage_read_aligned(dst, phys_blk, copy_len / BLOCK_SIZE) != 0) break;
         bytes_read += copy_len;
     }
 
@@ -480,6 +612,8 @@ ssize_t file_read_direct(int inum, char* buf, off_t offset, size_t len)
 ssize_t file_write_direct(int inum, const char* buf, off_t offset, size_t len)
 {
     if (len == 0) return 0;
+    if (!user_dma_request_ok(buf, offset, len)) return -EINVAL;
+    if (storage_prepare_user_dma(const_cast<char*>(buf), len) != 0) return -EIO;
 
     InodeHandle ih = ic_get_inode(inum);
     if (unlikely(!ih)) 
@@ -494,6 +628,7 @@ ssize_t file_write_direct(int inum, const char* buf, off_t offset, size_t len)
         uint64_t current_offset = offset + bytes_written;
         uint64_t logical_blk = current_offset / BLOCK_SIZE, blk_offset  = current_offset % BLOCK_SIZE;
         uint64_t copy_len = MIN(BLOCK_SIZE - blk_offset, len - bytes_written);
+        if (blk_offset != 0 || (copy_len % BLOCK_SIZE) != 0) break;
 
         BlockID phys_blk = INVALID_BLOCK_ID;
         bool use_fast_path = false;
@@ -514,7 +649,7 @@ ssize_t file_write_direct(int inum, const char* buf, off_t offset, size_t len)
                 {
                     bc_flush_block(phys_blk);
 
-                    if (storage_write_obj(buf + bytes_written, copy_len, phys_blk, blk_offset) != 0) 
+                    if (storage_write_user_dma(buf + bytes_written, phys_blk, copy_len / BLOCK_SIZE) != 0) 
                     {
                         log_err("[file_write_direct] Failed to write to physical block %lu", phys_blk);
                         break;
@@ -547,12 +682,7 @@ ssize_t file_write_direct(int inum, const char* buf, off_t offset, size_t len)
 
             bc_flush_block(phys_blk);
 
-            int ret = 0;
-            if (is_new_block) 
-                ret = storage_write_obj_no_rmw(buf + bytes_written, copy_len, phys_blk, blk_offset);
-            else 
-                ret = storage_write_obj(buf + bytes_written, copy_len, phys_blk, blk_offset);
-            if (unlikely(ret != 0)) break;
+            if (storage_write_user_dma(buf + bytes_written, phys_blk, copy_len / BLOCK_SIZE) != 0) break;
             bc_invalidate_block(phys_blk);
 
             uint64_t new_end_pos = current_offset + copy_len;

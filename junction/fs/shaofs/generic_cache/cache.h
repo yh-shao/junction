@@ -192,6 +192,7 @@ public:
         if (!entryHandle) return true;   // 不在缓存中，无需刷写
 
         EntryType* entry = entryHandle.get_entry();
+        if (!atomic_read(&entry->dirty) || !atomic_read(&entry->valid)) return true;   // fast path: 不脏或者无效，无需刷写，直接返回成功，避免对读锁的获取  （不过在极端情况下可能存在并发问题，此处暂时可以接受）
 
         auto acc = entryHandle.read_access();   // 读锁即可：只是读数据写到后端，不修改 entry 的 data
         if (atomic_read(&entry->dirty) && atomic_read(&entry->valid))

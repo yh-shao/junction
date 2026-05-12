@@ -4,6 +4,7 @@
 #include <linux/audit.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
+#include <linux/vfio.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,6 +33,7 @@ namespace junction {
 static struct sock_filter caladan_filter[] = {
     ALLOW_CALADAN_SYSCALL(ioctl),      ALLOW_CALADAN_SYSCALL(mmap),
     ALLOW_CALADAN_SYSCALL(madvise),    ALLOW_CALADAN_SYSCALL(mprotect),
+    ALLOW_CALADAN_SYSCALL(mlock),
     ALLOW_CALADAN_SYSCALL(exit_group), ALLOW_CALADAN_SYSCALL(pwritev2),
     ALLOW_CALADAN_SYSCALL(writev)};
 
@@ -53,6 +55,11 @@ static struct sock_filter allow_all_junction[] = {ALLOW_ANY_JUNCTION_SYSCALL};
 static struct sock_filter linux_tgkill[] = {ALLOW_JUNCTION_SYSCALL(tgkill)};
 
 static struct sock_filter rtsigreturn[] = {ALLOW_CALADAN_SYSCALL(rt_sigreturn)};
+
+static struct sock_filter vfio_dma_map[] = {
+    ALLOW_IOCTL_REQUEST(VFIO_IOMMU_MAP_DMA),
+    ALLOW_IOCTL_REQUEST(VFIO_IOMMU_UNMAP_DMA)
+};
 
 // Final filter that forwards all other system calls to our signal handler.
 static struct sock_filter trap[] = {TRAP};
@@ -77,7 +84,7 @@ constexpr size_t filterMax =
     sizeof(caladan_filter) + sizeof(writeable_linux_fs) +
     sizeof(uncached_linux_fs) + sizeof(allow_all_junction) +
     sizeof(linux_tgkill) + sizeof(trap) + sizeof(junction_core) +
-    sizeof(rtsigreturn);
+    sizeof(rtsigreturn) + sizeof(vfio_dma_map);
 
 /* Source: https://outflux.net/teach-seccomp/step-3/example.c
  */
@@ -94,6 +101,7 @@ Status<void> _install_seccomp_filter() {
 
   // Add caladan filters.
   addFilter(caladan_filter, sizeof(caladan_filter));
+  addFilter(vfio_dma_map, sizeof(vfio_dma_map));      // 放行 VFIO ioctl，从而在运行时可以将 user buffer 转换成 DMA-able (spdk_mem_register)
 
 #ifdef PERMISSIVE_SECCOMP
   // Allow any Junction system call.

@@ -542,6 +542,7 @@ long usys_openat(int dirfd, const char *pathname, int flags, mode_t mode) {
   
     auto my_dentry = std::make_shared<junction::DirectoryEntry>("dummy_name", nullptr, myinode);
     Status<std::shared_ptr<File>> f = std::make_shared<File>(FileType::kNormal, opflag, fmode, my_dentry);
+    if (opflag & kFlagDirect) file_prepare_direct_read_hint(inum, (*f)->get_shaofs_direct_read_hint());
     if (flags & kFlagAppend) (*f)->get_off_ref() = my_lseek(inum, 0, SEEK_END, 0);   // 此处 old_offset 可以忽略
     return ftbl.Insert(std::move(*f), (flags & kFlagCloseExec) > 0);
   }
