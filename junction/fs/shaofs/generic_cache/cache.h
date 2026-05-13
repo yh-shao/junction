@@ -4,6 +4,7 @@
 #include "objpool.h"
 #include "cache_entry.h"
 #include "hashmap.h"
+#include <vector>
 
 
 template <typename Key, typename Value, typename Hash = std::hash<Key>>
@@ -203,28 +204,31 @@ public:
         return true;
     }
     
-    void flush_all()   // 调用此函数时，应保证外部没有任何线程并发访问 Cache，例如系统终止时，不然该线程的阻塞时间就太久了。
+    void flush_all()
     {
+        std::vector<Handle> entries;
+        entries.reserve(capacity);
+
         spin_lock(&shard_lock);
-
-        for (size_t i = 0; i < hashmap->bucket_count(); i++) 
+        for (size_t i = 0; i < hashmap->bucket_count(); i++)
         {
-            EntryType* curr = hashmap->get_bucket_head(i);
-            while (curr) 
-            {
-                if (atomic_read(&curr->dirty) && atomic_read(&curr->valid)) 
-                {
-                    Handle h(curr);
-                    auto acc = h.read_access();
-                    if (backend->write(curr->key, curr->data)) atomic_write(&curr->dirty, 0); 
-                    else log_err("Flush failed during shutdown for a key"); 
-                }
+            for (EntryType* curr = hashmap->get_bucket_head(i); curr; curr = curr->hash_next) 
+                if (atomic_read(&curr->dirty) && atomic_read(&curr->valid)) entries.emplace_back(curr);
+        }
+        spin_unlock(&shard_lock);
 
-                curr = curr->hash_next;
+        for (Handle& h : entries)
+        {
+            EntryType* entry = h.get_entry();
+            if (!atomic_read(&entry->dirty) || !atomic_read(&entry->valid)) continue;
+
+            auto acc = h.read_access();
+            if (atomic_read(&entry->dirty) && atomic_read(&entry->valid))
+            {
+                if (backend->write(entry->key, entry->data)) atomic_write(&entry->dirty, 0);
+                else log_err("Flush failed for a key");
             }
         }
-
-        spin_unlock(&shard_lock);
     }
 
     void invalidate(const Key& key)   // 主动使指定 key 的 CachEntry 失效（不写回后端）

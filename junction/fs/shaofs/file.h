@@ -9,6 +9,7 @@ ssize_t file_write(int inum, const char* buf, off_t offset, size_t len);
 ssize_t file_read_direct(int inum, char* buf, off_t offset, size_t len);
 ssize_t file_write_direct(int inum, const char* buf, off_t offset, size_t len);
 void truncate_inode(int inum);
+void shaofs_sync_all();
 void final_flush();
 
 #define DIRECT_READ_HINT_MAX_EXTENTS 64

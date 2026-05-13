@@ -80,6 +80,23 @@ void truncate_inode(int inum)
     write_acc.mark_dirty();
 }
 
+static void flush_all_dirty_state()
+{
+	// uint64_t before_flush = rdtsc();
+    journal_write_metadata(imap, BITMAP_LONG_SIZE(sb.inode_num) * sizeof(unsigned long), sb.imap_blockstart, 0);
+	sync_all_gdt();
+	ic_flush_all();
+	bc_flush_all();
+	// uint64_t after_flush = rdtsc();
+	// log_info("[flush] duration: %lu us", (after_flush - before_flush) / cycles_per_us);
+}
+
+void shaofs_sync_all()
+{
+    RuntimeFSBaseGuard g;
+    flush_all_dirty_state();
+}
+
 void final_flush()
 {
 #if IO_PREEMPT
@@ -87,15 +104,9 @@ void final_flush()
 	barrier();
 #endif
 
-	RuntimeFSBaseGuard g;
-	// uint64_t before_flush = rdtsc();
-    journal_write_metadata(imap, BITMAP_LONG_SIZE(sb.inode_num) * sizeof(unsigned long), sb.imap_blockstart, 0);
-	sync_all_gdt();
-	ic_flush_all();
-	bc_flush_all();
+    RuntimeFSBaseGuard g;
+    flush_all_dirty_state();
     journal_mark_clean();
-	// uint64_t after_flush = rdtsc();
-	// log_info("[flush] duration: %lu us", (after_flush - before_flush) / cycles_per_us);
 }
 
 static constexpr size_t kFileBatchCopyMin = 64 * 1024;  // 64k

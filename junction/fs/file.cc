@@ -621,6 +621,11 @@ long usys_fsync(int fd) {
 }
 
 long usys_fdatasync(int fd) { return usys_fsync(fd); }
+long usys_sync(void) 
+{
+  shaofs_sync_all();
+  return 0;
+}
 
 long usys_dup(int oldfd) {
   FileTable &ftbl = myproc().get_file_table();

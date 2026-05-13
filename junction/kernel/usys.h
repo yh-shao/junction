@@ -61,6 +61,7 @@ ssize_t usys_sendfile(int out_fd, int in_fd, off_t *offset, size_t count);
 off_t usys_lseek(int fd, off_t offset, int whence);
 long usys_fsync(int fd);
 long usys_fdatasync(int fd);
+long usys_sync(void);
 long usys_dup(int oldfd);
 long usys_dup2(int oldfd, int newfd);
 long usys_dup3(int oldfd, int newfd, int flags);
