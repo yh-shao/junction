@@ -1,6 +1,6 @@
 # Project Handover / ShaOFS 全局项目交接与 AI 上下文恢复文档
 
-> **文档版本**: v4.3 | **最后更新**: 2026-05-12
+> **文档版本**: v4.4 | **最后更新**: 2026-05-13
 > **目的**: 使任何 AI Code Agent 读取本文档后，能瞬间加载全部项目上下文，无缝继续开发。
 
 > **2026-05-06 补充说明**: 本文档保留了 2026-04-10 之前关于 ShaOFS 架构、测试和优化的历史沉淀。本次交接修正了与当前代码明显不一致的事实，并追加了 FIO-on-Junction 适配、补丁管理脚本和当前验证状态。历史性能测试结果可能不可靠，已从本文档移除；正式性能数据应以重新跑出的 benchmark 原始输出为准。
@@ -12,6 +12,8 @@
 > **2026-05-10 补充说明**: 本次交接追加了 Filebench-on-Junction 适配、`alloc_inum()` 越过 8192 inode 的修复，以及 x86 FS base 保存/恢复策略。当前 Filebench 适配仅修改 Filebench 源码并通过 patch 管理，不修改 Junction；它把 Filebench procflow 从 fork/exec/wait 模型降级为进程内 pthread 模型，并绕过 Junction 当前不支持或不稳定的 `personality()`、SysV semaphore、部分清理命令和日志栈缓冲路径。当前 `alloc_inum()` 已按 `INODENUM=32768` 全范围扫描 inode bitmap；本轮验证越过了 8192 inode，但尚未完整验证 32768 inode 耗尽边界。
 
 > **2026-05-12 补充说明**: 本次交接修正了 O_DIRECT 路径的描述。当前 ShaOFS 已实现严格约束下的 user-buffer DMA：用户 buffer 必须 2MB 对齐、长度必须是 2MB 的倍数，文件 offset 必须 4KB 对齐；不满足时直接返回错误，不再回退到 bounce buffer。`storage_prepare_user_dma()` 会 `mlock()` 用户页、调用 `spdk_mem_register()` 并用 `spdk_vtophys()` 验证 IOVA，随后 `storage_read_aligned()` / `storage_write_user_dma()` 直接把用户 buffer 作为 SPDK NVMe payload。为支持这条路径，当前 seccomp 放行了 Caladan `mlock` wrapper 以及 VFIO DMA map/unmap ioctl request。另补充了 Filebench `randomread.f` 派生 workload、ext4 cgroup 对比脚本和 Caladan/Junction syscall 包装/拦截机制。
+
+> **2026-05-13 补充说明**: 本次交接追加了 Filebench `fileserver.f` / `webserver.f` 在 Junction/ShaOFS 上的当前验证状态、ext4 `fileserver.f` cgroup 对比脚本和最新 smoke 对比数据。为跑通 `fileserver.f` 的 append-heavy 模式，`junction/fs/shaofs/extent.cc` 已在普通文件 EOF append 路径加入批量预分配：按文件大小选择 16/64/128 blocks，通过 `alloc_blocks()` 获取物理块，合并成 extent 后一次写回 inode extent 元数据；预分配块会立即在 Block Cache 中清零并标脏，失败路径会 invalidate cache entry 并释放物理块。当前 `fileserver.f` 是一个缩小版 smoke workload（40 files、1 thread、2s runtime），ShaOFS 结果约 `989k ops/s`，ext4 同资源 cgroup 结果约 `627k ops/s`。`webserver.f` 已改为 `set $dir=FSHAO:` 并能完整跑完 60s，ShaOFS 结果约 `680k ops/s`、`3412.3MB/s`。这些是本轮功能验证/初步对比数据，不是最终论文 benchmark；正式实验仍需重新固定构建开关、WML、cgroup/Junction config 并保存完整原始输出。
 
 ---
 
@@ -316,7 +318,10 @@ junction/fs/shaofs/                    ← 我们的项目代码
 | `junction/fs/mytest/benchmark/patch/toggle_filebench.sh` | 应用/撤销 Filebench 适配补丁并重新 configure/make |
 | `junction/fs/mytest/benchmark/patch/example.f` | Filebench whole-file read 示例 workload |
 | `junction/fs/mytest/benchmark/filebench_wml/shaofs_randomread*.f` | 从 Filebench `workloads/randomread.f` 派生的 ShaOFS randomread workload；当前这些文件在工作区中是 untracked |
+| `junction/fs/mytest/benchmark/filebench_wml/fileserver.f` | 当前用于 ShaOFS 的 Filebench fileserver smoke workload：`FSHAO:`、40 files、1 thread、2s runtime；已在 Junction/ShaOFS 上跑通 |
+| `junction/fs/mytest/benchmark/filebench_wml/webserver.f` | 当前用于 ShaOFS 的 Filebench webserver workload：`FSHAO:`、1000 files、100 threads、60s runtime；已在 Junction/ShaOFS 上跑通 |
 | `/home/syh/fs_test/scripts/run_ext4_filebench_randomread_cgroup.sh` | repo 外部 ext4 对比脚本；会 reset ext4、设置 cgroup v2 CPU/内存限制并运行 Filebench randomread |
+| `/home/syh/fs_test/scripts/run_ext4_filebench_fileserver_cgroup.sh` | repo 外部 ext4 `fileserver.f` 对比脚本；会 reset ext4、生成只替换 `$dir` 的临时 WML、设置 cgroup v2 CPU/内存限制并运行 Filebench |
 | `/home/syh/fs_test/results/` | repo 外部 ext4 benchmark 输出目录 |
 | `junction/fs/shaofs/OPTIMIZATION_REPORT.md` | 当前工作区中的 ShaOFS 优化报告，未跟踪 |
 | `junction/fs/shaofs/IOPS_BENCHMARK_REPORT.md` | 当前工作区中的历史 4KB IOPS 报告，未跟踪；其中数字需按正式实验重新验证 |
@@ -492,6 +497,27 @@ inode_bmap_locked(inode_ptr, inum, logical_blk, allocate, is_new):
        写回 direct + indirect 区域
        返回 new_phys
 ```
+
+**2026-05-13 append 预分配现状**：
+
+当前 `extent.cc` 已不再对普通文件 EOF append 一律单块分配。`inode_bmap_locked()` 在 `allocate=true` 且未命中现有 extent 时，会先判断是否满足：
+
+```cpp
+inode->type == REGULAR &&
+inode->file_size >= BLOCK_SIZE &&
+logical_blk == ceil(file_size / BLOCK_SIZE)
+```
+
+若满足，则进入 `bmap_prealloc_append()`：
+
+1. 根据当前文件大小选择预分配块数：小于 64KB 时 16 blocks，小于 1MB 时 64 blocks，更大时 128 blocks。
+2. 调用 `alloc_blocks(blocks, want)` 批量获取物理块。
+3. 将返回的物理块按物理连续性切分成一个或多个 `iExtent` run。
+4. 对所有新物理块调用 `get_block_cache().getHandle(block, false)`，写入全 0、标记 dirty，并设置 cache entry valid。
+5. 调用 `bmap_insert_compact_extents()` 把这些 run 与已有 extent 一起排序、合并、写回 direct/indirect extent 元数据。
+6. 如果插入失败，调用 `bc_invalidate_block()` 丢弃刚清零的 cache entry，并用 `free_extent()` 释放已分配物理块。
+
+这个改动的目标是解决 Filebench `fileserver.f` 中 `appendfilerand` 长时间运行时单块分配导致 inode extent 数超过 `6 + 170` 上限的问题。预分配块提前清零是为了保证未来对预分配但尚未写满的块执行部分写或读时，不会暴露旧盘数据。当前实现只对普通文件 EOF append 生效，目录、稀疏远距离写和非 append 场景仍走原有单块分配 fallback。
 
 ### 5.3 file_write 锁范围优化
 
@@ -1117,7 +1143,7 @@ printf 'syh2syh\n' | sudo -S timeout 60s ./junction_run caladan_test.config -- \
 printf 'syh2syh\n' | sudo -S pkill -9 iokerneld
 ```
 
-### 6.8 在 Junction 中运行 Filebench（2026-05-10 当前流程）
+### 6.8 在 Junction 中运行 Filebench（2026-05-13 当前流程）
 
 Filebench 源码位于 `junction/fs/mytest/benchmark/filebench`。当前策略是只修改 Filebench 内部并用 patch 管理，不修改 Junction 源码。
 
@@ -1129,6 +1155,8 @@ Filebench 源码位于 `junction/fs/mytest/benchmark/filebench`。当前策略�
 | `junction/fs/mytest/benchmark/patch/filebench_changes.patch` | Junction 适配补丁，覆盖 `aslr.c`、`fb_cvar.c`、`fb_localfs.c`、`fileset.c`、`flag.h`、`flowop_library.c`、`ipc.c`、`misc.c`、`procflow.c` |
 | `junction/fs/mytest/benchmark/patch/toggle_filebench.sh` | 补丁 apply/revert + 自动 `configure`/`make` 的管理脚本 |
 | `junction/fs/mytest/benchmark/patch/example.f` | 当前 Filebench 示例 workload：10000 个 16KB 文件，2 个 process instances，每个 3 个 reader threads，`readwholefile` 跑 60s |
+| `junction/fs/mytest/benchmark/filebench_wml/fileserver.f` | 当前 ShaOFS fileserver smoke workload：40 files、1 thread、4KB file/io、2s runtime |
+| `junction/fs/mytest/benchmark/filebench_wml/webserver.f` | 当前 ShaOFS webserver workload：1000 files、100 reader threads、10 次 readwholefile + appendlog、60s runtime |
 
 将 Filebench 切换并构建为 Junction 适配版：
 
@@ -1161,7 +1189,7 @@ junction/fs/mytest/benchmark/patch/toggle_filebench.sh revert
 2. `ipc.c`：在 configure 禁用 `ftok/semget/semop/semtimedop` 后，Filebench 不再创建 SysV semaphore；`shm_semkey` 置 0。Filebench 仍使用自己的共享内存结构，但在 Junction 内主要以单进程多线程模型运行。
 3. `procflow.c` / `procflow.h`：不再 `fork()` / `exec()` / `waitpid()` worker procflow；每个 procflow monitor 改为 `pthread_create()` 在当前进程内运行，然后由它创建配置中的 Filebench worker threads。用户曾提示 Junction 可能支持 `vfork()`，但当前实际补丁选择 pthread 降级，避免引入 exec/shm 地址传递和 wait 语义问题。
 4. `fb_localfs.c`：`fb_lfs_recur_rm()` 遇到 `FSHAO:/` 或 `FSHAO/` 路径直接返回，避免通过 `system("rm -rf ...")` 清理 ShaOFS 路径。
-5. `fb_cvar.c`：cvar 目录不可用时降级为 verbose log，不让 benchmark 因缺少 cvar 插件目录失败。
+5. `fb_cvar.c`：cvar 目录不可用时降级为 verbose log；如果默认目录没有加载到 cvar 插件，会再根据 Filebench 可执行文件路径尝试 `cvars/.libs` build 目录，保证 `webserver.f` 中的 `cvar-gamma` 可用。
 6. `fileset.c` / `ipc.c`：修复若干 `strncpy` 未保证 NUL 结尾的问题，避免 Junction/Filebench 长路径下字符串截断或未终止。
 7. `fileset.c`：`fileset_mkdir()` 的 `dirs[65536]` 栈数组改为动态数组，避免 Junction uthread 512KB 栈被大栈对象压垮。
 8. `misc.c`：`filebench_log()` 的 128KB 栈上缓冲改为全局缓冲并加 pthread mutex，避免日志路径消耗过大 uthread 栈；同时改用 `vsnprintf()`。
@@ -1191,6 +1219,44 @@ printf 'syh2syh\n' | sudo -S pkill -9 iokerneld
 ```
 
 当前 `example.f` 使用 `path="FSHAO:"`。ShaOFS 的 `SHAOFS_REALPATH()` 同时支持 `FSHAO:`、`FSHAO:/...` 和 `FSHAO/...`；但其他工具如 FIO 对冒号有特殊解析，Filebench 是否会在所有 workload 语法中同样安全使用冒号仍建议按 workload 实测确认。
+
+运行当前 `fileserver.f` smoke workload：
+
+```bash
+cd /home/syh/MyProj1/junction
+printf 'syh2syh\n' | sudo -S pkill -9 iokerneld 2>/dev/null || true
+cd /home/syh/mkfs && printf 'syh2syh\n' | sudo -S bash ./mkfs.sh
+
+cd /home/syh/MyProj1/junction
+printf 'syh2syh\n' | sudo -S lib/caladan/iokerneld ias
+
+cd /home/syh/MyProj1/junction/build/junction
+printf 'syh2syh\n' | sudo -S timeout 20s ./junction_run caladan_test.config -- \
+  /home/syh/MyProj1/junction/junction/fs/mytest/benchmark/filebench/filebench \
+  -f /home/syh/MyProj1/junction/junction/fs/mytest/benchmark/filebench_wml/fileserver.f
+
+printf 'syh2syh\n' | sudo -S pkill -9 iokerneld
+```
+
+运行当前 `webserver.f` workload：
+
+```bash
+cd /home/syh/MyProj1/junction
+printf 'syh2syh\n' | sudo -S pkill -9 iokerneld 2>/dev/null || true
+cd /home/syh/mkfs && printf 'syh2syh\n' | sudo -S bash ./mkfs.sh
+
+cd /home/syh/MyProj1/junction
+printf 'syh2syh\n' | sudo -S lib/caladan/iokerneld ias
+
+cd /home/syh/MyProj1/junction/build/junction
+printf 'syh2syh\n' | sudo -S timeout 90s ./junction_run caladan_test.config -- \
+  /home/syh/MyProj1/junction/junction/fs/mytest/benchmark/filebench/filebench \
+  -f /home/syh/MyProj1/junction/junction/fs/mytest/benchmark/filebench_wml/webserver.f
+
+printf 'syh2syh\n' | sudo -S pkill -9 iokerneld
+```
+
+注意：`webserver.f` 原始 upstream workload 默认 `set $dir=/tmp`，那会绕过 ShaOFS。当前工作区版本已改为 `set $dir=FSHAO:`。`webserver.f` 内部写的是 `run 60`，所以用 `timeout 20s` 运行会得到退出码 124，这只是 timeout 太短，不表示 workload 或 ShaOFS 失败；完整验证建议 timeout 至少 90s。
 
 ### 6.9 Filebench randomread workload 与 ext4 对比脚本（2026-05-12）
 
@@ -1264,6 +1330,44 @@ printf 'syh2syh\n' | sudo -S \
 
 注意：本次交接整理没有重新运行 ShaOFS/ext4 randomread benchmark。正式对比时必须保存完整 Filebench stdout/stderr、退出码、WML 文件、构建开关、Junction `caladan_test.config` CPU 配置和 cgroup 参数。
 
+### 6.10 ext4 fileserver.f cgroup 对比脚本（2026-05-13）
+
+repo 外部新增了 ext4 `fileserver.f` 对比脚本：
+
+```bash
+/home/syh/fs_test/scripts/run_ext4_filebench_fileserver_cgroup.sh
+```
+
+脚本当前行为：
+
+- 使用 `/home/syh/mkfs/reset_ext4.sh` 将测试盘重置为 ext4。
+- 默认挂载点为 `/mnt/nvme/ext4_bench`。
+- 使用 cgroup v2 限制 Filebench 进程资源，默认 `CPU_LIMIT=2`、`NUMA_NODE=0`、`MEM_LIMIT_MB=300`、`TIMEOUT_SEC=30`。
+- 默认读取 ShaOFS 当前 `fileserver.f`：`/home/syh/MyProj1/junction/junction/fs/mytest/benchmark/filebench_wml/fileserver.f`。
+- 在 `/home/syh/fs_test/results/` 生成临时 WML，只替换 `set $dir=` 为 ext4 挂载点，其他 workload 参数保持一致。
+- 运行结束后保存 log 和 CSV，并输出 cgroup `cpu.stat` / `memory.events` / `memory.peak` 摘要。
+
+运行示例：
+
+```bash
+printf 'syh2syh\n' | sudo -S /home/syh/fs_test/scripts/run_ext4_filebench_fileserver_cgroup.sh
+```
+
+本轮实际观察到的 ext4 smoke 结果为：
+
+```text
+IO Summary: 1254505 ops 627211.104 ops/s 20907/439050 rd/wr 367.4mb/s 0.001ms/op
+Cgroup: cpu_usage_usec_delta=1953362 mem_peak_bytes=314572800 mem.high_delta=0 mem.max_delta=694 mem.oom_delta=0
+```
+
+同一轮 ShaOFS `fileserver.f` smoke 结果为：
+
+```text
+IO Summary: 1979495 ops 989422.475 ops/s 32981/692595 rd/wr 579.4mb/s 0.001ms/op
+```
+
+这个对比对应当前缩小版 `fileserver.f`（40 files、1 thread、2s runtime），ShaOFS 约为 ext4 的 `1.58x` IOPS/throughput。注意该结果只是 smoke 对比，ext4 运行中 `memory.peak` 达到 `memory.max=300MB` 且 `memory.events max` 增加，虽然没有 OOM，但正式实验应明确记录这个资源限制状态。
+
 ---
 
 ## 第七章：踩坑记录与高危警告（最重要）
@@ -1304,11 +1408,11 @@ printf 'syh2syh\n' | sudo -S \
 
 ### 7.5 GOTCHA 5：Extent 数组溢出
 
-**触发条件**：文件 > ~700KB 且块分配碎片化（非连续）时，extent 数超过 176 上限。
+**触发条件**：单个文件的物理块分配高度碎片化时，extent 数超过 `DIRECT_EXTENT_NUM + EXTENTS_PER_BLOCK = 176` 上限。历史上 Filebench `fileserver.f` 的 append-heavy 模式曾触发该问题。
 
-**规避**：控制文件大小或确保顺序分配产生连续 extent。
+**当前状态**：2026-05-13 已在普通文件 EOF append 路径加入批量预分配，使用 `alloc_blocks()` 一次获取 16/64/128 个块并合并成 extent，已经能跑通当前 `fileserver.f` smoke workload。
 
-**根治**：实现批量块分配 `alloc_blocks(N)`。
+**仍需注意**：这不是全局根治。目录、稀疏远距离写、随机非 append 写、或极端碎片化情况下仍可能达到 176 extent 上限。后续如果看到 `[extent] Extent array overflow for inode ...`，应先确认 workload 是否走 EOF append 预分配路径，再考虑扩大 extent 存储结构、加入更强的连续块分配策略或为随机写 workload 做专门设计。
 
 ### 7.6 GOTCHA 6：IOKernel 必须在 mkfs 前 kill
 
@@ -1488,6 +1592,7 @@ Filebench `directio=1` 不一定天然满足 ShaOFS 当前 2MB user-buffer 合�
 - **fsync**：per-file 精确刷写（遍历 extent → `bc_flush_block` + `ic_flush_inode`）
 - **stat/fstat**：完整填充 `struct stat`（含 indirect extent 块数统计）
 - **Extent hint**：顺序访问 O(1) 块映射
+- **EOF append 预分配**：普通文件 append 到 EOF 时按文件大小批量预分配 16/64/128 blocks，减少 Filebench append-heavy 场景中的 extent 数和分配开销
 - **Per-core group affinity**：减少块分配锁竞争
 - **目录读写锁**：`dir_lookup` 并发读，`dir_add/delete` 排他写
 - **I/O completion driven preemption**：`IO_PREEMPT` 开启时，IOKernel 检查 SPDK completion 并触发目标 Runtime core yield；Runtime 优先运行 storage softirq 和完成 I/O 的 uthread
@@ -1555,13 +1660,16 @@ lat_us p50=9 p90=9 p99=13 max=102
 - 当前已构建的 FIO 二进制可执行，`fio --version` 输出 `fio-3.42-22-g7215-dirty`。
 - 本次会话中曾验证过一个接近目标参数的 FIO 命令可在 Junction 中跑完并输出报告。历史性能数字不写入本文档；后续正式 benchmark 必须重新运行并保存原始输出。
 
-### 8.6 2026-05-12 当前 Filebench 状态
+### 8.6 2026-05-13 当前 Filebench 状态
 
 - `junction/fs/mytest/benchmark/filebench` 是 Filebench 源码目录；当前通过 `junction/fs/mytest/benchmark/patch/filebench_changes.patch` 管理 Junction 适配修改。
 - `toggle_filebench.sh apply` 会应用补丁，并用 `ac_cv_func_ftok=no ac_cv_func_semget=no ac_cv_func_semop=no ac_cv_func_semtimedop=no ./configure` 重新配置，然后执行 `make -j $(nproc)`。
 - 当前补丁覆盖 9 个 Filebench 源文件：`aslr.c`、`fb_cvar.c`、`fb_localfs.c`、`fileset.c`、`flag.h`、`flowop_library.c`、`ipc.c`、`misc.c`、`procflow.c`。
-- 适配后的 Filebench 不再依赖 `personality()` 关闭 ASLR，不再创建 SysV semaphore，不再 fork/exec worker process，也避免了 Filebench 日志和 mkdir 路径中的大栈对象。
+- 适配后的 Filebench 不再依赖 `personality()` 关闭 ASLR，不再创建 SysV semaphore，不再 fork/exec worker process，也避免了 Filebench 日志和 mkdir 路径中的大栈对象；`fb_cvar.c` 还会从可执行文件所在 build tree 的 `cvars/.libs` 查找 cvar 插件，使 `webserver.f` 的 `cvar-gamma` 能在 Junction 内加载。
 - 本轮会话中曾使用 `example.f` 在 Junction 上跑通 60s Filebench 读 whole-file workload：10000 个 16KB 文件，2 个 process instances，每个 3 个 reader threads。记录到的输出约为 `79454650 ops`、`1324058 ops/s`、`6.9GB/s`、`0.0ms/op`、`0.660ms` latency；这些是本轮调试验证数字，不是正式论文 benchmark，后续必须重新运行并保存完整 stdout/stderr、退出码和构建开关状态。
+- 当前 `fileserver.f` 已缩小为 ShaOFS smoke workload：`set $dir=FSHAO:`、40 files、1 thread、4KB file/io、`run 2`。2026-05-13 在 Junction/ShaOFS 上完整跑通，输出约 `1979495 ops`、`989422.475 ops/s`、`579.4mb/s`。
+- repo 外部脚本 `/home/syh/fs_test/scripts/run_ext4_filebench_fileserver_cgroup.sh` 使用同一 `fileserver.f` 参数对 ext4 做 cgroup v2 限制下的 smoke 对比，当前观察到 ext4 约 `1254505 ops`、`627211.104 ops/s`、`367.4mb/s`。该脚本会把 `$dir` 改成 ext4 挂载点，其他参数保持一致。
+- 当前 `webserver.f` 已改为 `set $dir=FSHAO:`、1000 files、100 threads、`run 60`。用 `timeout 20s` 运行会因为 workload runtime 太长而得到退出码 124；用 `timeout 90s` 已在 Junction/ShaOFS 上完整跑通，输出约 `40842810 ops`、`680679.092 ops/s`、`3412.3mb/s`。
 - 之后又派生了 Filebench `randomread.f` workload 到 `junction/fs/mytest/benchmark/filebench_wml/`，并编写了 repo 外部 ext4 cgroup 对比脚本 `/home/syh/fs_test/scripts/run_ext4_filebench_randomread_cgroup.sh`。本次交接整理未重新运行这些 randomread benchmark，无法从当前上下文确认最新 ShaOFS/ext4 对比数字。
 - 当前 Filebench 结果是在 `DIRECTPATH DISABLED` 环境下得到的，不能直接解释为最终 NVMe 极限带宽。
 
@@ -1615,7 +1723,7 @@ bench_seq_rw 32: Write 0.4978s, 64.29 MB/s, 16457 IOPS; Read 0.0034s, 9467.46 MB
 ### 9.1 已知缺陷
 
 1. **并发文件创建未充分测试**：多线程同时 `open(O_CREAT)` 在同一目录下创建不同文件的正确性未验证
-2. **Extent 数组溢出**：文件 > ~700KB 且分配碎片化时可能溢出 176 extent 上限
+2. **Extent 数组溢出未全局消除**：普通文件 EOF append 已加入 16/64/128 blocks 批量预分配并跑通当前 `fileserver.f` smoke workload，但随机非 append、稀疏写和极端碎片化场景仍可能超过 176 extent 上限
 3. **高线程混合负载表现需要重新确认**：历史上曾关注 cache shard 竞争，但具体性能结论不再写入本文档，后续应重新 benchmark
 4. **无 `unlink` / `rmdir`**：`dir_delete_entry` 存在但未接入 VFS dispatch
 5. **无 `getdents64`**：目录列表需要直接读取 Dirent 结构
@@ -1634,9 +1742,10 @@ bench_seq_rw 32: Write 0.4978s, 64.29 MB/s, 16457 IOPS; Read 0.0034s, 9467.46 MB
 
 ### 9.2 优先待办任务
 
-**Task 1: 批量块分配 `alloc_blocks(N)`**
-- 消除 extent 溢出，并减少顺序写时的分配和 extent 管理开销
-- 在 bitmap 中搜索连续 N 个空闲 bit，一次锁内全部分配
+**Task 1: 完善 append 预分配与 extent 压力测试**
+- 当前 `alloc_blocks()` 已用于普通文件 EOF append 预分配，但只覆盖 append 到 EOF 的常见路径。
+- 补充针对随机写、稀疏写、append 预分配跨 direct/indirect 边界、预分配失败回滚和崩溃恢复后的 extent 校验测试。
+- 根据正式 Filebench/fileserver 结果调优 16/64/128 blocks 阈值，确认预清零和额外 dirty cache 不会在目标负载下引入明显 CPU/写放大。
 
 **Task 2: 接入 `unlink` / `rmdir`**
 - `my_unlink(path)`: nameiparent → dir_delete_entry → ic_free_inode
@@ -1686,9 +1795,11 @@ bench_seq_rw 32: Write 0.4978s, 64.29 MB/s, 16457 IOPS; Read 0.0034s, 9467.46 MB
 - 基于 `toggle_filebench.sh apply`、重新 mkfs、启动 IOKernel、`timeout` 运行 Filebench、清理 IOKernel 的流程写自动化脚本。
 - 每次记录 Filebench stdout/stderr、退出码、Junction `DIRECTPATH` 状态、`SHAOFS_IO_PREEMPT` / `SHAOFS_CRASH_CONSISTENCY` 构建开关和 Filebench patch 状态。
 - 明确论文中如何解释 Filebench `process` 被降级为 pthread 的限制。
+- 将 `fileserver.f`、`webserver.f` 和 randomread 的 WML、timeout、runtime、线程数、文件数固定到脚本和结果目录中，避免手工改 WML 后无法复现实验。
 
 **Task 13: 固化 ext4 对比脚本与参数**
 - `/home/syh/fs_test/scripts/run_ext4_filebench_randomread_cgroup.sh` 当前默认 `CPU_LIMIT=1`、`MEM_LIMIT_MB=300`，用于单核/300MB 内存限制的 ext4 randomread 对比。
+- `/home/syh/fs_test/scripts/run_ext4_filebench_fileserver_cgroup.sh` 当前默认 `CPU_LIMIT=2`、`MEM_LIMIT_MB=300`、`TIMEOUT_SEC=30`，用于当前缩小版 `fileserver.f` 的 ext4 smoke 对比。
 - 需要把 ShaOFS WML 参数、ext4 WML 参数、cgroup CPU/memory、Junction config 的 core 数固定到同一实验记录中。
 - 每次 ext4 测试前确认 `/home/syh/mkfs/reset_ext4.sh` 成功格式化并挂载目标盘，避免拿旧数据或 page cache 结果做对比。
 
@@ -1716,7 +1827,7 @@ bench_seq_rw 32: Write 0.4978s, 64.29 MB/s, 16457 IOPS; Read 0.0034s, 9467.46 MB
 | `shaofs/file.h` | Feature | 新增 file_read/write_direct, truncate_inode 声明 |
 | `shaofs/inode.h` | Perf + refactor | MInode 新增 extent_hint、hint_lock 和 has_dirty_data_cache；dir_mtx 从 mutex_t 升级为 rwmutex_t |
 | `shaofs/inode.cc` | Bug fix | `alloc_inum()` 按 `INODENUM=32768` 全范围环形扫描 inode bitmap，避免把 inode cache 容量 8192 误当作 inode 上限 |
-| `shaofs/extent.cc` | Perf | inode_bmap_locked 增加 hint fast path + hint 更新 |
+| `shaofs/extent.cc` | Perf + bug fix | inode_bmap_locked 增加 hint fast path；普通文件 EOF append 路径加入 16/64/128 blocks 批量预分配、预清零和失败回滚，缓解 Filebench append-heavy extent 溢出 |
 | `shaofs/inodeCache.cc` | Bug fix + feature | ic_free_inode 实现完整块释放；新增 ic_flush_inode |
 | `shaofs/inodeCache.h` | Feature | 新增 ic_flush_inode 声明 |
 | `shaofs/dir.h` | Refactor | 新增 dirent_is_empty()；移除未实现的 _locked 声明 |
@@ -1758,13 +1869,16 @@ bench_seq_rw 32: Write 0.4978s, 64.29 MB/s, 16457 IOPS; Read 0.0034s, 9467.46 MB
 | `junction/fs/mytest/benchmark/filebench/misc.c` | Filebench adapter | `filebench_log()` 大栈缓冲改为全局互斥缓冲并使用 `vsnprintf()` |
 | `junction/fs/mytest/benchmark/filebench/fileset.c` | Filebench adapter | 动态分配 mkdir 路径栈，避免 512KB uthread 栈被大数组压垮 |
 | `junction/fs/mytest/benchmark/filebench/fb_localfs.c` | Filebench adapter | 跳过对 `FSHAO:/` / `FSHAO/` 的 `system("rm -rf ...")` 清理 |
-| `junction/fs/mytest/benchmark/filebench/fb_cvar.c` | Filebench adapter | cvar 目录不可用时降级为 verbose log |
+| `junction/fs/mytest/benchmark/filebench/fb_cvar.c` | Filebench adapter | cvar 目录不可用时降级为 verbose log，并从可执行文件 build tree 的 `cvars/.libs` fallback 加载 cvar 插件 |
 | `junction/fs/mytest/benchmark/filebench/flag.h` | Filebench adapter | `wait_flag()` busy-wait 中调用 `sched_yield()`，降低进程内 pthread 模型下的空转 |
 | `junction/fs/mytest/benchmark/patch/filebench_changes.patch` | Handover artifact | 保存 Filebench 适配源码补丁 |
 | `junction/fs/mytest/benchmark/patch/toggle_filebench.sh` | Tooling | 一键 apply/revert Filebench 补丁，并自动重新 configure/make |
 | `junction/fs/mytest/benchmark/patch/example.f` | Benchmark config | 当前用于 Junction/ShaOFS 的 Filebench 示例 workload |
 | `junction/fs/mytest/benchmark/filebench_wml/shaofs_randomread*.f` | Benchmark config | 从 Filebench `workloads/randomread.f` 派生的 ShaOFS randomread workload，当前为 untracked 工作区文件 |
+| `junction/fs/mytest/benchmark/filebench_wml/fileserver.f` | Benchmark config | 当前 ShaOFS fileserver smoke workload：`FSHAO:`、40 files、1 thread、2s runtime；2026-05-13 已在 ShaOFS/ext4 上跑通 smoke 对比 |
+| `junction/fs/mytest/benchmark/filebench_wml/webserver.f` | Benchmark config | 当前 ShaOFS webserver workload：`FSHAO:`、1000 files、100 threads、60s runtime；2026-05-13 已在 Junction/ShaOFS 上跑通 |
 | `/home/syh/fs_test/scripts/run_ext4_filebench_randomread_cgroup.sh` | Benchmark tooling | repo 外部 ext4 randomread 对比脚本，包含 ext4 reset、cgroup v2 CPU/memory 限制和 Filebench 运行 |
+| `/home/syh/fs_test/scripts/run_ext4_filebench_fileserver_cgroup.sh` | Benchmark tooling | repo 外部 ext4 fileserver 对比脚本，包含 ext4 reset、临时 WML `$dir` 替换、cgroup v2 CPU/memory 限制、log/CSV 输出 |
 | `lib/caladan/inc/base/syscall.h` / `lib/caladan/base/syscall.S` | User DMA support | Caladan wrapper 当前包含 `syscall_mlock()`，供 `storage_prepare_user_dma()` pin 用户页 |
 | `junction/syscall/seccomp.cc` | User DMA support | seccomp allowlist 当前包含 Caladan `mlock`，并按 request 放行 VFIO DMA map/unmap ioctl |
 | `lib/caladan/runtime/storage.c` | User DMA support | 新增 user DMA registration cache、`storage_prepare_user_dma()`、`storage_read_aligned()`、`storage_write_user_dma()` |
@@ -2108,3 +2222,77 @@ sed -n '/SHAOFS_IO_PREEMPT/p;/SHAOFS_CRASH_CONSISTENCY/p' build/CMakeCache.txt
 - 未运行最小 user-buffer DMA 正确性测试；因此本次只确认代码路径存在，未确认当前机器运行时一定成功打印 `storage: enabled direct DMA into user buffers`。
 - 虽然已确认当前 build cache 两个 ShaOFS 开关都是 ON，接手者做正式实验前仍应重新 `cmake -S . -B build ...` 固化开关，避免继承旧 cache 状态。
 - 未确认 Filebench `directio=1` 是否满足 ShaOFS 当前 2MB user-buffer DMA 合约；正式 randomread 测试前应单独验证。
+
+---
+
+## 第十六章：2026-05-13 Filebench fileserver/webserver 与 ext4 对比交接整理验证记录
+
+### 16.1 本次实际检查过的内容
+
+```bash
+sed -n '1,140p' HANDOVER.md
+rg -n 'Extent 数组|Filebench|alloc_blocks|webserver|fileserver|TODO|验证' HANDOVER.md
+git -C /home/syh/MyProj1/junction status --short
+git -C junction/fs/mytest/benchmark/filebench diff --stat
+git -C junction/fs/mytest/benchmark/filebench status --short
+sed -n '1,220p' junction/fs/shaofs/extent.cc
+sed -n '220,390p' junction/fs/shaofs/extent.cc
+sed -n '1,140p' junction/fs/mytest/benchmark/filebench_wml/fileserver.f
+sed -n '1,160p' junction/fs/mytest/benchmark/filebench_wml/webserver.f
+sed -n '1,220p' junction/fs/mytest/benchmark/filebench/fb_cvar.c
+sed -n '1,220p' /home/syh/fs_test/scripts/run_ext4_filebench_fileserver_cgroup.sh
+bash -n /home/syh/fs_test/scripts/run_ext4_filebench_fileserver_cgroup.sh
+git -C /home/syh/MyProj1/junction diff --check -- HANDOVER.md
+git -C /home/syh/MyProj1/junction diff --stat -- HANDOVER.md
+```
+
+本次文档整理过程中，部分普通只读命令仍可能被 sandbox 的 `bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted` 拦截；必要时已改用已批准的只读命令或提权只读检索完成核对。
+
+### 16.2 本轮会话中已运行过的关键构建和测试
+
+以下是 2026-05-13 本轮 Filebench 调试/验证阶段实际运行过并记录到的关键结果；不是本次最后文档编辑阶段重新跑出的长测试。
+
+已运行并确认过的关键项：
+
+- 修改 `junction/fs/shaofs/extent.cc` 后执行过 `cmake --build build --target junction_run -- -j$(nproc)`，构建成功；仍只有既有 objpool 相关 warning。
+- 执行过 `/home/syh/mkfs/mkfs.sh` 重新格式化 ShaOFS 测试盘。
+- 启动过 `sudo lib/caladan/iokerneld ias`，并在测试结束后用 `pkill -9 iokerneld` 清理。
+- ShaOFS `fileserver.f` 使用 `timeout 20s ./junction_run ... filebench -f .../fileserver.f` 跑通，结果：
+
+```text
+IO Summary: 1979495 ops 989422.475 ops/s 32981/692595 rd/wr 579.4mb/s 0.001ms/op
+```
+
+- ext4 `fileserver.f` 使用 `/home/syh/fs_test/scripts/run_ext4_filebench_fileserver_cgroup.sh` 跑通，结果：
+
+```text
+IO Summary: 1254505 ops 627211.104 ops/s 20907/439050 rd/wr 367.4mb/s 0.001ms/op
+Cgroup: cpu_usage_usec_delta=1953362 mem_peak_bytes=314572800 mem.high_delta=0 mem.max_delta=694 mem.oom_delta=0
+```
+
+- ShaOFS `webserver.f` 首次用 `timeout 20s` 运行时退出码为 124；结合 WML 中 `run 60` 判断为 timeout 太短。
+- ShaOFS `webserver.f` 使用 `timeout 90s ./junction_run ... filebench -f .../webserver.f` 完整跑通，结果：
+
+```text
+IO Summary: 40842810 ops 680679.092 ops/s 219574/21957 rd/wr 3412.3mb/s 0.145ms/op
+```
+
+测试结束后已清理 IOKernel；本轮最后一次 ShaOFS Filebench 运行后，测试盘最后状态可视为 ShaOFS/SPDK 场景。若接下来要跑 ext4，应先执行 `/home/syh/mkfs/reset_ext4.sh`。
+
+### 16.3 本次确认的客观状态
+
+- `junction/fs/shaofs/extent.cc` 当前包含 EOF append 预分配逻辑：`should_prealloc_append()`、`append_prealloc_blocks()`、`bmap_prealloc_append()`、`zero_fresh_blocks()`、`discard_preallocated_blocks()` 等。
+- 预分配只在普通文件 append 到当前 EOF 后第一个 logical block 时触发；目录、稀疏远距离写和非 append 场景仍使用原单块分配 fallback。
+- `fileserver.f` 当前是缩小版 ShaOFS smoke workload：`FSHAO:`、40 files、1 thread、4KB file/io、`run 2`、`appendfilerand iters=20`。
+- `webserver.f` 当前使用 `set $dir=FSHAO:`，不是 upstream 默认 `/tmp`；参数为 1000 files、100 threads、`iosize=1m`、`meanappendsize=16k`、`run 60`。
+- Filebench patch 当前覆盖 9 个源文件；`fb_cvar.c` 包含 build-directory fallback，可从可执行文件所在目录的 `cvars/.libs` 加载 cvar 插件。
+- Filebench 子仓库当前处于 patch-applied dirty 状态，`git diff --stat` 显示 9 个源码文件修改，同时存在 autotools/configure/build 生成文件。这个状态是 `toggle_filebench.sh apply` 后的预期结果，但源码修改仍应通过 `filebench_changes.patch` 管理。
+- 顶层 Junction 工作区仍存在既有 modified/untracked 文件。本次交接整理前后都不应假设所有 dirty 文件来自当前 Agent；当前重点 dirty 文件包括 `HANDOVER.md`、`junction/fs/shaofs/extent.cc`，以及既有的 `junction/fs/mytest/iops.c`、`junction/fs/mytest/testwholepath.c` 和大量 untracked benchmark/test 文件。
+
+### 16.4 本次未重新验证的内容
+
+- 最后文档整理阶段没有重新运行 `scripts/build.sh`、CMake build、IOKernel 或长 benchmark；长测试结果来自本轮前面的实际调试运行。
+- 未运行 `webserver.f` 的 ext4 对比脚本，也未编写对应 ext4 webserver cgroup 脚本。
+- 未重新运行 Filebench randomread、FIO、ShaOFS 全量单元测试或完整 inode 耗尽测试。
+- 未做多轮重复实验、置信区间统计、CPU cycle/perf 采样、NVMe 设备端带宽计数或 `DIRECTPATH DISABLED` 根因确认。
+- 未确认当前 `fileserver.f` 缩小参数是否适合作为论文最终 workload；当前只适合作为跑通和 smoke 对比。
