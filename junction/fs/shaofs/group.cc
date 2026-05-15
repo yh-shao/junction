@@ -186,7 +186,7 @@ int alloc_blocks(BlockID* out, int count)
             kguard k;
             if (unlikely(k->curr_cpu != snapshot_coreid || core_to_group[k->curr_cpu] != snapshot_gid)) continue;
 
-            SpinGuard g(&gdesc->lock);
+            SpinGuardNP g(&gdesc->lock);
 
             if (unlikely(gdesc->free_blocks_count == 0)) continue;
 
@@ -258,7 +258,7 @@ void free_extent(const iExtent* ext)
         uint32_t actually_freed = 0;
 
         {
-            SpinGuard g(&gdesc->lock);
+            SpinGuardNP g(&gdesc->lock);
 
             // 批量清空 Bitmap
             for (uint32_t i = 0; i < blocks_to_free_this_round; i++) 
@@ -318,7 +318,7 @@ void sync_all_gdt()
 
     for (uint32_t i = 0; i < sb.group_num; ++i)   // 如果系统终止前已经停止了所有并发 alloc/free，这里其实不加锁也可以。
     {
-        SpinGuard g(&group_info[i].lock);
+        SpinGuardNP g(&group_info[i].lock);
         disk_gdt[i].free_blocks_count = group_info[i].free_blocks_count;
         disk_gdt[i].next_free_hint    = group_info[i].next_free_hint;
         disk_gdt[i].flags             = group_info[i].flags;

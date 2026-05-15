@@ -30,10 +30,10 @@ void free_inum(int inum);
 
 static inline void update_extent_hint(MInode* inode, const iExtent& ext) 
 {
-    if (spin_try_lock(&inode->hint_lock)) 
+    if (spin_try_lock_np(&inode->hint_lock))
     {
         inode->extent_hint = ext;
-        spin_unlock(&inode->hint_lock);
+        spin_unlock_np(&inode->hint_lock);
     }
 }
 

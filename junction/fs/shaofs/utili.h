@@ -38,6 +38,14 @@ struct SpinGuard
     SpinGuard(const SpinGuard&) = delete;
     SpinGuard& operator=(const SpinGuard&) = delete;
 };
+struct SpinGuardNP
+{
+    spinlock_t* m;
+    explicit SpinGuardNP(spinlock_t* mm) : m(mm) { spin_lock_np(m); }
+    ~SpinGuardNP() { spin_unlock_np(m); }
+    SpinGuardNP(const SpinGuardNP&) = delete;
+    SpinGuardNP& operator=(const SpinGuardNP&) = delete;
+};
 struct ReadGuard 
 {
     rwmutex_t* m;

@@ -14,10 +14,9 @@ extern "C" {
 #include "runtime/runtime.h"
 }
 
-static constexpr size_t USER_DMA_ALIGNMENT = 2 * 1024 * 1024;
-static inline bool user_dma_request_ok(const void* buf, off_t offset, size_t len)   // 只有满足该条件的 buffer 才能直接参与 O_DIRECT I/O 的用户 DMA；否则直接返回错误，不回退到 bounce buffer + memcpy 了
+static inline bool user_dma_request_ok(const void* buf, off_t offset, size_t len)
 {
-    return offset >= 0 && (static_cast<uint64_t>(offset) & (BLOCK_SIZE - 1)) == 0 && (reinterpret_cast<uintptr_t>(buf) & (USER_DMA_ALIGNMENT - 1)) == 0 && (len & (USER_DMA_ALIGNMENT - 1)) == 0;
+    return offset >= 0 && (static_cast<uint64_t>(offset) & (BLOCK_SIZE - 1)) == 0 && (reinterpret_cast<uintptr_t>(buf) & (BLOCK_SIZE - 1)) == 0 && (len & (BLOCK_SIZE - 1)) == 0;
 }
 
 static inline void mark_inode_data_cache_dirty(MInode* inode)

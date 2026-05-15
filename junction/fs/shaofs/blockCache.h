@@ -38,13 +38,13 @@ public:
 
     char* alloc() 
     {
-        SpinGuard g(&lock_);
+        SpinGuardNP g(&lock_);
         return (char*)pool_->alloc();
     }
     void free(char* b) 
     {
         if (!b) return;
-        SpinGuard g(&lock_);
+        SpinGuardNP g(&lock_);
         pool_->free((Block*)b);
     }
 };

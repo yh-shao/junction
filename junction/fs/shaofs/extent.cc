@@ -79,10 +79,10 @@ static BlockID bmap_lookup(MInode* inode, BlockID logical_blk)   // 在 inode �
     if (inode->valid_extent_count == 0) return INVALID_BLOCK_ID;
 
     // Fast Path: Hint 缓存
-    if (spin_try_lock(&inode->hint_lock)) 
+    if (spin_try_lock_np(&inode->hint_lock))
     {
         iExtent hint = inode->extent_hint;
-        spin_unlock(&inode->hint_lock);
+        spin_unlock_np(&inode->hint_lock);
         if (block_in_extent(logical_blk, hint)) return hint.physical_start + (logical_blk - hint.logical_start);
     }
 

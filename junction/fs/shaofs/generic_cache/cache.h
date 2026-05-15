@@ -49,14 +49,14 @@ private:
             atomic_inc(&victim->ref_count);       // Pin 住该 CacheEntry （当前正在访问该 CacheEntry） 将不会被再次选中 evict
 
             rwmutex_rdlock(&victim->rw_mtx);    // 拿”读”锁：阻止其它线程写入该 CacheEntry，但允许其它线程并发读取，提高并发性
-            spin_unlock(&shard_lock);           // 释放全局锁，允许其它线程访问 Hashmap，此时其它线程可能会访问到这个 victim cache entry
+            spin_unlock_np(&shard_lock);        // 释放全局锁，允许其它线程访问 Hashmap，此时其它线程可能会访问到这个 victim cache entry
 
             bool write_success = true;
             if (atomic_read(&victim->dirty) && atomic_read(&victim->valid)) write_success = backend->write(victim->key, victim->data);
             if (write_success) atomic_write(&victim->dirty, 0);   // 此时该 CacheEntry 中的数据已经与后端一致
             rwmutex_unlock(&victim->rw_mtx);
 
-            spin_lock(&shard_lock); // 重新获取全局大锁，保证没有新线程能从 hashmap 中查找到这个 cache entry
+            spin_lock_np(&shard_lock); // 重新获取全局大锁，保证没有新线程能从 hashmap 中查找到这个 cache entry
             if (write_success && atomic_read(&victim->ref_count) == 1 && atomic_read(&victim->dirty) == 0)  // 该 CacheEntry 此时没有被访问 且在释放全局锁期间没有被修改
             {
                 hashmap->remove(victim->key);
@@ -130,9 +130,9 @@ public:
     // 独占访问：返回 Handle，调用者可通过 read_access()/write_access() 持锁操作。失败返回 Handle(nullptr)，由调用者自行 fallback
     Handle getHandle(const Key& key, bool fetch_on_miss)   
     {
-        spin_lock(&shard_lock);
+        spin_lock_np(&shard_lock);
         Handle entryHandle = find_or_allocate_locked(key);
-        spin_unlock(&shard_lock);
+        spin_unlock_np(&shard_lock);
 
         if (!entryHandle) return Handle(nullptr); // 无法获取该 key 对应的 CacheEntry，触发调用方降级处理
 
@@ -186,9 +186,9 @@ public:
 
     bool flush_entry(const Key& key)   // 将指定 key 的 CacheEntry 刷写到后端（如果在缓存中且为脏）
     {
-        spin_lock(&shard_lock);
+        spin_lock_np(&shard_lock);
         Handle entryHandle(hashmap->find(key));  // Pin 住，防止被驱逐
-        spin_unlock(&shard_lock);
+        spin_unlock_np(&shard_lock);
 
         if (!entryHandle) return true;   // 不在缓存中，无需刷写
 
@@ -209,13 +209,13 @@ public:
         std::vector<Handle> entries;
         entries.reserve(capacity);
 
-        spin_lock(&shard_lock);
+        spin_lock_np(&shard_lock);
         for (size_t i = 0; i < hashmap->bucket_count(); i++)
         {
             for (EntryType* curr = hashmap->get_bucket_head(i); curr; curr = curr->hash_next) 
                 if (atomic_read(&curr->dirty) && atomic_read(&curr->valid)) entries.emplace_back(curr);
         }
-        spin_unlock(&shard_lock);
+        spin_unlock_np(&shard_lock);
 
         for (Handle& h : entries)
         {
@@ -233,9 +233,9 @@ public:
 
     void invalidate(const Key& key)   // 主动使指定 key 的 CachEntry 失效（不写回后端）
     {
-        spin_lock(&shard_lock);
+        spin_lock_np(&shard_lock);
         Handle entryHandle = Handle(hashmap->find(key));  // 使用 Handle 接管，内部会自动执行 atomic_inc(&ref_count)
-        spin_unlock(&shard_lock);
+        spin_unlock_np(&shard_lock);
 
         if (!entryHandle) return;  // Cache Miss: 本身就不在缓存中，直接返回
         EntryType* victim = entryHandle.get_entry();
@@ -247,7 +247,7 @@ public:
         }
 
         // 尝试将其从 Hashmap 和内存池中物理回收，以节省空间
-        spin_lock(&shard_lock);
+        spin_lock_np(&shard_lock);
         if (atomic_read(&victim->ref_count) == 1 && atomic_read(&victim->valid) == 0)  // 二次检查：确保当前没有其它线程在使用它，且在我们释放读写锁到重新获取全局锁的间隙，没有其他线程又去后端拉取了数据让它 valid
         {
             hashmap->remove(victim->key);
@@ -255,7 +255,7 @@ public:
             entryHandle = Handle();  // 析构掉之前的 entryHandle  （不能在 entryPool->free(victim) 之后再调用 atomic_dec(&ref_count)）
             entryPool->free(victim); // 直接释放回对象池，被 free 的对象无需再 dec ref_count
         } 
-        spin_unlock(&shard_lock);
+        spin_unlock_np(&shard_lock);
     }
 
     static size_t CacheEntry_footprint(size_t capacity) { return capacity * sizeof(EntryType); }

@@ -64,18 +64,18 @@ static int dsa_req_pool_init(size_t req_size)
     if (req_size < TCACHE_MIN_ITEM_SIZE) return -EINVAL;
     int ret;
 
-    spin_lock(&dsa_req_pool_lock);
+    spin_lock_np(&dsa_req_pool_lock);
     if (dsa_req_tcache)
     {
         ret = dsa_req_size == req_size ? 0 : -EINVAL;
-        spin_unlock(&dsa_req_pool_lock);
+        spin_unlock_np(&dsa_req_pool_lock);
         return ret;
     }
 
     ret = slab_create(&dsa_req_slab, "shaofs_dsa_req", req_size, 0);
     if (ret)
     {
-        spin_unlock(&dsa_req_pool_lock);
+        spin_unlock_np(&dsa_req_pool_lock);
         return ret;
     }
 
@@ -83,12 +83,12 @@ static int dsa_req_pool_init(size_t req_size)
     if (!dsa_req_tcache)
     {
         slab_destroy(&dsa_req_slab);
-        spin_unlock(&dsa_req_pool_lock);
+        spin_unlock_np(&dsa_req_pool_lock);
         return -ENOMEM;
     }
 
     dsa_req_size = req_size;
-    spin_unlock(&dsa_req_pool_lock);
+    spin_unlock_np(&dsa_req_pool_lock);
     return 0;
 }
 static struct tcache_perthread* shaofs_dsa_req_get_pt()
@@ -117,18 +117,18 @@ static int dsa_batch_req_pool_init(size_t req_size)
     if (req_size < TCACHE_MIN_ITEM_SIZE) return -EINVAL;
     int ret;
 
-    spin_lock(&dsa_batch_req_pool_lock);
+    spin_lock_np(&dsa_batch_req_pool_lock);
     if (dsa_batch_req_tcache)
     {
         ret = dsa_batch_req_size == req_size ? 0 : -EINVAL;
-        spin_unlock(&dsa_batch_req_pool_lock);
+        spin_unlock_np(&dsa_batch_req_pool_lock);
         return ret;
     }
 
     ret = slab_create(&dsa_batch_req_slab, "shaofs_dsa_batch_req", req_size, 0);
     if (ret)
     {
-        spin_unlock(&dsa_batch_req_pool_lock);
+        spin_unlock_np(&dsa_batch_req_pool_lock);
         return ret;
     }
 
@@ -136,12 +136,12 @@ static int dsa_batch_req_pool_init(size_t req_size)
     if (!dsa_batch_req_tcache)
     {
         slab_destroy(&dsa_batch_req_slab);
-        spin_unlock(&dsa_batch_req_pool_lock);
+        spin_unlock_np(&dsa_batch_req_pool_lock);
         return -ENOMEM;
     }
 
     dsa_batch_req_size = req_size;
-    spin_unlock(&dsa_batch_req_pool_lock);
+    spin_unlock_np(&dsa_batch_req_pool_lock);
     return 0;
 }
 static struct tcache_perthread* shaofs_dsa_batch_req_get_pt()
