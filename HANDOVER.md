@@ -1,6 +1,6 @@
 # Project Handover / ShaOFS 全局项目交接与 AI 上下文恢复文档
 
-> **文档版本**: v4.4 | **最后更新**: 2026-05-13
+> **文档版本**: v4.5 | **最后更新**: 2026-05-15
 > **目的**: 使任何 AI Code Agent 读取本文档后，能瞬间加载全部项目上下文，无缝继续开发。
 
 > **2026-05-06 补充说明**: 本文档保留了 2026-04-10 之前关于 ShaOFS 架构、测试和优化的历史沉淀。本次交接修正了与当前代码明显不一致的事实，并追加了 FIO-on-Junction 适配、补丁管理脚本和当前验证状态。历史性能测试结果可能不可靠，已从本文档移除；正式性能数据应以重新跑出的 benchmark 原始输出为准。
@@ -14,6 +14,8 @@
 > **2026-05-12 补充说明**: 本次交接修正了 O_DIRECT 路径的描述。当前 ShaOFS 已实现严格约束下的 user-buffer DMA：用户 buffer 必须 2MB 对齐、长度必须是 2MB 的倍数，文件 offset 必须 4KB 对齐；不满足时直接返回错误，不再回退到 bounce buffer。`storage_prepare_user_dma()` 会 `mlock()` 用户页、调用 `spdk_mem_register()` 并用 `spdk_vtophys()` 验证 IOVA，随后 `storage_read_aligned()` / `storage_write_user_dma()` 直接把用户 buffer 作为 SPDK NVMe payload。为支持这条路径，当前 seccomp 放行了 Caladan `mlock` wrapper 以及 VFIO DMA map/unmap ioctl request。另补充了 Filebench `randomread.f` 派生 workload、ext4 cgroup 对比脚本和 Caladan/Junction syscall 包装/拦截机制。
 
 > **2026-05-13 补充说明**: 本次交接追加了 Filebench `fileserver.f` / `webserver.f` 在 Junction/ShaOFS 上的当前验证状态、ext4 `fileserver.f` cgroup 对比脚本和最新 smoke 对比数据。为跑通 `fileserver.f` 的 append-heavy 模式，`junction/fs/shaofs/extent.cc` 已在普通文件 EOF append 路径加入批量预分配：按文件大小选择 16/64/128 blocks，通过 `alloc_blocks()` 获取物理块，合并成 extent 后一次写回 inode extent 元数据；预分配块会立即在 Block Cache 中清零并标脏，失败路径会 invalidate cache entry 并释放物理块。当前 `fileserver.f` 是一个缩小版 smoke workload（40 files、1 thread、2s runtime），ShaOFS 结果约 `989k ops/s`，ext4 同资源 cgroup 结果约 `627k ops/s`。`webserver.f` 已改为 `set $dir=FSHAO:` 并能完整跑完 60s，ShaOFS 结果约 `680k ops/s`、`3412.3MB/s`。这些是本轮功能验证/初步对比数据，不是最终论文 benchmark；正式实验仍需重新固定构建开关、WML、cgroup/Junction config 并保存完整原始输出。
+
+> **2026-05-15 补充说明**: 本次交接追加了 Junction `sync()` syscall 和 FxMark-on-Junction 适配状态。`sync()` 已加入 `usys.txt` / `usys.h` / `junction/fs/file.cc`，当前语义是调用 `shaofs_sync_all()` 刷写 ShaOFS 的 imap、GDT、inode cache 和 block cache；它不会像 `final_flush()` 那样清除 crash-consistency dirty marker，也不会 disable `IO_PREEMPT`。为避免运行时 `sync()` 与并发 cache 操作死锁，`generic_cache/cache.h::flush_all()` 当前先在 shard lock 下收集 dirty entry handle，再释放 shard lock 后逐个刷写。FxMark 源码位于 `junction/fs/mytest/benchmark/fxmark`，适配通过 `junction/fs/mytest/benchmark/patch/fxmark_changes.patch` 和 `toggle_fxmark.sh` 管理；当前 patch 把 FxMark worker 从 `fork()` 改为 `pthread_create()`，把启动/结束屏障的纯 busy-wait 改为 `sched_yield()`，把 `mkdir -p` 改为进程内递归 `mkdir()`，并让 DRBL worker 自己按 wall-clock 控制 duration。已验证 DRBL `--ncore 2/4/8` 能在 Junction/ShaOFS 上跑完，但当前 `build/junction/caladan_test.config` 仍是 `runtime_kthreads=1`、`runtime_spinning_kthreads=1`、`runtime_quantum_us=0`，这些结果只能说明多 worker 适配已跑通，不是多核扩展性结论。
 
 ---
 
@@ -314,8 +316,11 @@ junction/fs/shaofs/                    ← 我们的项目代码
 |------|---------|
 | `junction/fs/mytest/benchmark/fio` | FIO 源码子仓库；当前适配通过 `patch/fio_changes.patch` 管理 |
 | `junction/fs/mytest/benchmark/filebench` | Filebench 源码目录；当前适配通过 `patch/filebench_changes.patch` 管理 |
+| `junction/fs/mytest/benchmark/fxmark` | FxMark 源码目录；当前适配通过 `patch/fxmark_changes.patch` 管理 |
 | `junction/fs/mytest/benchmark/patch/toggle_fio.sh` | 应用/撤销 FIO 适配补丁并重新 configure/make |
 | `junction/fs/mytest/benchmark/patch/toggle_filebench.sh` | 应用/撤销 Filebench 适配补丁并重新 configure/make |
+| `junction/fs/mytest/benchmark/patch/toggle_fxmark.sh` | 应用/撤销 FxMark 适配补丁并重新 `make -j $(nproc)` |
+| `junction/fs/mytest/benchmark/patch/fxmark_changes.patch` | FxMark Junction 适配补丁；当前覆盖 `Makefile`、`src/bench.c`、`src/DRBL.c`、`src/util.c` |
 | `junction/fs/mytest/benchmark/patch/example.f` | Filebench whole-file read 示例 workload |
 | `junction/fs/mytest/benchmark/filebench_wml/shaofs_randomread*.f` | 从 Filebench `workloads/randomread.f` 派生的 ShaOFS randomread workload；当前这些文件在工作区中是 untracked |
 | `junction/fs/mytest/benchmark/filebench_wml/fileserver.f` | 当前用于 ShaOFS 的 Filebench fileserver smoke workload：`FSHAO:`、40 files、1 thread、2s runtime；已在 Junction/ShaOFS 上跑通 |
@@ -997,7 +1002,38 @@ cd /home/syh/MyProj1/junction/build/junction
 printf 'syh2syh\n' | sudo -S timeout 20s ./junction_run ../../junction/fs/mytest/shaofs_storage_st.config -- mytest/test_direct_io
 ```
 
-### 6.5 编译并运行 crash consistency 测试
+### 6.5 编译并运行 sync syscall smoke test（2026-05-15）
+
+当前 Junction syscall table 已包含 `sync`。最小测试程序为：
+
+```bash
+cd /home/syh/MyProj1/junction
+gcc junction/fs/mytest/test_sync_syscall.c -o build/junction/mytest/test_sync_syscall -lpthread
+```
+
+运行方式：
+
+```bash
+# shell 1
+cd /home/syh/MyProj1/junction
+printf 'syh2syh\n' | sudo -S lib/caladan/iokerneld ias
+
+# shell 2
+cd /home/syh/MyProj1/junction/build/junction
+printf 'syh2syh\n' | sudo -S timeout 20s ./junction_run caladan_test.config -- \
+  mytest/test_sync_syscall
+
+# 结束后
+printf 'syh2syh\n' | sudo -S pkill -9 iokerneld
+```
+
+本轮已观察到输出：
+
+```text
+sync ret=0 errno=0 (Success)
+```
+
+### 6.6 编译并运行 crash consistency 测试
 
 编译：
 
@@ -1036,13 +1072,13 @@ printf 'syh2syh\n' | sudo -S timeout 60s ./junction_run caladan_test.config -- \
 printf 'syh2syh\n' | sudo -S pkill -9 iokerneld
 ```
 
-### 6.6 sudo 密码
+### 6.7 sudo 密码
 
 ```
 syh2syh
 ```
 
-### 6.7 在 Junction 中运行 FIO（2026-05-06 当前流程）
+### 6.8 在 Junction 中运行 FIO（2026-05-06 当前流程）
 
 FIO 源码位于 `junction/fs/mytest/benchmark/fio`，这是一个独立 git 仓库。为了让它能在 Junction 中启动，当前采用“FIO 内部降级 + 构建配置”的方式，不修改 Junction 源码。
 
@@ -1143,7 +1179,7 @@ printf 'syh2syh\n' | sudo -S timeout 60s ./junction_run caladan_test.config -- \
 printf 'syh2syh\n' | sudo -S pkill -9 iokerneld
 ```
 
-### 6.8 在 Junction 中运行 Filebench（2026-05-13 当前流程）
+### 6.9 在 Junction 中运行 Filebench（2026-05-13 当前流程）
 
 Filebench 源码位于 `junction/fs/mytest/benchmark/filebench`。当前策略是只修改 Filebench 内部并用 patch 管理，不修改 Junction 源码。
 
@@ -1258,7 +1294,74 @@ printf 'syh2syh\n' | sudo -S pkill -9 iokerneld
 
 注意：`webserver.f` 原始 upstream workload 默认 `set $dir=/tmp`，那会绕过 ShaOFS。当前工作区版本已改为 `set $dir=FSHAO:`。`webserver.f` 内部写的是 `run 60`，所以用 `timeout 20s` 运行会得到退出码 124，这只是 timeout 太短，不表示 workload 或 ShaOFS 失败；完整验证建议 timeout 至少 90s。
 
-### 6.9 Filebench randomread workload 与 ext4 对比脚本（2026-05-12）
+### 6.10 在 Junction 中运行 FxMark（2026-05-15 当前流程）
+
+FxMark 源码位于：
+
+```bash
+/home/syh/MyProj1/junction/junction/fs/mytest/benchmark/fxmark
+```
+
+当前策略是只修改 FxMark 内部并用 patch 管理，不修改 Junction 或 ShaOFS 源码。相关文件：
+
+| Path | Purpose |
+|------|---------|
+| `junction/fs/mytest/benchmark/fxmark` | FxMark 源码和构建产物目录 |
+| `junction/fs/mytest/benchmark/patch/fxmark_changes.patch` | Junction 适配补丁，覆盖 `Makefile`、`src/bench.c`、`src/DRBL.c`、`src/util.c` |
+| `junction/fs/mytest/benchmark/patch/toggle_fxmark.sh` | 补丁 apply/revert + 自动 `make -j "$(nproc)"` 的管理脚本 |
+
+将 FxMark 切换并构建为 Junction 适配版：
+
+```bash
+cd /home/syh/MyProj1/junction
+junction/fs/mytest/benchmark/patch/toggle_fxmark.sh apply
+```
+
+恢复 FxMark 普通源码状态并重建：
+
+```bash
+cd /home/syh/MyProj1/junction
+junction/fs/mytest/benchmark/patch/toggle_fxmark.sh revert
+```
+
+当前 FxMark 适配补丁的核心变化：
+
+1. `src/bench.c`：把 worker 创建从 `fork()` 改为 `pthread_create()`。Junction 当前没有通用 `fork()`，原 FxMark 在 `--ncore > 1` 时会因 worker 创建失败而卡在 ready/start 屏障；`vfork()` 也不适合这里，因为 Junction 的 `vfork()` 会暂停 parent 到 child exit/exec，而 FxMark worker 必须并发运行。
+2. `src/bench.c`：启动/结束屏障从纯 `pause` busy-wait 改为 `sched_yield()`，避免 `runtime_quantum_us=0` 且只有一个 runtime kthread 时，某个等待 worker 自旋霸占唯一运行权。
+3. `src/bench.c` / `Makefile`：新增 pthread worker wrapper，并用 `-pthread` 构建。
+4. `src/util.c`：把 `system("mkdir -p ...")` 改为进程内递归 `mkdir()`，并把 `FSHAO` / `FSHAO:` 当作 ShaOFS 根别名处理，避免通过 shell 清理或创建 ShaOFS 路径。
+5. `src/DRBL.c`：DRBL 主循环每 4096 次迭代检查一次 wall-clock deadline，使 worker 自己按 `bench->duration` 结束；这绕开了 Junction/Caladan tight loop 中 `SIGALRM` 递送不及时的问题。核心 I/O 操作仍是原 DRBL 的 `pread(fd, page, PAGE_SIZE, 0)`。
+
+推荐运行方式：
+
+```bash
+# shell 1: 启动 IOKernel
+cd /home/syh/MyProj1/junction
+printf 'syh2syh\n' | sudo -S lib/caladan/iokerneld ias
+
+# shell 2: 运行 FxMark，务必使用 timeout
+cd /home/syh/MyProj1/junction/build/junction
+printf 'syh2syh\n' | sudo -S timeout 45s ./junction_run caladan_test.config -- \
+  /home/syh/MyProj1/junction/junction/fs/mytest/benchmark/fxmark/bin/fxmark \
+  --type DRBL --ncore 8 --nbg 0 --duration 5 --directio 0 --root FSHAO/demo
+
+# 结束后清理
+printf 'syh2syh\n' | sudo -S pkill -9 iokerneld
+```
+
+当前 `build/junction/caladan_test.config` 已确认包含：
+
+```text
+runtime_kthreads 1
+runtime_spinning_kthreads 1
+runtime_guaranteed_kthreads 0
+runtime_quantum_us 0
+enable_storage 1
+```
+
+因此 `--ncore` 只表示 FxMark 逻辑 worker 数，不代表 Junction 当前真的用了同等数量的 Caladan runtime kthreads。若要测试真实多核扩展性，需要另行调整 `caladan_test.config` 中的 runtime kthread/spinning kthread 配置并重新记录实验条件。
+
+### 6.11 Filebench randomread workload 与 ext4 对比脚本（2026-05-12）
 
 当前工作区中存在一组从 Filebench 官方 `workloads/randomread.f` 派生的 ShaOFS workload，目录为：
 
@@ -1330,7 +1433,7 @@ printf 'syh2syh\n' | sudo -S \
 
 注意：本次交接整理没有重新运行 ShaOFS/ext4 randomread benchmark。正式对比时必须保存完整 Filebench stdout/stderr、退出码、WML 文件、构建开关、Junction `caladan_test.config` CPU 配置和 cgroup 参数。
 
-### 6.10 ext4 fileserver.f cgroup 对比脚本（2026-05-13）
+### 6.12 ext4 fileserver.f cgroup 对比脚本（2026-05-13）
 
 repo 外部新增了 ext4 `fileserver.f` 对比脚本：
 
@@ -1582,6 +1685,7 @@ Filebench `directio=1` 不一定天然满足 ShaOFS 当前 2MB user-buffer 合�
 | `fstat` | `my_fstat` | `file.cc:usys_fstat` |
 | `newfstatat` | `my_newfstatat` | `file.cc:usys_newfstatat` |
 | `fsync/fdatasync` | `my_fsync` | `file.cc:usys_fsync` |
+| `sync` | `shaofs_sync_all` | `file.cc:usys_sync` |
 
 ### 8.3 已实现的功能特性
 
@@ -1590,6 +1694,7 @@ Filebench `directio=1` 不一定天然满足 ShaOFS 当前 2MB user-buffer 合�
 - **O_TRUNC**：`truncate_inode()` 释放所有数据块并重置 file_size
 - **O_APPEND**：在 write dispatch 时 `lseek(SEEK_END)` 后写入
 - **fsync**：per-file 精确刷写（遍历 extent → `bc_flush_block` + `ic_flush_inode`）
+- **sync**：全局刷写 ShaOFS 内存脏状态（imap、GDT、inode cache、block cache），用于 FxMark/FIO/Filebench 等会调用 `sync()` 的 benchmark；不会执行 clean unmount 语义或清 dirty marker
 - **stat/fstat**：完整填充 `struct stat`（含 indirect extent 块数统计）
 - **Extent hint**：顺序访问 O(1) 块映射
 - **EOF append 预分配**：普通文件 append 到 EOF 时按文件大小批量预分配 16/64/128 blocks，减少 Filebench append-heavy 场景中的 extent 数和分配开销
@@ -1673,7 +1778,37 @@ lat_us p50=9 p90=9 p99=13 max=102
 - 之后又派生了 Filebench `randomread.f` workload 到 `junction/fs/mytest/benchmark/filebench_wml/`，并编写了 repo 外部 ext4 cgroup 对比脚本 `/home/syh/fs_test/scripts/run_ext4_filebench_randomread_cgroup.sh`。本次交接整理未重新运行这些 randomread benchmark，无法从当前上下文确认最新 ShaOFS/ext4 对比数字。
 - 当前 Filebench 结果是在 `DIRECTPATH DISABLED` 环境下得到的，不能直接解释为最终 NVMe 极限带宽。
 
-### 8.7 2026-05-09 crash consistency 验证结果
+### 8.7 2026-05-15 当前 FxMark 状态
+
+- `junction/fs/mytest/benchmark/fxmark` 是 FxMark 源码目录；当前通过 `junction/fs/mytest/benchmark/patch/fxmark_changes.patch` 管理 Junction 适配修改。
+- `toggle_fxmark.sh apply` 会应用补丁并执行 `make -j "$(nproc)"`；`toggle_fxmark.sh revert` 会反向应用补丁并重新构建。2026-05-15 已实际验证 `revert` 和 `apply` 都能干净执行并构建通过。
+- 当前补丁覆盖 4 个文件：`Makefile`、`src/bench.c`、`src/DRBL.c`、`src/util.c`。
+- 适配后的 FxMark 不再使用 `fork()` 创建 worker，而是在同一 Junction 进程内使用 pthread worker；启动/结束屏障中的纯 busy-wait 改为 `sched_yield()`，避免 `runtime_quantum_us=0` + 单 runtime kthread 下等待线程自旋霸占 CPU。
+- `src/util.c` 中的 `mkdir_p()` 已改为进程内递归 `mkdir()`，避免 `system("mkdir -p")` 在 Junction/ShaOFS 路径上触发额外 shell/未支持机制。
+- `src/DRBL.c` 当前用 wall-clock deadline 让 worker 自己结束；这样不依赖 `SIGALRM` 在 tight loop 中及时投递。这个改动只覆盖 DRBL workload，其他 FxMark workload 是否也需要类似处理尚未验证。
+- 当前 `build/junction/caladan_test.config` 为 `runtime_kthreads=1`、`runtime_spinning_kthreads=1`、`runtime_quantum_us=0`。因此以下结果主要证明 FxMark 多 worker 在 Junction/ShaOFS 上能稳定跑完，不代表真实多核扩展性。
+
+已验证命令形态：
+
+```bash
+cd /home/syh/MyProj1/junction/build/junction
+printf 'syh2syh\n' | sudo -S timeout 45s ./junction_run caladan_test.config -- \
+  /home/syh/MyProj1/junction/junction/fs/mytest/benchmark/fxmark/bin/fxmark \
+  --type DRBL --ncore 8 --nbg 0 --duration 5 --directio 0 --root FSHAO/demo
+```
+
+本轮观察到的 DRBL smoke 结果：
+
+```text
+--ncore 1: 1 5.000181 30830592.000000 6165895.194594
+--ncore 2: 2 2.500116 30744576.000000 12297259.807145
+--ncore 4: 4 1.250023 30773248.000000 24618135.579051
+--ncore 8: 8 0.625031 30765056.000000 49221658.050092
+```
+
+注意：这些是跑通/烟测数字，不是论文最终 benchmark。正式实验前应重新固定 Junction config、构建开关、timeout、FxMark patch 状态和完整 stdout/stderr。
+
+### 8.8 2026-05-09 crash consistency 验证结果
 
 本次验证使用默认 `SHAOFS_CRASH_CONSISTENCY=ON` 构建；同时确认 `SHAOFS_CRASH_CONSISTENCY=OFF` 可以成功编译。测试前重新执行过 `/home/syh/mkfs/mkfs.sh`，mkfs 输出包含：
 
@@ -1739,6 +1874,9 @@ bench_seq_rw 32: Write 0.4978s, 64.29 MB/s, 16457 IOPS; Read 0.0034s, 9467.46 MB
 15. **Filebench patch 改变 procflow 执行模型**：当前 Filebench 适配版用于跑通 Junction/ShaOFS 学术负载；它不是对上游 Filebench 多进程语义的完整兼容。
 16. **32768 inode 边界尚未完整耗尽验证**：当前已修复约 8192 inode 附近失败的问题，并验证过 10000 文件级别场景；完整创建到接近 `INODENUM=32768` 后的行为仍应补充压力测试。
 17. **当前工作区存在未跟踪 benchmark/patch/report 文件**：`junction/fs/mytest/benchmark/patch/*`、`junction/fs/mytest/benchmark/filebench_wml/*`、`junction/fs/shaofs/OPTIMIZATION_REPORT.md`、`junction/fs/shaofs/IOPS_BENCHMARK_REPORT.md` 当前在主仓库中显示为 untracked；接手前应确认哪些需要纳入版本控制
+18. **FxMark patch 是 Junction 适配版，不是上游语义完整等价实现**：当前把 FxMark worker 从 process/fork 模型改成同进程 pthread 模型，只验证了 DRBL 跑通。涉及进程隔离、真实多进程扩展性或其他 FxMark workload 的结论需要单独验证。
+19. **当前 FxMark 多 worker smoke 不是多核扩展性结果**：`build/junction/caladan_test.config` 当前只有 `runtime_kthreads=1` / `runtime_spinning_kthreads=1`，所以 `--ncore 8` 并不表示 Junction/ShaOFS 使用了 8 个 runtime kthreads。正式多核实验必须先调整并记录 config。
+20. **`sync()` 是全局 flush，不是 clean unmount**：`usys_sync()` 当前调用 `shaofs_sync_all()` 刷写脏状态，但不会调用 `journal_mark_clean()`，也不会清除 `runtime_info->spdk_uipi`。如果测试依赖 clean shutdown 语义，仍应让 `junction_run` 正常退出走 `final_flush()`。
 
 ### 9.2 优先待办任务
 
@@ -1816,6 +1954,16 @@ bench_seq_rw 32: Write 0.4978s, 64.29 MB/s, 16457 IOPS; Read 0.0034s, 9467.46 MB
 - 仍需检查 Junction 其他 runtime libc 调用点、lazy binding、signal trampoline、interrupt/syscall entry 等是否存在未 guard 或 guard 后可能 yield 的路径。
 - 如果新增可 yield 的 runtime-FS 区域，应复用 `runtime_fsbase_depth`，而不是使用会长时间禁用抢占的 `RuntimeLibcGuard`。
 
+**Task 17: 固化 FxMark 正式 benchmark 脚本**
+- 当前只手动验证了 DRBL `--ncore 1/2/4/8` 能跑完；建议把 `toggle_fxmark.sh apply`、重新 mkfs、启动 IOKernel、`timeout` 运行 FxMark、清理 IOKernel 的流程写成脚本。
+- 正式实验应同时记录 `caladan_test.config` 中的 `runtime_kthreads` / `runtime_spinning_kthreads`、`runtime_quantum_us`、ShaOFS 构建开关、FxMark patch 状态、完整 stdout/stderr 和退出码。
+- 如果要报告多核扩展性，必须先提供多 runtime kthread 配置，并确认 FxMark pthread worker 真正分布到多个 Caladan kthread/core 上。
+
+**Task 18: 扩展 FxMark workload 兼容性验证**
+- 当前 patch 中只有 DRBL 被改成 self-timed loop；其他 FxMark workload 仍可能依赖 `SIGALRM` 或遇到 Junction 不支持的 syscall。
+- 后续可逐个验证常用 FxMark 类型，遇到失败时优先在 FxMark 适配层绕过不支持机制，不要直接修改 Junction，除非确认是 Junction bug。
+- 需要注意 FxMark 当前 pthread 降级模型对原始 process-based 语义的影响，尤其是共享地址空间、共享全局变量和资源统计。
+
 ---
 
 ## 第十章：文件修改历史总览
@@ -1839,6 +1987,7 @@ bench_seq_rw 32: Write 0.4978s, 64.29 MB/s, 16457 IOPS; Read 0.0034s, 9467.46 MB
 | `generic_cache/cache.h` | Feature | 新增 flush_entry(key) |
 | `generic_cache/sharded_cache.h` | Feature | 转发 flush_entry |
 | `junction/fs/file.cc` | Feature | usys_read/write/pread64/pwrite64 传递 O_DIRECT flag；usys_fstat/newfstatat/fsync 添加 SHAOFS dispatch；newfstatat 使用 SHAOFS_REALPATH |
+| `junction/fs/file.cc` | Feature | 新增 `usys_sync()`，调用 `shaofs_sync_all()` 全局刷写 ShaOFS 脏状态 |
 | `junction/fs/core.cc` | Feature + path fix | openat/mkdir 使用 SHAOFS_REALPATH，兼容 `FSHAO/path` 与 `FSHAO:/path` |
 | `junction/CMakeLists.txt` | Build | 新增 `SHAOFS_IO_PREEMPT` option，开启时定义 `IO_PREEMPT=1` |
 | `lib/caladan/runtime/softirq.c` | User fix | 恢复 timer soft interrupt 处理（修复 sleep/barrier）；storage softirq pending 时使用 runqueue head insertion |
@@ -1853,6 +2002,7 @@ bench_seq_rw 32: Write 0.4978s, 64.29 MB/s, 16457 IOPS; Read 0.0034s, 9467.46 MB
 | `shaofs/journal.h` | New | journal API 和 `CRASH_CONSISTENCY=0` no-op fallback |
 | `shaofs/journal.cc` | New | metadata-only redo journal、dirty mount marker、transaction replay、dirty repair |
 | `shaofs/file.cc` | Crash consistency | final_flush 通过 journal 写 imap，clean shutdown 清 dirty marker；目录块分配后登记为 metadata block |
+| `shaofs/file.cc` / `shaofs/file.h` | Feature | 新增 `shaofs_sync_all()`；与 `final_flush()` 共用 `flush_all_dirty_state()`，但 runtime `sync()` 不清 dirty marker |
 | `shaofs/group.cc` | Crash consistency | GDT sync 改为 `journal_write_metadata()` |
 | `/home/syh/mkfs/fs.h` | Crash consistency | mkfs 侧 SuperBlock 同步新增 journal 字段和 `DEFAULT_JOURNAL_BLOCKS` |
 | `/home/syh/mkfs/mkfs.c` | Crash consistency | mkfs 在盘尾预留并清空 journal 区，data group 只使用 journal 前空间 |
@@ -1874,6 +2024,13 @@ bench_seq_rw 32: Write 0.4978s, 64.29 MB/s, 16457 IOPS; Read 0.0034s, 9467.46 MB
 | `junction/fs/mytest/benchmark/patch/filebench_changes.patch` | Handover artifact | 保存 Filebench 适配源码补丁 |
 | `junction/fs/mytest/benchmark/patch/toggle_filebench.sh` | Tooling | 一键 apply/revert Filebench 补丁，并自动重新 configure/make |
 | `junction/fs/mytest/benchmark/patch/example.f` | Benchmark config | 当前用于 Junction/ShaOFS 的 Filebench 示例 workload |
+| `junction/fs/mytest/benchmark/fxmark/Makefile` | FxMark adapter | 补丁后增加 `-pthread`，支持 pthread worker 模型 |
+| `junction/fs/mytest/benchmark/fxmark/src/bench.c` | FxMark adapter | 补丁后用 `pthread_create()` 代替 `fork()` 创建 worker；屏障等待使用 `sched_yield()` |
+| `junction/fs/mytest/benchmark/fxmark/src/DRBL.c` | FxMark adapter | 补丁后 DRBL worker 自己按 wall-clock deadline 结束，避免依赖 `SIGALRM` 及时投递 |
+| `junction/fs/mytest/benchmark/fxmark/src/util.c` | FxMark adapter | 补丁后 `mkdir_p()` 使用进程内递归 `mkdir()`，并兼容 `FSHAO` / `FSHAO:` 根别名 |
+| `junction/fs/mytest/benchmark/patch/fxmark_changes.patch` | Handover artifact | 保存 FxMark Junction 适配源码补丁 |
+| `junction/fs/mytest/benchmark/patch/toggle_fxmark.sh` | Tooling | 一键 apply/revert FxMark 补丁，并自动 `make -j $(nproc)` |
+| `junction/fs/mytest/test_sync_syscall.c` | New test | 最小 `sync()` syscall smoke test，写入 ShaOFS 文件后调用 `syscall(SYS_sync)` 并检查返回值 |
 | `junction/fs/mytest/benchmark/filebench_wml/shaofs_randomread*.f` | Benchmark config | 从 Filebench `workloads/randomread.f` 派生的 ShaOFS randomread workload，当前为 untracked 工作区文件 |
 | `junction/fs/mytest/benchmark/filebench_wml/fileserver.f` | Benchmark config | 当前 ShaOFS fileserver smoke workload：`FSHAO:`、40 files、1 thread、2s runtime；2026-05-13 已在 ShaOFS/ext4 上跑通 smoke 对比 |
 | `junction/fs/mytest/benchmark/filebench_wml/webserver.f` | Benchmark config | 当前 ShaOFS webserver workload：`FSHAO:`、1000 files、100 threads、60s runtime；2026-05-13 已在 Junction/ShaOFS 上跑通 |
@@ -2296,3 +2453,97 @@ IO Summary: 40842810 ops 680679.092 ops/s 219574/21957 rd/wr 3412.3mb/s 0.145ms/
 - 未重新运行 Filebench randomread、FIO、ShaOFS 全量单元测试或完整 inode 耗尽测试。
 - 未做多轮重复实验、置信区间统计、CPU cycle/perf 采样、NVMe 设备端带宽计数或 `DIRECTPATH DISABLED` 根因确认。
 - 未确认当前 `fileserver.f` 缩小参数是否适合作为论文最终 workload；当前只适合作为跑通和 smoke 对比。
+
+---
+
+## 第十七章：2026-05-15 sync syscall 与 FxMark 交接整理验证记录
+
+### 17.1 本次实际检查过的内容
+
+```bash
+sed -n '1,2420p' HANDOVER.md
+git status --short
+rg -n 'usys_sync|shaofs_sync_all|flush_all_dirty_state|sync_all|fdatasync|fsync' \
+  junction/fs junction/kernel junction/syscall -g'*.[ch]' -g'*.cc' -g'*.h'
+sed -n '600,635p' junction/fs/file.cc
+sed -n '70,115p' junction/fs/shaofs/file.cc
+sed -n '1,80p' junction/fs/shaofs/file.h
+rg -n '^sync|fdatasync|fsync' junction/syscall/usys.txt junction/kernel/usys.h
+sed -n '130,255p' junction/fs/shaofs/generic_cache/cache.h
+sed -n '1,260p' junction/fs/mytest/benchmark/patch/fxmark_changes.patch
+sed -n '1,220p' junction/fs/mytest/benchmark/patch/toggle_fxmark.sh
+sed -n '1,180p' junction/fs/mytest/test_sync_syscall.c
+sed -n '1,120p' build/junction/caladan_test.config
+git status --short \
+  junction/fs/mytest/benchmark/patch/fxmark_changes.patch \
+  junction/fs/mytest/benchmark/patch/toggle_fxmark.sh \
+  junction/fs/mytest/test_sync_syscall.c \
+  HANDOVER.md
+```
+
+部分普通只读命令仍可能被当前 sandbox 的 `bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted` 拦截；必要时使用已批准的只读/写入命令完成核对。
+
+### 17.2 本轮会话中已运行过的关键构建和测试
+
+以下记录来自 2026-05-15 前后本轮开发调试过程；本次最后的文档整理阶段没有重新启动 IOKernel 或重新跑长 benchmark。
+
+已运行并确认过的关键项：
+
+- 修改 Junction syscall table 后重新构建过 `junction_run`，`sync` 已不再报 unsupported syscall。
+- 编译过 `junction/fs/mytest/test_sync_syscall.c` 到 `build/junction/mytest/test_sync_syscall`。
+- 在 Junction/ShaOFS 中运行 `test_sync_syscall`，观察到：
+
+```text
+sync ret=0 errno=0 (Success)
+```
+
+- `toggle_fxmark.sh apply` 可以应用 `fxmark_changes.patch` 并执行 `make -j "$(nproc)"` 构建 FxMark。
+- `toggle_fxmark.sh revert` 可以反向应用同一 patch 并重新构建；随后再次 `apply` 成功。
+- 启动过 `sudo lib/caladan/iokerneld ias`，运行 FxMark DRBL `--ncore 1/2/4/8` smoke 测试；每次 `junction_run` 都用 `timeout` 包裹。
+- FxMark DRBL 观察到的 smoke 输出：
+
+```text
+--ncore 1: # ncpu secs works works/sec
+           1 5.000181 30830592.000000 6165895.194594
+
+--ncore 2: # ncpu secs works works/sec
+           2 2.500116 30744576.000000 12297259.807145
+
+--ncore 4: # ncpu secs works works/sec
+           4 1.250023 30773248.000000 24618135.579051
+
+--ncore 8: # ncpu secs works works/sec
+           8 0.625031 30765056.000000 49221658.050092
+```
+
+- 测试结束后已执行 `pkill -9 iokerneld`，并用 `pgrep -a iokerneld` / `pgrep -a junction_run` 确认没有残留进程。
+
+### 17.3 本次确认的客观状态
+
+- `junction/syscall/usys.txt` 当前包含 `sync`，位置在 `fsync` / `fdatasync` 之后。
+- `junction/kernel/usys.h` 当前声明了 `long usys_sync(void);`。
+- `junction/fs/file.cc:usys_sync()` 当前无条件调用 `shaofs_sync_all()` 并返回 0。它不是按 mount namespace 或文件系统实例筛选的通用 Linux `sync()` 实现；当前项目语义是“刷 ShaOFS 全局内存脏状态”。
+- `junction/fs/shaofs/file.cc` 当前把 `final_flush()` 的公共刷写逻辑提取为 `flush_all_dirty_state()`；`shaofs_sync_all()` 调用该函数但不调用 `journal_mark_clean()`，`final_flush()` 则在刷写后调用 `journal_mark_clean()`。
+- `generic_cache/cache.h::flush_all()` 当前先在 shard lock 下收集 dirty+valid entry handle，再释放 shard lock 后逐个获取 read lock 并写回 backend。这是为了让 runtime `sync()` / `final_flush()` 避免长期持有 shard lock 时进入 backend write。
+- `fxmark_changes.patch` 当前覆盖 `Makefile`、`src/bench.c`、`src/DRBL.c`、`src/util.c`；`toggle_fxmark.sh` 当前支持 `apply` / `revert` 并在切换后自动构建。
+- `build/junction/caladan_test.config` 当前为单 runtime kthread 配置：
+
+```text
+runtime_kthreads 1
+runtime_spinning_kthreads 1
+runtime_guaranteed_kthreads 0
+runtime_quantum_us 0
+enable_storage 1
+```
+
+- 顶层 git 状态中 `fxmark_changes.patch`、`toggle_fxmark.sh` 和 `test_sync_syscall.c` 当前是 untracked。FxMark 源码目录处于 patch-applied dirty 状态是预期的，但源码改动应继续通过 `fxmark_changes.patch` 管理。
+- FxMark 目录中还存在 `Makefile.orig` 和 `src/bench.c.orig` 这两个未跟踪备份文件；它们在本轮最终 patch 生成前已存在/被发现，未纳入 `fxmark_changes.patch`。接手者如要清理，应先确认不是用户仍需要的临时备份。
+
+### 17.4 本次未重新验证的内容
+
+- 最后文档整理阶段没有重新运行 `scripts/build.sh`、CMake build、IOKernel 或 FxMark；长测试结果来自本轮前面的实际调试运行。
+- 未验证 FxMark 除 DRBL 外的其他 workload。
+- 未验证 FxMark `--directio 1` 与 ShaOFS 当前严格 O_DIRECT user-buffer DMA 合约的兼容性。
+- 未调整 `caladan_test.config` 到多 runtime kthread，因此未确认 FxMark/ShaOFS 的真实多核扩展性。
+- 未重新跑 Filebench、FIO、ext4 对比或 ShaOFS 全量单元测试。
+- 未重新格式化磁盘后重复 FxMark 多轮统计；当前结果只作为跑通 smoke 记录。
