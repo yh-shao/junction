@@ -5,7 +5,7 @@
 
 int main()
 {
-    int fd = open("FSHAO:/file", O_RDWR | O_CREAT, 0644), ret;
+    int fd = open("FSHAO/file", O_RDWR | O_CREAT, 0644), ret;
     printf("[OPEN] ret val = %d\n", fd);
 
     size_t n = 2000;
