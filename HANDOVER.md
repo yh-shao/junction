@@ -1,6 +1,6 @@
 # Project Handover / ShaOFS 全局项目交接与 AI 上下文恢复文档
 
-> **文档版本**: v4.5 | **最后更新**: 2026-05-15
+> **文档版本**: v4.6 | **最后更新**: 2026-05-15
 > **目的**: 使任何 AI Code Agent 读取本文档后，能瞬间加载全部项目上下文，无缝继续开发。
 
 > **2026-05-06 补充说明**: 本文档保留了 2026-04-10 之前关于 ShaOFS 架构、测试和优化的历史沉淀。本次交接修正了与当前代码明显不一致的事实，并追加了 FIO-on-Junction 适配、补丁管理脚本和当前验证状态。历史性能测试结果可能不可靠，已从本文档移除；正式性能数据应以重新跑出的 benchmark 原始输出为准。
@@ -11,11 +11,13 @@
 
 > **2026-05-10 补充说明**: 本次交接追加了 Filebench-on-Junction 适配、`alloc_inum()` 越过 8192 inode 的修复，以及 x86 FS base 保存/恢复策略。当前 Filebench 适配仅修改 Filebench 源码并通过 patch 管理，不修改 Junction；它把 Filebench procflow 从 fork/exec/wait 模型降级为进程内 pthread 模型，并绕过 Junction 当前不支持或不稳定的 `personality()`、SysV semaphore、部分清理命令和日志栈缓冲路径。当前 `alloc_inum()` 已按 `INODENUM=32768` 全范围扫描 inode bitmap；本轮验证越过了 8192 inode，但尚未完整验证 32768 inode 耗尽边界。
 
-> **2026-05-12 补充说明**: 本次交接修正了 O_DIRECT 路径的描述。当前 ShaOFS 已实现严格约束下的 user-buffer DMA：用户 buffer 必须 2MB 对齐、长度必须是 2MB 的倍数，文件 offset 必须 4KB 对齐；不满足时直接返回错误，不再回退到 bounce buffer。`storage_prepare_user_dma()` 会 `mlock()` 用户页、调用 `spdk_mem_register()` 并用 `spdk_vtophys()` 验证 IOVA，随后 `storage_read_aligned()` / `storage_write_user_dma()` 直接把用户 buffer 作为 SPDK NVMe payload。为支持这条路径，当前 seccomp 放行了 Caladan `mlock` wrapper 以及 VFIO DMA map/unmap ioctl request。另补充了 Filebench `randomread.f` 派生 workload、ext4 cgroup 对比脚本和 Caladan/Junction syscall 包装/拦截机制。
+> **2026-05-12 补充说明**: 本次交接修正了 O_DIRECT 路径的描述。ShaOFS 已实现严格约束下的 user-buffer DMA，不满足条件时直接返回错误，不再回退到 bounce buffer。后续 2026-05-15 已进一步放宽用户传入 buffer 的表层合约：用户传入的 `buf`、`len`、`offset` 只需 4KB 对齐，但底层仍按覆盖该子区间的 2MB 范围执行 `mlock()` / `spdk_mem_register()` / `spdk_vtophys()`；因此推荐用户分配 2MB 对齐、至少 2MB 映射的 arena，再传入其中 4KB 对齐子区间。`storage_read_aligned()` / `storage_write_user_dma()` 直接把用户 buffer 作为 SPDK NVMe payload。为支持这条路径，当前 seccomp 放行了 Caladan `mlock` wrapper 以及 VFIO DMA map/unmap ioctl request。另补充了 Filebench `randomread.f` 派生 workload、ext4 cgroup 对比脚本和 Caladan/Junction syscall 包装/拦截机制。
 
 > **2026-05-13 补充说明**: 本次交接追加了 Filebench `fileserver.f` / `webserver.f` 在 Junction/ShaOFS 上的当前验证状态、ext4 `fileserver.f` cgroup 对比脚本和最新 smoke 对比数据。为跑通 `fileserver.f` 的 append-heavy 模式，`junction/fs/shaofs/extent.cc` 已在普通文件 EOF append 路径加入批量预分配：按文件大小选择 16/64/128 blocks，通过 `alloc_blocks()` 获取物理块，合并成 extent 后一次写回 inode extent 元数据；预分配块会立即在 Block Cache 中清零并标脏，失败路径会 invalidate cache entry 并释放物理块。当前 `fileserver.f` 是一个缩小版 smoke workload（40 files、1 thread、2s runtime），ShaOFS 结果约 `989k ops/s`，ext4 同资源 cgroup 结果约 `627k ops/s`。`webserver.f` 已改为 `set $dir=FSHAO:` 并能完整跑完 60s，ShaOFS 结果约 `680k ops/s`、`3412.3MB/s`。这些是本轮功能验证/初步对比数据，不是最终论文 benchmark；正式实验仍需重新固定构建开关、WML、cgroup/Junction config 并保存完整原始输出。
 
 > **2026-05-15 补充说明**: 本次交接追加了 Junction `sync()` syscall 和 FxMark-on-Junction 适配状态。`sync()` 已加入 `usys.txt` / `usys.h` / `junction/fs/file.cc`，当前语义是调用 `shaofs_sync_all()` 刷写 ShaOFS 的 imap、GDT、inode cache 和 block cache；它不会像 `final_flush()` 那样清除 crash-consistency dirty marker，也不会 disable `IO_PREEMPT`。为避免运行时 `sync()` 与并发 cache 操作死锁，`generic_cache/cache.h::flush_all()` 当前先在 shard lock 下收集 dirty entry handle，再释放 shard lock 后逐个刷写。FxMark 源码位于 `junction/fs/mytest/benchmark/fxmark`，适配通过 `junction/fs/mytest/benchmark/patch/fxmark_changes.patch` 和 `toggle_fxmark.sh` 管理；当前 patch 把 FxMark worker 从 `fork()` 改为 `pthread_create()`，把启动/结束屏障的纯 busy-wait 改为 `sched_yield()`，把 `mkdir -p` 改为进程内递归 `mkdir()`，并让 DRBL worker 自己按 wall-clock 控制 duration。已验证 DRBL `--ncore 2/4/8` 能在 Junction/ShaOFS 上跑完，但当前 `build/junction/caladan_test.config` 仍是 `runtime_kthreads=1`、`runtime_spinning_kthreads=1`、`runtime_quantum_us=0`，这些结果只能说明多 worker 适配已跑通，不是多核扩展性结论。
+
+> **2026-05-15 晚些时候补充说明**: 本次交接追加了 ShaOFS Direct IO user-buffer DMA 放宽、FIO Direct IO 复测和 spinlock 抢占安全审计。`junction/fs/shaofs/file.cc::user_dma_request_ok()` 当前要求用户传入的 `buf`、`len`、`offset` 4KB 对齐；`lib/caladan/runtime/storage.c` 会自动计算覆盖范围的 2MB 注册区间，用 `spdk_mem_register()` 注册该 2MB 区间，并只对用户请求的实际子区间做 NVMe DMA。新增/保留了 `shaofs_direct_io_example.c` 和 `test_user_dma_direct.c` 用于演示 2MB arena 内 4KB 子区间 Direct IO。FIO 适配补丁 `fio_changes.patch` 当前覆盖 `filesetup.c`、`helper_thread.c`、`memory.c`，其中 `memory.c` 为 `direct=1` 的 FIO malloc buffer 使用 2MB 对齐/向上取整分配。已用 `directio.fio` 复跑 16 job、4KB、60s、O_DIRECT random read，`junction_run` 退出码 0，总吞吐约 `852MiB/s`，约 `218k IOPS`，日志出现 `storage: enabled direct DMA into user buffers`。锁审计方面，已新增 `SpinGuardNP`，并把 `BlockPool`、group bitmap/free counter、extent hint、DSA init pool 等短内存临界区改为 `spin_lock_np()`；`journal_lock` 因临界区内会执行 storage I/O，仍保留普通 `SpinGuard`，不能直接换成 `_np`。
 
 ---
 
@@ -126,7 +128,7 @@ Junction 拦截 syscall → usys_write() [junction/fs/file.cc]
                       ▼
 ┌─────────────────────────────────────────────────────────┐
 │                    Block Cache                            │
-│  65536 entries (256MB), 32 shards                       │
+│  65536 entries (256MB), 256 shards                      │
 │  Key: BlockID (uint64_t) → Value: BlockData (4KB)        │
 │  Policy: LRU, write-back                                │
 │  Memory: spdk_dma_zmalloc() 分配（DMA-capable hugepage）  │
@@ -253,7 +255,7 @@ junction/fs/shaofs/                    ← 我们的项目代码
 ├── syscall.h/cc                       ← my_open/read/write/mkdir/lseek/fstat/newfstatat/fsync
 │                                        fill_stat_from_inode
 ├── utili.h                            ← SpinGuard, ReadGuard, WriteGuard, RuntimeFSBaseGuard,
-│                                        kguard, atomic_read/write/inc/dec
+│                                        SpinGuardNP, kguard, atomic_read/write/inc/dec
 ├── dsa.h/cc                           ← Intel DSA/DML 初始化、异步 copy/copyv，硬件不可用时回退 CPU memcpy
 ├── journal.h/cc                       ← metadata-only redo journal + dirty mount repair
 │                                        journal_init/recover/mark_dirty/mark_clean,
@@ -294,6 +296,8 @@ junction/fs/shaofs/                    ← 我们的项目代码
 | `test_dir.c` | 单元测试 | 22 项目录操作检查（ROOT_INO fix, 并发 lookup） |
 | `test_tools.c` | 集成测试 | 24 项（创建目录树 + stat + read + 目录枚举） |
 | `test_direct_io.c` | 单元测试 | 35 项 O_DIRECT 检查（整块/部分块/跨模式一致性） |
+| `shaofs_direct_io_example.c` | 示例程序 | 最小 ShaOFS O_DIRECT 示例：分配 2MB arena，传入 4KB 对齐子区间执行 pwrite/pread |
+| `test_user_dma_direct.c` | 回归测试 | 验证 2MB 对齐 arena、4KB 子区间、尾部 4KB 子区间、非 4KB 对齐拒绝等 Direct DMA 合约 |
 | `test_many_inodes.c` | 回归测试 | 顺序创建大量小文件，用于验证 inode bitmap 分配能越过 inode cache 容量 |
 | `test_many_inodes_read_threads.c` | 回归测试 | 创建大量 16KB 文件后用 3 个 pthread 反复整文件读取并校验内容，用于覆盖 Filebench 类似读负载 |
 | `test_barrier_sleep.c` | 兼容性测试 | pthread_barrier + sleep() 在 Junction 中的正确性 |
@@ -551,11 +555,12 @@ Phase 2: (无 inode 锁)
 
 **用户 buffer 合约**：
 
-- `buf` 必须按 2MB 对齐。
-- `len` 必须是 2MB 的倍数。
+- 用户传入的 `buf` 必须 4KB 对齐。
+- 用户传入的 `len` 必须是 4KB 的倍数。
 - `offset` 必须非负且 4KB 对齐。
 - direct read/write 内部还要求每次提交给 NVMe 的片段是整 4KB 块；当前不支持 direct partial-block I/O。
 - 不满足上述条件时，`file_read_direct()` / `file_write_direct()` 返回错误；当前实现故意不回退到 bounce buffer + memcpy。
+- 底层 DMA 注册仍按覆盖用户子区间的 2MB 范围进行。因此实际使用时推荐通过 `posix_memalign(..., 2MB, 2MB 或更大)` 分配 arena，再传入 arena 内部 4KB 对齐的子区间；只传一个孤立的 4KB malloc 小块通常无法保证覆盖 2MB 注册区间都属于可安全 pin/register 的用户映射。
 
 **注册和验证流程**：
 
@@ -563,12 +568,13 @@ Phase 2: (无 inode 锁)
 file_read_direct/file_write_direct
     ├─ user_dma_request_ok(buf, offset, len)
     ├─ storage_prepare_user_dma(buf, len)
-    │   ├─ 2MB 对齐检查
+    │   ├─ 4KB 对齐检查
+    │   ├─ 计算覆盖 [buf, buf+len) 的 2MB 注册区间 [reg_base, reg_end)
     │   ├─ 查 user_dma_pages[] 2MB 页粒度 cache
-    │   ├─ syscall_mlock(buf, len)                 // pin 用户页
-    │   ├─ spdk_mem_register(buf, len)             // 建立 SPDK/DPDK/VFIO DMA 映射
+    │   ├─ syscall_mlock(reg_base, reg_end-reg_base)          // pin 覆盖用户子区间的 2MB 注册区
+    │   ├─ spdk_mem_register(reg_base, reg_end-reg_base)      // 建立 SPDK/DPDK/VFIO DMA 映射
     │   ├─ rc == -EBUSY 时按 2MB 页逐段注册
-    │   ├─ spdk_vtophys() 遍历验证每段可转 IOVA
+    │   ├─ spdk_vtophys() 遍历验证实际 [buf, buf+len) 可转 IOVA
     │   └─ 成功后写入 user_dma_pages[] cache
     └─ 进入实际 direct I/O
 ```
@@ -1087,7 +1093,7 @@ FIO 源码位于 `junction/fs/mytest/benchmark/fio`，这是一个独立 git 仓
 | Path | Purpose |
 |------|---------|
 | `junction/fs/mytest/benchmark/fio` | FIO 源码和构建产物目录 |
-| `junction/fs/mytest/benchmark/patch/fio_changes.patch` | 当前 FIO 适配补丁，120 行，只修改 `filesetup.c` 和 `helper_thread.c` |
+| `junction/fs/mytest/benchmark/patch/fio_changes.patch` | 当前 FIO 适配补丁，158 行，修改 `filesetup.c`、`helper_thread.c`、`memory.c` |
 | `junction/fs/mytest/benchmark/patch/toggle_fio.sh` | 补丁 apply/revert + 自动重新 `configure`/`make` 的管理脚本 |
 
 将 FIO 切换并构建为 Junction 适配版：
@@ -1120,6 +1126,7 @@ junction/fs/mytest/benchmark/patch/toggle_fio.sh revert
 1. `filesetup.c`：识别 `FSHAO/` 和 `FSHAO:/` 路径，避免 FIO 把 `FSHAO` 或 `FSHAO:` 当作普通目录去 `mkdir`。注意：FIO 自身的 `options.c:get_next_str()` 会把未转义的 `:` 当作 filename/directory 列表分隔符；当前 ShaOFS core 的 `MYPREFIX` 是 `"FSHAO"`，实际 FIO 命令建议优先使用 `FSHAO/` 规避这个问题。
 2. `filesetup.c`：当 ShaOFS 的 `ftruncate` 返回 `EINVAL` 或 `ENOSYS` 时，不让 FIO prepare 阶段直接失败，而是继续通过写入铺文件。
 3. `helper_thread.c`：`timerfd_create()` / `timerfd_settime()` 在 Junction 中不可用或失败时不再 `assert` 崩溃，而是回退到原有 select timeout 路径。
+4. `memory.c`：当 job 使用 `direct=1` 且 FIO 走 malloc 内存模式时，使用 `posix_memalign()` 分配 2MB 对齐、按 2MB 向上取整的 buffer，保证 ShaOFS 当前 O_DIRECT user-buffer DMA 能对覆盖区间执行 2MB 注册。
 
 运行 FIO 前建议重新格式化 ShaOFS 测试盘：
 
@@ -1582,7 +1589,7 @@ FIO 默认会使用 SysV shared memory（`shmget()` 等），而 Junction 当前
 
 2026-05-09 的测试中 Junction 输出仍包含 `DIRECTPATH DISABLED` 警告，因此 `shaofs_preempt_latency` / `shaofs_preempt_iops` 的结果应解释为“completion-driven preemption 在 CPU-bound 干扰下显著降低延迟、提升可观测 IOPS”，不要直接写成 ShaOFS 已达到最终 NVMe 带宽上限。
 
-另外，ShaOFS direct I/O 当前已有严格约束下的 user-buffer DMA 路径，但为了保证 cached/direct 一致性，direct read/write 仍会涉及 `bc_flush_block()` / `bc_invalidate_block()`；不满足 2MB 对齐/长度合约的请求会直接失败。正式解释性能时需要明确 workload 是否真的走到了 user-buffer DMA fast path。
+另外，ShaOFS direct I/O 当前已有严格约束下的 user-buffer DMA 路径，但为了保证 cached/direct 一致性，direct read/write 仍会涉及 `bc_flush_block()` / `bc_invalidate_block()`；不满足 4KB 对齐请求合约、或底层覆盖 2MB 区间无法 `mlock/spdk_mem_register/vtophys` 的请求会失败。正式解释性能时需要明确 workload 是否真的走到了 user-buffer DMA fast path。
 
 ### 7.13 GOTCHA 12：Crash consistency 当前是 metadata-only，不是完整事务文件系统
 
@@ -1633,13 +1640,13 @@ ShaOFS 的 `RuntimeFSBaseGuard` 与 Junction 原有 `RuntimeLibcGuard` 不同。
 
 当前 ShaOFS O_DIRECT 不再为不合规请求自动回退到 bounce buffer。测试程序或 benchmark 如果要验证“NVMe SSD ↔ user buffer”直通路径，必须保证：
 
-- 用户 buffer 2MB 对齐。
-- I/O 长度是 2MB 的倍数。
+- 用户传给 read/write 的 buffer 地址 4KB 对齐。
+- I/O 长度是 4KB 的倍数。
 - 文件 offset 4KB 对齐。
 - 读写范围落在整 4KB 块上。
-- `storage_prepare_user_dma()` 成功完成 `mlock`、`spdk_mem_register` 和 `spdk_vtophys` 验证。
+- `storage_prepare_user_dma()` 能对覆盖用户子区间的 2MB 注册范围成功完成 `mlock`、`spdk_mem_register`，并对实际请求子区间完成 `spdk_vtophys` 验证。
 
-Filebench `directio=1` 不一定天然满足 ShaOFS 当前 2MB user-buffer 合约。若 Filebench 内部只按 4KB 分配/提交 buffer，ShaOFS O_DIRECT 可能返回错误或没有走到 user-buffer DMA fast path。正式 benchmark 前应通过最小测试程序或 Filebench 日志确认实际路径。
+因此推荐测试程序分配 2MB 对齐、至少 2MB 大小的 arena，再传入其中 4KB 对齐的子区间。孤立的小 4KB malloc buffer 即使地址碰巧 4KB 对齐，也可能因为底层需要注册覆盖它的完整 2MB 区间而失败。当前 FIO patch 已在 `memory.c` 中为 `direct=1` 的 malloc buffer 做 2MB 对齐/向上取整；Filebench `directio=1` 是否满足该模式仍需单独确认。
 
 ### 7.18 GOTCHA 17：Caladan/Junction 内不能任意调用 Linux syscall
 
@@ -1650,6 +1657,30 @@ Filebench `directio=1` 不一定天然满足 ShaOFS 当前 2MB user-buffer 合�
 - 额外的 VFIO ioctl 只按 request 放行，用于 SPDK DMA map/unmap。
 
 因此不要在 ShaOFS、Caladan runtime 或 Junction runtime 中直接调用 glibc `syscall()`、`open()`、`ioctl()` 等。需要新增真实 syscall 时，必须同时增加 wrapper、头文件声明和 seccomp allowlist，并确认调用点不会破坏 Junction 对用户 syscall 的拦截语义。
+
+### 7.19 GOTCHA 18：uthread 路径里的短 spinlock 应禁用抢占，但不要全局无脑替换
+
+Caladan 的 `spin_lock()` 只是 raw busy-wait，不会自动禁止 uthread 抢占。如果 uthread A 已经持有某把 spinlock 后被 Caladan 抢占，而同一个 kthread 上的 uthread B 又去拿同一把锁，B 会在用户态 busy-spin，导致 A 没机会恢复执行并释放锁，表现为死锁式等待或 timeout。
+
+`spin_lock_np()` 的语义是 `preempt_disable(); spin_lock();`，对应 `spin_unlock_np()` 在解锁后 `preempt_enable()`。它适合 **短、纯内存、不会 yield/阻塞/IO** 的元数据临界区。
+
+2026-05-15 已完成的低风险修复：
+
+- `generic_cache/cache.h` 的 shard metadata lock 使用 `_np`，但 backend read/write 仍在 shard lock 外执行。
+- `lib/caladan/runtime/storage.c` 的 `user_dma_lock` 使用 `_np`；`mlock()`、`spdk_mem_register()`、`spdk_vtophys()` 不在该锁内。
+- `utili.h` 新增 `SpinGuardNP`。
+- `blockCache.h::BlockPool::alloc/free` 改为 `SpinGuardNP`。
+- `group.cc` 的 group bitmap/free counter 短临界区改为 `SpinGuardNP`。
+- `inode.h` / `extent.cc` 的 `extent_hint` try-lock 改为 `spin_try_lock_np()` / `spin_unlock_np()`。
+- `dsa.cc` 的 DSA request pool 初始化锁改为 `_np`。
+
+不要全局替换所有 `spin_lock()`：
+
+- `journal.cc::journal_lock` 临界区会调用 `storage_write()`，不能直接换成 `_np`，否则会在不可抢占状态下做 IO。
+- `journal.cc::metadata_lock` 下存在 `std::vector::push_back()`，虽然通常已 `reserve(4096)`，但严格说仍可能分配；若要改 `_np`，应先改成固定容量或确保不会扩容。
+- `lib/caladan/runtime/storage.c` 的 `q->lock` 多数路径在 `getk()` 后运行，而 `getk()` 已经 `preempt_disable()`；`thread_park_and_unlock_np()` 也要求进入时 preemption 已关闭。这类 runtime 锁需要按 Caladan 约定审计，不能按 ShaOFS 元数据锁简单处理。
+
+判断原则：只有在确认临界区不会执行 `rwmutex`/`mutex` 等可能阻塞的等待、不会访问磁盘/提交或等待 I/O、不会调用可能 yield 的函数时，才使用 `spin_lock_np()` 或 `SpinGuardNP`。
 
 ---
 
@@ -1690,7 +1721,7 @@ Filebench `directio=1` 不一定天然满足 ShaOFS 当前 2MB user-buffer 合�
 ### 8.3 已实现的功能特性
 
 - **三级缓存**：Block Cache (write-back) + Inode Cache (write-back) + Dentry Cache (write-through)
-- **O_DIRECT user-buffer DMA**：满足 2MB 对齐/长度合约时绕过 Block Cache，直接用用户 buffer 作为 SPDK NVMe read/write payload；不满足时返回错误
+- **O_DIRECT user-buffer DMA**：满足 4KB 对齐请求合约且底层覆盖 2MB 注册成功时绕过 Block Cache，直接用用户 buffer 作为 SPDK NVMe read/write payload；不满足时返回错误
 - **O_TRUNC**：`truncate_inode()` 释放所有数据块并重置 file_size
 - **O_APPEND**：在 write dispatch 时 `lseek(SEEK_END)` 后写入
 - **fsync**：per-file 精确刷写（遍历 extent → `bc_flush_block` + `ic_flush_inode`）
@@ -1757,13 +1788,31 @@ lat_us p50=9 p90=9 p99=13 max=102
 
 解释：开启抢占后，在一个 1s CPU-bound uthread 干扰下，连续 4KB O_DIRECT reads 不再被卡住，IOPS 从约 1.97K 提升到约 105.5K，最大延迟从约 1s 降到约 102us。
 
-### 8.5 2026-05-06 当前 FIO 状态
+### 8.5 2026-05-15 当前 FIO / Direct IO 状态
 
-- `junction/fs/mytest/benchmark/fio` 是独立 FIO git 仓库；当前已执行 `toggle_fio.sh apply`，所以子仓库 `git status --short` 显示 `M filesetup.c` 和 `M helper_thread.c` 是预期状态。
-- `junction/fs/mytest/benchmark/patch/fio_changes.patch` 已保存这两处源码修改，可用 `toggle_fio.sh revert` 恢复 FIO tracked 源码。
+- `junction/fs/mytest/benchmark/fio` 是独立 FIO git 仓库；当前已执行 `toggle_fio.sh apply`，所以子仓库 `git status --short` 显示 `M filesetup.c`、`M helper_thread.c`、`M memory.c` 是预期状态。
+- `junction/fs/mytest/benchmark/patch/fio_changes.patch` 已保存这三处源码修改，可用 `toggle_fio.sh revert` 恢复 FIO tracked 源码。
 - `config-host.h` 和 `config-host.mak` 当前包含 `CONFIG_NO_SHM`，表示已用 `./configure --disable-shm` 构建 Junction 适配版。
 - 当前已构建的 FIO 二进制可执行，`fio --version` 输出 `fio-3.42-22-g7215-dirty`。
-- 本次会话中曾验证过一个接近目标参数的 FIO 命令可在 Junction 中跑完并输出报告。历史性能数字不写入本文档；后续正式 benchmark 必须重新运行并保存原始输出。
+- 当前 `junction/fs/mytest/benchmark/fio_test/directio.fio` 配置为 `ioengine=psync`、`thread=1`、`numjobs=16`、`directory=FSHAO/`、`rw=randread`、`bs=4k`、`direct=1`、`runtime=60`、`size=2G`。
+- 2026-05-15 本轮在 spinlock 修复后复跑该配置，命令形态为：
+
+```bash
+cd /home/syh/MyProj1/junction/build/junction
+printf 'syh2syh\n' | sudo -S timeout 100s ./junction_run caladan_test.config -- \
+  ../../junction/fs/mytest/benchmark/fio/fio \
+  ../../junction/fs/mytest/benchmark/fio_test/directio.fio
+```
+
+观察结果：
+
+```text
+storage: enabled direct DMA into user buffers
+Run status group 0 (all jobs):
+   READ: bw=852MiB/s (893MB/s), io=49.9GiB (53.6GB), run=60000-60001msec
+```
+
+单 job 约 `13.6k IOPS`、聚合约 `218k IOPS`，`junction_run` 退出码 0，没有 timeout。测试后已执行 `pkill -9 iokerneld`，并确认无 `iokerneld` / `junction_run` 残留。该结果证明当前项目和 FIO Direct IO 适配能稳定跑完同一测试；正式论文 benchmark 仍需重新固定构建开关、设备状态、Junction config 和保存完整 stdout/stderr。
 
 ### 8.6 2026-05-13 当前 Filebench 状态
 
@@ -1863,7 +1912,7 @@ bench_seq_rw 32: Write 0.4978s, 64.29 MB/s, 16457 IOPS; Read 0.0034s, 9467.46 MB
 4. **无 `unlink` / `rmdir`**：`dir_delete_entry` 存在但未接入 VFS dispatch
 5. **无 `getdents64`**：目录列表需要直接读取 Dirent 结构
 6. **时间戳全为 0**：DInode 有 atime/mtime/ctime 字段但无代码设置
-7. **O_DIRECT user-buffer DMA 适用范围有限**：当前已实现严格约束下的 direct user-buffer DMA，但要求 buffer 2MB 对齐、长度 2MB 倍数、offset 4KB 对齐；Filebench 等通用 benchmark 不一定天然满足这些约束，需专门确认
+7. **O_DIRECT user-buffer DMA 适用范围有限**：当前已实现严格约束下的 direct user-buffer DMA；请求层要求 `buf`/`len`/`offset` 4KB 对齐，但底层仍会对覆盖区间按 2MB 粒度注册。FIO 已做 2MB arena 适配；Filebench 等通用 benchmark 不一定天然满足这些约束，需专门确认
 8. **FIO 适配是源码补丁而非上游通用修复**：当前只保证本项目常用参数（特别是 `--thread=1`、psync、ShaOFS 路径）可跑通；不要默认它覆盖 FIO 全部 job 组合。
 9. **`MYPREFIX` 与测试路径书写存在历史不一致**：当前代码定义为 `"FSHAO"`，`SHAOFS_REALPATH()` 已兼容 `FSHAO/...` 与 `FSHAO:/...`，但 FIO 当前源码仍将未转义 `:` 作为 filename/directory 分隔符，因此 FIO 命令建议写 `FSHAO/`；若恢复 `FSHAO:`，必须设计并验证 FIO 参数转义方案。
 10. **`IO_PREEMPT` 只在特定场景下显著收益**：它主要解决 CPU-bound uthread 阻塞 SPDK completion poll 的问题；没有 CPU-bound 干扰、kthread 充足或大块顺序吞吐场景下，收益可能较小甚至需要评估额外 UIPI 开销。
@@ -1909,8 +1958,8 @@ bench_seq_rw 32: Write 0.4978s, 64.29 MB/s, 16457 IOPS; Read 0.0034s, 9467.46 MB
 - 在不同 `busy_us`、kthread 数、CPU-bound uthread 数、I/O 深度下扫参数，找出机制收益边界。
 
 **Task 7: 验证并优化 O_DIRECT user-buffer DMA**
-- 用最小 C 测试程序显式分配 2MB 对齐 buffer、长度 2MB 倍数，确认 `storage: enabled direct DMA into user buffers` 日志和 `NVMe SSD ↔ user buffer` 数据正确性。
-- 确认 Filebench `directio=1` 是否满足当前 2MB user-buffer 合约；若不满足，需要在 Filebench 适配层控制 buffer 对齐/长度，或明确该 workload 不用于验证 user-buffer DMA。
+- 用 `shaofs_direct_io_example.c` / `test_user_dma_direct.c` 或新的最小 C 测试程序显式分配 2MB 对齐 arena，并传入 4KB 对齐子区间，确认 `storage: enabled direct DMA into user buffers` 日志和 `NVMe SSD ↔ user buffer` 数据正确性。
+- 确认 Filebench `directio=1` 是否满足当前 4KB 请求对齐 + 2MB 覆盖注册合约；若不满足，需要在 Filebench 适配层控制 buffer 对齐/arena 大小，或明确该 workload 不用于验证 user-buffer DMA。
 - cached/direct 一致性当前使用 `bc_flush_block()` 和 `bc_invalidate_block()`，正确但可能增加 direct path CPU 开销。后续可考虑仅在 cache entry dirty 时 flush，或在 direct read 命中 clean cache 时直接从 cache 返回。
 
 **Task 8: 评估 IOKernel completion 检查开销**
@@ -1971,20 +2020,20 @@ bench_seq_rw 32: Write 0.4978s, 64.29 MB/s, 16457 IOPS; Read 0.0034s, 9467.46 MB
 | 文件 | 修改类型 | 说明 |
 |------|----------|------|
 | `shaofs/group.cc` | Bug fix + perf | 移除热路径 log_info；`alloc_block` 中 write_access 移到 kguard 之前 |
-| `shaofs/file.cc` | Perf + feature | 拆分 file_write 锁范围；新增 truncate_inode + free_inode_data_blocks；新增 file_read/write_direct |
+| `shaofs/file.cc` | Perf + feature | 拆分 file_write 锁范围；新增 truncate_inode + free_inode_data_blocks；新增 file_read/write_direct；当前 O_DIRECT 请求层要求 `buf`/`len`/`offset` 4KB 对齐，底层按覆盖 2MB 区间注册 |
 | `shaofs/file.h` | Feature | 新增 file_read/write_direct, truncate_inode 声明 |
-| `shaofs/inode.h` | Perf + refactor | MInode 新增 extent_hint、hint_lock 和 has_dirty_data_cache；dir_mtx 从 mutex_t 升级为 rwmutex_t |
+| `shaofs/inode.h` | Perf + refactor | MInode 新增 extent_hint、hint_lock 和 has_dirty_data_cache；dir_mtx 从 mutex_t 升级为 rwmutex_t；extent_hint try-lock 当前使用 `spin_try_lock_np()` |
 | `shaofs/inode.cc` | Bug fix | `alloc_inum()` 按 `INODENUM=32768` 全范围环形扫描 inode bitmap，避免把 inode cache 容量 8192 误当作 inode 上限 |
-| `shaofs/extent.cc` | Perf + bug fix | inode_bmap_locked 增加 hint fast path；普通文件 EOF append 路径加入 16/64/128 blocks 批量预分配、预清零和失败回滚，缓解 Filebench append-heavy extent 溢出 |
+| `shaofs/extent.cc` | Perf + bug fix | inode_bmap_locked 增加 hint fast path；普通文件 EOF append 路径加入 16/64/128 blocks 批量预分配、预清零和失败回滚，缓解 Filebench append-heavy extent 溢出；hint lock 当前使用 `spin_try_lock_np()` |
 | `shaofs/inodeCache.cc` | Bug fix + feature | ic_free_inode 实现完整块释放；新增 ic_flush_inode |
 | `shaofs/inodeCache.h` | Feature | 新增 ic_flush_inode 声明 |
 | `shaofs/dir.h` | Refactor | 新增 dirent_is_empty()；移除未实现的 _locked 声明 |
 | `shaofs/dir.cc` | Refactor + bug fix | 全面重写：DirReadGuard/DirWriteGuard + rwmutex；dir_foreach_locked；dirent_is_empty |
 | `shaofs/syscall.h` | Feature | 新增 my_fstat, my_newfstatat, my_fsync |
 | `shaofs/syscall.cc` | Feature + perf | 实现 fstat/newfstatat/fsync；移除热路径日志；my_read/write 支持 direct 分派 |
-| `shaofs/blockCache.h` | Feature + fix | NVMeSSD 后端改用 DMA_read/write_block；新增 bc_flush_block |
+| `shaofs/blockCache.h` | Feature + fix | NVMeSSD 后端改用 DMA_read/write_block；新增 bc_flush_block；BlockPool freelist 短临界区使用 `SpinGuardNP` |
 | `shaofs/blockCache.cc` | Feature | 新增 bc_flush_block；新增 bc_invalidate_block 用于 direct write 后失效旧 cache entry；CRASH_CONSISTENCY=1 时 metadata block 写回走 journal |
-| `generic_cache/cache.h` | Feature | 新增 flush_entry(key) |
+| `generic_cache/cache.h` | Feature + concurrency | 新增 flush_entry(key)；shard metadata lock 使用 `spin_lock_np()`，backend I/O 保持在 shard lock 外 |
 | `generic_cache/sharded_cache.h` | Feature | 转发 flush_entry |
 | `junction/fs/file.cc` | Feature | usys_read/write/pread64/pwrite64 传递 O_DIRECT flag；usys_fstat/newfstatat/fsync 添加 SHAOFS dispatch；newfstatat 使用 SHAOFS_REALPATH |
 | `junction/fs/file.cc` | Feature | 新增 `usys_sync()`，调用 `shaofs_sync_all()` 全局刷写 ShaOFS 脏状态 |
@@ -2003,7 +2052,7 @@ bench_seq_rw 32: Write 0.4978s, 64.29 MB/s, 16457 IOPS; Read 0.0034s, 9467.46 MB
 | `shaofs/journal.cc` | New | metadata-only redo journal、dirty mount marker、transaction replay、dirty repair |
 | `shaofs/file.cc` | Crash consistency | final_flush 通过 journal 写 imap，clean shutdown 清 dirty marker；目录块分配后登记为 metadata block |
 | `shaofs/file.cc` / `shaofs/file.h` | Feature | 新增 `shaofs_sync_all()`；与 `final_flush()` 共用 `flush_all_dirty_state()`，但 runtime `sync()` 不清 dirty marker |
-| `shaofs/group.cc` | Crash consistency | GDT sync 改为 `journal_write_metadata()` |
+| `shaofs/group.cc` | Crash consistency + concurrency | GDT sync 改为 `journal_write_metadata()`；group bitmap/free counter 短临界区使用 `SpinGuardNP` |
 | `/home/syh/mkfs/fs.h` | Crash consistency | mkfs 侧 SuperBlock 同步新增 journal 字段和 `DEFAULT_JOURNAL_BLOCKS` |
 | `/home/syh/mkfs/mkfs.c` | Crash consistency | mkfs 在盘尾预留并清空 journal 区，data group 只使用 journal 前空间 |
 | `junction/fs/mytest/journal_layout_probe.c` | New test | 验证 journal superblock 布局可 mount |
@@ -2011,6 +2060,7 @@ bench_seq_rw 32: Write 0.4978s, 64.29 MB/s, 16457 IOPS; Read 0.0034s, 9467.46 MB
 | `junction/fs/mytest/journal_recovery_check.c` | New test | 验证 dirty mount repair 后目录、文件大小和数据内容 |
 | `junction/fs/mytest/benchmark/fio/filesetup.c` | FIO adapter | 补丁后识别 `FSHAO/`、`FSHAO:/`，并容忍 ShaOFS 上 `ftruncate` 不支持 |
 | `junction/fs/mytest/benchmark/fio/helper_thread.c` | FIO adapter | 补丁后 `timerfd_create/settime` 失败不再 assert，回退 select timeout |
+| `junction/fs/mytest/benchmark/fio/memory.c` | FIO adapter | 补丁后 `direct=1` 且 malloc 内存模式下使用 2MB 对齐、按 2MB 向上取整的 buffer，满足 ShaOFS 底层 2MB 注册要求 |
 | `junction/fs/mytest/benchmark/patch/fio_changes.patch` | Handover artifact | 保存 FIO 适配源码补丁 |
 | `junction/fs/mytest/benchmark/patch/toggle_fio.sh` | Tooling | 一键 apply/revert FIO 补丁，并自动重新 configure/make |
 | `junction/fs/mytest/benchmark/filebench/aslr.c` | Filebench adapter | 补丁后不再调用 `personality()` 禁用 ASLR，要求宿主环境全局关闭 ASLR |
@@ -2038,8 +2088,8 @@ bench_seq_rw 32: Write 0.4978s, 64.29 MB/s, 16457 IOPS; Read 0.0034s, 9467.46 MB
 | `/home/syh/fs_test/scripts/run_ext4_filebench_fileserver_cgroup.sh` | Benchmark tooling | repo 外部 ext4 fileserver 对比脚本，包含 ext4 reset、临时 WML `$dir` 替换、cgroup v2 CPU/memory 限制、log/CSV 输出 |
 | `lib/caladan/inc/base/syscall.h` / `lib/caladan/base/syscall.S` | User DMA support | Caladan wrapper 当前包含 `syscall_mlock()`，供 `storage_prepare_user_dma()` pin 用户页 |
 | `junction/syscall/seccomp.cc` | User DMA support | seccomp allowlist 当前包含 Caladan `mlock`，并按 request 放行 VFIO DMA map/unmap ioctl |
-| `lib/caladan/runtime/storage.c` | User DMA support | 新增 user DMA registration cache、`storage_prepare_user_dma()`、`storage_read_aligned()`、`storage_write_user_dma()` |
-| `lib/caladan/inc/runtime/storage.h` | User DMA support | 声明 user-buffer DMA 相关 storage API |
+| `lib/caladan/runtime/storage.c` | User DMA support + concurrency | 新增 user DMA registration cache、`storage_prepare_user_dma()`、`storage_read_aligned()`、`storage_write_user_dma()`；当前按用户 4KB 子区间计算覆盖 2MB 注册范围，`user_dma_lock` 使用 `spin_lock_np()` |
+| `lib/caladan/inc/runtime/storage.h` | User DMA support | 声明 user-buffer DMA 相关 storage API；注释说明用户传入 4KB 对齐子区间，底层按覆盖的 2MB 区间注册 |
 | `junction/fs/file.h` | User DMA support | `File` 内嵌 `DirectReadHint`，供 ShaOFS O_DIRECT read fast path 使用 |
 | `junction/fs/core.cc` | User DMA support | ShaOFS O_DIRECT open 时调用 `file_prepare_direct_read_hint()` |
 | `junction/fs/file.cc` | User DMA support | ShaOFS O_DIRECT read/pread 优先使用 `file_read_direct_hint()`；write 时使 hint invalid |
@@ -2057,6 +2107,8 @@ bench_seq_rw 32: Write 0.4978s, 64.29 MB/s, 16457 IOPS; Read 0.0034s, 9467.46 MB
 | `junction/fs/shaofs/utili.h` | FS base fix | `RuntimeFSBaseGuard` 更新 `runtime_fsbase_depth`，只在切换窗口短暂禁用抢占，guard 内允许 yield |
 | `junction/fs/mytest/test_many_inodes.c` | New test | 验证创建大量 inode 能越过 inode cache 容量 |
 | `junction/fs/mytest/test_many_inodes_read_threads.c` | New test | 大量小文件创建后多 pthread 读整文件并校验数据 |
+| `junction/fs/mytest/shaofs_direct_io_example.c` | New example | 最小 ShaOFS O_DIRECT 示例：2MB arena 内 4KB 子区间 pwrite/pread |
+| `junction/fs/mytest/test_user_dma_direct.c` | New test | 验证 2MB arena、4KB 子区间和非 4KB 对齐拒绝等 Direct user-buffer DMA 合约 |
 
 ---
 
@@ -2089,8 +2141,8 @@ bash -n junction/fs/mytest/benchmark/patch/toggle_fio.sh
 - 顶层 git 工作区当前有大量既有未提交/未跟踪文件；本次交接整理只修改了 `HANDOVER.md`。
 - `junction/fs/shaofs/dml_utili.h` 当前不存在，旧文档中对它的引用已移除。
 - `junction/fs/shaofs/fs.h` 当前 `MYPREFIX` 是 `"FSHAO"`。
-- FIO 适配补丁文件存在，大小为 120 行，覆盖 `filesetup.c` 和 `helper_thread.c`。
-- 当前 FIO 子仓库处于补丁已应用状态，`git -C junction/fs/mytest/benchmark/fio status --short` 显示两个预期 modified 文件。
+- FIO 适配补丁在 2026-05-06 交接时覆盖 `filesetup.c` 和 `helper_thread.c`；该状态已在 2026-05-15 被后续 Direct IO 适配更新。当前状态请以第 8.5 / 第 18 章为准：`fio_changes.patch` 覆盖 `filesetup.c`、`helper_thread.c`、`memory.c`。
+- 当前 FIO 子仓库处于补丁已应用状态，`git -C junction/fs/mytest/benchmark/fio status --short` 应显示三个预期 modified 文件。
 - 当前 FIO 构建配置包含 `CONFIG_NO_SHM`，用于绕过 Junction 不支持的 SysV shm 路径。
 - `toggle_fio.sh` 通过 `bash -n` 语法检查。
 
@@ -2320,7 +2372,7 @@ sed -n '/SHAOFS_IO_PREEMPT/,+2p;/SHAOFS_CRASH_CONSISTENCY/,+2p' build/CMakeCache
 
 ---
 
-## 第十五章：2026-05-12 user-buffer DMA / Filebench randomread / syscall 交接整理验证记录
+## 第十五章：2026-05-12 / 2026-05-15 user-buffer DMA / Filebench randomread / syscall 交接整理验证记录
 
 ### 15.1 本次实际检查过的内容
 
@@ -2361,24 +2413,25 @@ sed -n '/SHAOFS_IO_PREEMPT/p;/SHAOFS_CRASH_CONSISTENCY/p' build/CMakeCache.txt
 ### 15.2 本次确认的客观状态
 
 - `file_read_direct()` / `file_write_direct()` 当前调用 `storage_prepare_user_dma()`，并在实际 I/O 中调用 `storage_read_aligned()` / `storage_write_user_dma()`；旧文档中“direct I/O 仍总是经过 SPDK bounce buffer memcpy”的描述已不符合当前代码。
-- user-buffer DMA 合约由 `user_dma_request_ok()` 强制：`buf` 2MB 对齐、`len` 是 2MB 倍数、`offset` 4KB 对齐。
-- `storage_prepare_user_dma()` 当前使用 `syscall_mlock()`、`spdk_mem_register()`、`spdk_vtophys()` 和 2MB 页粒度 cache。
+- user-buffer DMA 合约由 `user_dma_request_ok()` 强制：当前请求层要求 `buf` 4KB 对齐、`len` 是 4KB 倍数、`offset` 4KB 对齐。
+- `storage_prepare_user_dma()` 当前使用 `syscall_mlock()`、`spdk_mem_register()`、`spdk_vtophys()` 和 2MB 页粒度 cache；它会先计算覆盖实际用户子区间的 2MB 注册范围，再对该注册范围 pin/register。
 - `junction/syscall/seccomp.cc` 当前 allowlist 包含 `ALLOW_CALADAN_SYSCALL(mlock)`，并按 request 放行 `VFIO_IOMMU_MAP_DMA` 和 `VFIO_IOMMU_UNMAP_DMA`。
 - `junction/fs/core.cc:usys_openat()` 在 ShaOFS O_DIRECT open 时调用 `file_prepare_direct_read_hint()`；`junction/fs/file.cc` 在 direct read/pread 时优先使用 `file_read_direct_hint()`，write 时使 hint invalid。
 - Filebench patch 当前覆盖 9 个源文件，包括 `flag.h`；旧文档中“覆盖 8 个源文件”的说法已修正。
 - `junction/fs/mytest/benchmark/filebench_wml/shaofs_randomread*.f` 当前存在但为 untracked 工作区文件。
 - `/home/syh/fs_test/scripts/run_ext4_filebench_randomread_cgroup.sh` 当前存在于 repo 外部，默认使用 1 核、300MB 内存、direct I/O 和 Filebench randomread 形态。
 - 当前 `build/CMakeCache.txt` 中 `SHAOFS_IO_PREEMPT:BOOL=ON`，`SHAOFS_CRASH_CONSISTENCY:BOOL=ON`。
-- 本次整理中有多条 `find` / `ls` / `rg` 命令因当前 sandbox 的 `bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted` 失败；随后使用 `git status`、`sed` 和定点文件读取完成了必要核对。
+- 2026-05-15 已新增并运行过最小 Direct IO 示例/回归测试：`shaofs_direct_io_example.c` 和 `test_user_dma_direct.c`。其中 `test_user_dma_direct.c` 覆盖 2MB 对齐 arena、arena 内 4KB 子区间、arena 尾部 4KB 子区间、非 4KB 长度拒绝、非 4KB 地址拒绝、4KB offset 接受等场景。
+- 本次整理中有多条 `find` / `ls` / `rg` 命令因当前 sandbox 的 `bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted` 失败；随后使用 `git status`、`sed`、`rg` 和定点文件读取完成了必要核对。
 
 ### 15.3 本次未重新验证的内容
 
 - 未重新运行 `scripts/build.sh` 或 CMake build。
 - 未启动 IOKernel。
 - 未重新运行 ShaOFS / Filebench / FIO / ext4 benchmark。
-- 未运行最小 user-buffer DMA 正确性测试；因此本次只确认代码路径存在，未确认当前机器运行时一定成功打印 `storage: enabled direct DMA into user buffers`。
+- 2026-05-15 已通过 FIO Direct IO 复测确认当前机器运行时会打印 `storage: enabled direct DMA into user buffers`，但本章没有保存完整原始 stdout 到文件；正式实验仍需保存日志。
 - 虽然已确认当前 build cache 两个 ShaOFS 开关都是 ON，接手者做正式实验前仍应重新 `cmake -S . -B build ...` 固化开关，避免继承旧 cache 状态。
-- 未确认 Filebench `directio=1` 是否满足 ShaOFS 当前 2MB user-buffer DMA 合约；正式 randomread 测试前应单独验证。
+- 未确认 Filebench `directio=1` 是否满足 ShaOFS 当前 4KB 请求对齐 + 2MB 覆盖注册合约；正式 randomread 测试前应单独验证。
 
 ---
 
@@ -2547,3 +2600,99 @@ enable_storage 1
 - 未调整 `caladan_test.config` 到多 runtime kthread，因此未确认 FxMark/ShaOFS 的真实多核扩展性。
 - 未重新跑 Filebench、FIO、ext4 对比或 ShaOFS 全量单元测试。
 - 未重新格式化磁盘后重复 FxMark 多轮统计；当前结果只作为跑通 smoke 记录。
+
+---
+
+## 第十八章：2026-05-15 Direct IO / FIO / spinlock 审计最终交接记录
+
+### 18.1 本次实际检查过的内容
+
+```bash
+sed -n '1,2549p' HANDOVER.md
+git -C /home/syh/MyProj1/junction status --short
+sed -n '1,45p;460,720p' junction/fs/shaofs/file.cc
+sed -n '1,210p' lib/caladan/runtime/storage.c
+sed -n '1,120p' lib/caladan/inc/runtime/storage.h
+sed -n '1,220p' junction/fs/mytest/benchmark/patch/fio_changes.patch
+git -C junction/fs/mytest/benchmark/fio status --short
+git -C junction/fs/mytest/benchmark/fio diff --stat
+sed -n '1,80p' junction/fs/mytest/benchmark/fio_test/directio.fio
+sed -n '1,180p' junction/fs/mytest/shaofs_direct_io_example.c
+sed -n '1,220p' junction/fs/mytest/test_user_dma_direct.c
+rg -n 'spin_lock_np|SpinGuardNP|user_dma_request_ok|storage_prepare_user_dma' \
+  junction/fs/shaofs lib/caladan/runtime/storage.c lib/caladan/inc/runtime/storage.h
+rg -n 'SHAOFS_IO_PREEMPT|SHAOFS_CRASH_CONSISTENCY' build/CMakeCache.txt
+git -C /home/syh/MyProj1/junction diff --check -- HANDOVER.md
+```
+
+### 18.2 本轮会话中已运行过的关键构建和测试
+
+已运行并确认过的关键项：
+
+- 修改 ShaOFS spinlock 后执行：
+
+```bash
+cmake --build build --target junction_run -- -j$(nproc)
+```
+
+构建成功；只出现既有 `ObjectPool` / `offsetof` 相关 warning。
+
+- 对 FIO 执行：
+
+```bash
+/home/syh/MyProj1/junction/junction/fs/mytest/benchmark/patch/toggle_fio.sh apply
+```
+
+该脚本成功应用 `fio_changes.patch`，执行 `./configure --disable-shm`，并 `make -j 128` 构建成功。当前 FIO 子仓库处于 patch-applied 状态：
+
+```text
+ M filesetup.c
+ M helper_thread.c
+ M memory.c
+```
+
+- 启动 IOKernel：
+
+```bash
+cd /home/syh/MyProj1/junction
+printf 'syh2syh\n' | sudo -S lib/caladan/iokerneld ias
+```
+
+- 在另一个 shell 使用 `timeout` 运行同一 FIO Direct IO 测试：
+
+```bash
+cd /home/syh/MyProj1/junction/build/junction
+printf 'syh2syh\n' | sudo -S timeout 100s ./junction_run caladan_test.config -- \
+  ../../junction/fs/mytest/benchmark/fio/fio \
+  ../../junction/fs/mytest/benchmark/fio_test/directio.fio
+```
+
+观察结果：
+
+```text
+storage: enabled direct DMA into user buffers
+Run status group 0 (all jobs):
+   READ: bw=852MiB/s (893MB/s), 53.2MiB/s-53.3MiB/s (55.8MB/s-55.9MB/s), io=49.9GiB (53.6GB), run=60000-60001msec
+```
+
+该次 `junction_run` 退出码为 0，没有 timeout。测试结束后已执行 `pkill -9 iokerneld`，并用 `pgrep -a iokerneld` / `pgrep -a junction_run` 确认无残留。
+
+### 18.3 本次确认的客观状态
+
+- `junction/fs/shaofs/file.cc::user_dma_request_ok()` 当前请求层只检查 `offset`、`buf`、`len` 的 4KB 对齐，不再要求用户传入的 `buf` 本身 2MB 对齐或 `len` 是 2MB 倍数。
+- `lib/caladan/runtime/storage.c::user_dma_registration_range()` 会对实际 `[buf, buf+len)` 计算覆盖 2MB 注册范围；`storage_register_user_dma()` 对该范围执行 `mlock()` 和 `spdk_mem_register()`，但用 `spdk_vtophys()` 验证实际用户请求子区间。
+- `user_dma_lock` 当前使用 `spin_lock_np()`；慢操作 `mlock()`、`spdk_mem_register()`、`spdk_vtophys()` 不在该锁内。
+- `junction/fs/shaofs/utili.h` 当前新增 `SpinGuardNP`。
+- 已改为不可抢占短临界区的 ShaOFS 锁包括：`BlockPool::alloc/free`、`group.cc` 中的 group bitmap/free counter、`inode.h` / `extent.cc` 的 extent hint、`dsa.cc` 的 DSA request pool 初始化锁，以及此前已经改过的 generic cache shard metadata lock。
+- `journal.cc` 中的 `journal_lock` / `metadata_lock` 仍使用 `SpinGuard`。这是有意保留：`journal_lock` 会跨 `storage_write()`，不能直接换成 `_np`。
+- `build/CMakeCache.txt` 当前仍为 `SHAOFS_IO_PREEMPT:BOOL=ON`、`SHAOFS_CRASH_CONSISTENCY:BOOL=ON`。
+- `junction/fs/mytest/benchmark/patch/fio_changes.patch` 当前 158 行，覆盖 `filesetup.c`、`helper_thread.c`、`memory.c`。
+- `junction/fs/mytest/shaofs_direct_io_example.c` 和 `junction/fs/mytest/test_user_dma_direct.c` 当前在顶层 git 状态中是 untracked；它们是本轮 Direct IO 说明/验证的重要文件，接手者应决定是否纳入版本控制。
+
+### 18.4 本次未重新验证的内容
+
+- 未重新运行完整 ShaOFS 单元测试套件。
+- 未重新运行 Filebench、FxMark、ext4 对比或 `IO_PREEMPT` ON/OFF 对比。
+- FIO Direct IO 只复跑了 `directio.fio` 这一组 16 job 4KB random read；未扫线程数、读写混合、不同 bs、不同 runtime kthread 配置。
+- 没有把 FIO 原始 stdout/stderr 保存到结果文件；正式实验需要保存完整日志、Junction config、CMake cache、patch 状态和设备状态。
+- FIO patch 当前保持 applied 状态；如需要恢复 FIO 子仓库 clean 状态，请执行 `junction/fs/mytest/benchmark/patch/toggle_fio.sh revert`。
