@@ -224,6 +224,25 @@ int my_mkdir(const char *pathname, mode_t mode)
     return 0;
 }
 
+int my_unlink(const char *pathname)
+{
+    RuntimeFSBaseGuard g;
+
+    char name[NAMESIZ];
+    int parent_inum = nameiparent(pathname, name);
+    if (parent_inum == -1) return -ENOENT;
+
+    file_type_t type;
+    int inum = dir_lookup(parent_inum, name, &type);
+    if (inum == -1) return -ENOENT;
+    if (type == DIRECTORY) return -EISDIR;
+
+    if (dir_delete_entry(parent_inum, name) != 0) return -ENOENT;
+    if (!ic_free_inode(inum)) return -EIO;
+
+    return 0;
+}
+
 off_t my_lseek(int inum, off_t offset, int whence, off_t old_off)
 {
     RuntimeFSBaseGuard g;

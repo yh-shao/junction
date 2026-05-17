@@ -437,6 +437,7 @@ long usys_mkdirat(int dirfd, const char *pathname, mode_t mode) {
 long usys_unlink(const char *pathname) {
   std::string_view pathnamev(pathname);
   if (pathnamev == "") return -ENOENT;
+  if (const char* realpath = SHAOFS_REALPATH(pathname)) return my_unlink(realpath);
   Status<Entry> entry = LookupEntry(myproc().get_fs(), pathnamev);
   if (!entry) return MakeCError(entry);
   Status<void> ret = Unlink(*entry);
@@ -453,6 +454,10 @@ long usys_rmdir(const char *pathname) {
 }
 
 long usys_unlinkat(int dirfd, const char *pathname, int flags) {
+  if ((flags & kAtRemoveDir) == 0) {
+    if (const char* realpath = SHAOFS_REALPATH(pathname)) return my_unlink(realpath);
+  }
+
   Status<Entry> entry = LookupEntry(myproc(), dirfd, pathname);
   if (!entry) return MakeCError(entry);
 
