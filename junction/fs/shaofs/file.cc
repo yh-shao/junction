@@ -465,7 +465,6 @@ ssize_t file_read_direct(int inum, char* buf, off_t offset, size_t len)
 {
     if (len == 0) return 0;
     if (!user_dma_request_ok(buf, offset, len)) return -EINVAL;   // O_DIRECT 使用严格的用户 buffer DMA 合约；不满足条件或注册失败时直接返回错误。
-    if (storage_prepare_user_dma(buf, len) != 0) return -EIO;
 
     InodeHandle ih = ic_get_inode(inum);
     if (unlikely(!ih)) return -1;
@@ -557,7 +556,6 @@ ssize_t file_read_direct_hint(const DirectReadHint* hint, char* buf, off_t offse
     if (!hint || !hint->valid) return -1;
     if (len == 0) return 0;
     if (!user_dma_request_ok(buf, offset, len)) return -EINVAL;
-    if (storage_prepare_user_dma(buf, len) != 0) return -EIO;
     if (static_cast<uint64_t>(offset) >= hint->file_size) return 0;
 
     RuntimeFSBaseGuard g;
@@ -623,7 +621,6 @@ ssize_t file_write_direct(int inum, const char* buf, off_t offset, size_t len)
 {
     if (len == 0) return 0;
     if (!user_dma_request_ok(buf, offset, len)) return -EINVAL;
-    if (storage_prepare_user_dma(const_cast<char*>(buf), len) != 0) return -EIO;
 
     InodeHandle ih = ic_get_inode(inum);
     if (unlikely(!ih)) 
