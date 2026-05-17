@@ -5,6 +5,7 @@
 #include "extent.h"
 #include <vector>
 #include <utility>
+#include <sys/uio.h>
 #include "group.h"
 #include "dsa.h"
 #include "journal.h"
@@ -12,6 +13,7 @@
 #include <boost/container/small_vector.hpp>
 extern "C" {
 #include "runtime/runtime.h"
+#include "runtime/storage.h"
 }
 
 static inline bool user_dma_request_ok(const void* buf, off_t offset, size_t len)
@@ -615,6 +617,81 @@ ssize_t file_read_direct_hint(const DirectReadHint* hint, char* buf, off_t offse
     }
 
     return bytes_read;
+}
+
+static ssize_t file_readv_direct_scalar(int inum, const struct iovec* iov, int iovcnt, off_t offset)
+{
+    uint64_t total_len = 0;
+    off_t cursor = offset;
+
+    for (int i = 0; i < iovcnt; i++)
+    {
+        if (iov[i].iov_len == 0) continue;
+
+        ssize_t ret = file_read_direct(inum, static_cast<char*>(iov[i].iov_base), cursor, iov[i].iov_len);
+        if (ret < 0) return total_len ? static_cast<ssize_t>(total_len) : ret;
+
+        total_len += ret;
+        cursor += ret;
+        if (static_cast<size_t>(ret) < iov[i].iov_len) break;
+    }
+
+    return total_len;
+}
+
+ssize_t file_readv_direct(int inum, const struct iovec* iov, int iovcnt, off_t offset)
+{
+    if (!iov || iovcnt <= 0 || offset < 0) return -EINVAL;
+
+    RuntimeFSBaseGuard g;
+
+    InodeHandle ih = ic_get_inode(inum);
+    if (unlikely(!ih)) return -1;
+
+    boost::container::small_vector<storage_batch_read, 64> reqs;
+    uint64_t total_len = 0;
+    uint64_t cursor = offset;
+    bool scalar_fallback = false;
+
+    {
+        auto read_acc = ih.read_access();
+        if (!read_acc->used || static_cast<uint64_t>(offset) >= read_acc->file_size) return 0;
+
+        if (atomic_read(&ih.get_entry()->data.has_dirty_data_cache))
+        {
+            scalar_fallback = true;
+        }
+        else
+        {
+            for (int i = 0; i < iovcnt; i++)
+            {
+                if (iov[i].iov_len == 0) continue;
+                if (!user_dma_request_ok(iov[i].iov_base, cursor, iov[i].iov_len)) return total_len ? static_cast<ssize_t>(total_len) : -EINVAL;
+                if (cursor >= read_acc->file_size) break;
+
+                uint64_t req_len = MIN(static_cast<uint64_t>(iov[i].iov_len), read_acc->file_size - cursor);
+                if ((req_len & (BLOCK_SIZE - 1)) != 0) break;
+
+                uint64_t logical_blk = cursor / BLOCK_SIZE;
+                BlockID phys_blk = inode_bmap_locked(const_cast<MInode*>(&(*read_acc)), logical_blk, false, nullptr);
+                if (phys_blk == INVALID_BLOCK_ID)
+                {
+                    scalar_fallback = total_len == 0;
+                    break;
+                }
+
+                reqs.push_back({iov[i].iov_base, phys_blk, static_cast<uint32_t>(req_len / BLOCK_SIZE)});
+                total_len += req_len;
+                cursor += req_len;
+            }
+        }
+    }
+
+    if (scalar_fallback) return file_readv_direct_scalar(inum, iov, iovcnt, offset);
+    if (reqs.empty()) return file_readv_direct_scalar(inum, iov, iovcnt, offset);
+    
+    if (storage_read_aligned_batch(reqs.data(), reqs.size()) != 0) return -EIO;
+    return total_len;
 }
 
 ssize_t file_write_direct(int inum, const char* buf, off_t offset, size_t len)

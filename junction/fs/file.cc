@@ -245,6 +245,31 @@ ssize_t usys_readv(int fd, struct iovec *iov, int iovcnt) {
   FileTable &ftbl = myproc().get_file_table();
   File *f = ftbl.Get(fd);
   if (unlikely(!f || !f->is_readable())) return -EBADF;
+  if (unlikely(iovcnt < 0)) return -EINVAL;
+  if (iovcnt == 0) return 0;
+
+  if (f->get_inode() && f->get_inode()->get_mode() == SHAOFS) 
+  {
+    bool direct = f->get_flags() & kFlagDirect;
+    if (direct) 
+    {
+      ssize_t ret = file_readv_direct(f->get_inode()->get_inum(), iov, iovcnt, f->get_off_ref());
+      if (ret >= 0) f->get_off_ref() += ret;
+      return ret;
+    }
+
+    ssize_t total = 0;
+    for (int i = 0; i < iovcnt; i++) 
+    {
+      if (!iov[i].iov_len) continue;
+      ssize_t ret = my_read(f->get_inode()->get_inum(), iov[i].iov_base, &f->get_off_ref(), iov[i].iov_len, false);
+      if (ret < 0) return total ? total : ret;
+      total += ret;
+      if (static_cast<size_t>(ret) < iov[i].iov_len) break;
+    }
+    return total;
+  }
+
   Status<size_t> ret =
       f->Readv({iov, static_cast<size_t>(iovcnt)}, &f->get_off_ref());
   if (!ret) return MakeCError(ret);
@@ -291,6 +316,26 @@ ssize_t usys_preadv(int fd, struct iovec *iov, int iovcnt, off_t offset) {
   FileTable &ftbl = myproc().get_file_table();
   File *f = ftbl.Get(fd);
   if (unlikely(!f || !f->is_readable())) return -EBADF;
+  if (unlikely(iovcnt < 0 || offset < 0)) return -EINVAL;
+  if (iovcnt == 0) return 0;
+
+  if (f->get_inode() && f->get_inode()->get_mode() == SHAOFS) {
+    bool direct = f->get_flags() & kFlagDirect;
+    if (direct) return file_readv_direct(f->get_inode()->get_inum(), iov, iovcnt, offset);
+
+    ssize_t total = 0;
+    off_t cursor = offset;
+    for (int i = 0; i < iovcnt; i++) {
+      if (!iov[i].iov_len) continue;
+      ssize_t ret = my_read(f->get_inode()->get_inum(), iov[i].iov_base,
+                            &cursor, iov[i].iov_len, false);
+      if (ret < 0) return total ? total : ret;
+      total += ret;
+      if (static_cast<size_t>(ret) < iov[i].iov_len) break;
+    }
+    return total;
+  }
+
   Status<size_t> ret = f->Readv({iov, static_cast<size_t>(iovcnt)}, &offset);
   if (!ret) return MakeCError(ret);
   return static_cast<ssize_t>(*ret);
