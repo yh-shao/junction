@@ -16,6 +16,7 @@ static constexpr int kMaxExtents = static_cast<int>(DIRECT_EXTENT_NUM + EXTENTS_
 static constexpr int kAppendPreallocSmallBlocks = 16;
 static constexpr int kAppendPreallocMediumBlocks = 64;
 static constexpr int kAppendPreallocMaxBlocks = 128;
+static constexpr uint64_t kAppendPreallocMinFileSize = 256ull * 1024;
 
 static inline BlockID first_block_after_eof(const MInode* inode)
 {
@@ -24,7 +25,7 @@ static inline BlockID first_block_after_eof(const MInode* inode)
 
 static inline bool should_prealloc_append(const MInode* inode, BlockID logical_blk)
 {
-    return inode->type == REGULAR && inode->file_size >= BLOCK_SIZE && logical_blk == first_block_after_eof(inode);
+    return inode->type == REGULAR && inode->file_size >= kAppendPreallocMinFileSize && logical_blk == first_block_after_eof(inode);
 }
 
 static inline int append_prealloc_blocks(const MInode* inode)
