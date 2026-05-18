@@ -97,6 +97,7 @@ bool ic_free_inode(int inum)   // 释放该 inode 持有的所有资源，inum �
     {
         auto write_acc = ih.write_access();  // 获取排他写锁，防止在销毁时有其他线程试图读取
         if (!write_acc->used) return false;  // 防止被重复删除
+        write_acc->drop_dir_index();
         write_acc->used = false;             // 逻辑删除（新的读写请求拿到锁后看到 used == false 会直接退出）
 
         // 释放 direct extents 中引用的所有物理块

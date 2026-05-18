@@ -378,12 +378,38 @@ int my_fsync(int inum)
         {
             BlockID first_logical = dirty_start / BLOCK_SIZE;
             BlockID last_logical = (dirty_end - 1) / BLOCK_SIZE;
+            BlockID run_start = INVALID_BLOCK_ID;
+            uint32_t run_count = 0;
+
+            auto flush_run = [&]() -> bool {
+                if (run_count == 0) return true;
+                bool ok = bc_flush_blocks_contiguous(run_start, run_count);
+                run_start = INVALID_BLOCK_ID;
+                run_count = 0;
+                return ok;
+            };
 
             for (BlockID logical = first_logical; logical <= last_logical; logical++)
             {
                 BlockID phys_blk = inode_bmap_locked(inode_ptr, logical, false, nullptr);
-                if (phys_blk != INVALID_BLOCK_ID && !bc_flush_block(phys_blk)) return -EIO;
+                if (phys_blk == INVALID_BLOCK_ID)
+                {
+                    if (!flush_run()) return -EIO;
+                    continue;
+                }
+
+                if (run_count > 0 && phys_blk == run_start + run_count && run_count < 1024)
+                {
+                    run_count++;
+                    continue;
+                }
+
+                if (!flush_run()) return -EIO;
+                run_start = phys_blk;
+                run_count = 1;
             }
+
+            if (!flush_run()) return -EIO;
         }
 
         if (uses_indirect_block(&(*read_acc)) && read_acc->indirect_extent_block != 0)

@@ -203,6 +203,14 @@ public:
         }
         return true;
     }
+
+    Handle find_cached(const Key& key)   // 只查找已存在的 CacheEntry，不触发 miss 分配或后端读
+    {
+        spin_lock_np(&shard_lock);
+        Handle entryHandle(hashmap->find(key));
+        spin_unlock_np(&shard_lock);
+        return entryHandle;
+    }
     
     void flush_all()
     {

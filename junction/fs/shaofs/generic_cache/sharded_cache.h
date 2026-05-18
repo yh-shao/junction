@@ -57,6 +57,7 @@ public:
     bool   put(const Key& key, const Value& val) { return shards[get_shard_idx(key)]->put(key, val);    }
     void   invalidate(const Key& key)            { return shards[get_shard_idx(key)]->invalidate(key);  }
     bool   flush_entry(const Key& key)           { return shards[get_shard_idx(key)]->flush_entry(key); }
+    Handle find_cached(const Key& key)           { return shards[get_shard_idx(key)]->find_cached(key); }
 
     void flush_all() { for (auto shard : shards) shard->flush_all(); }
     

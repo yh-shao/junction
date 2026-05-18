@@ -1,9 +1,12 @@
 #pragma once
 #include "fs.h"
 
+struct DirIndex;
+
 struct MInode : public DInode
 {
     mutable rwmutex_t dir_mtx;     // 若这个 inode 是目录，读写锁保护目录的并发访问
+    DirIndex* dir_index;           // 目录运行时索引，仅用于加速 lookup/add/delete，不写入磁盘
     mutable iExtent extent_hint;   // 上次访问的 extent，加速顺序访问
     spinlock_t hint_lock;          // 保护多线程对 extent_hint 的更新 （线程在持有 MInode 读锁的情况下，也可以更新 hint）
     spinlock_t dirty_lock;         // 保护下面的 dirty byte range
@@ -12,17 +15,8 @@ struct MInode : public DInode
     uint64_t dirty_data_end;
     uint64_t dirty_data_seq;
 
-    void init_runtime_state()
-    {
-        rwmutex_init(&dir_mtx);
-        memset(&extent_hint, 0, sizeof(extent_hint));
-        spin_lock_init(&hint_lock);
-        spin_lock_init(&dirty_lock);
-        atomic_write(&has_dirty_data_cache, 0);
-        dirty_data_start = 0;
-        dirty_data_end = 0;
-        dirty_data_seq = 0;
-    }
+    void init_runtime_state();
+    void drop_dir_index();
 
     void clear_dirty_data_unlocked()
     {
@@ -31,14 +25,10 @@ struct MInode : public DInode
         dirty_data_end = 0;
     }
 
-    MInode() { init_runtime_state(); }
+    MInode();
+    ~MInode();
 
-    MInode& operator=(const DInode& disk_inode)   // 自定义拷贝赋值运算符，只拷贝盘上数据即可
-    {
-        DInode::operator=(disk_inode);
-        init_runtime_state();
-        return *this;
-    }
+    MInode& operator=(const DInode& disk_inode);   // 自定义拷贝赋值运算符，只拷贝盘上数据即可
 };
 
 int alloc_inum();

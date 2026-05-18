@@ -2,6 +2,9 @@
 
 #include "fs.h"
 
+struct DirIndex;
+void dir_index_destroy(DirIndex* index);
+
 typedef struct {
     int         inum;
     file_type_t filetype;   // 4B

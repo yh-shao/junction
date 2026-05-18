@@ -70,7 +70,7 @@ runtime_kthreads ${n_kthreads}
 runtime_spinning_kthreads 0
 runtime_guaranteed_kthreads 0
 runtime_priority lc
-runtime_quantum_us 0
+runtime_quantum_us 100
 enable_storage 1"
 )
 set(caladan_test_config_path

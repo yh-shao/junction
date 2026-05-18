@@ -98,4 +98,5 @@ BlockHandle bc_get_handle(BlockID id);          // 获取 Block 的 handle，用
 
 void bc_flush_all();                            // 将 cache 中所有脏数据刷回后端存储
 bool bc_flush_block(BlockID id);                // 将指定 block 刷写到后端（如果在缓存中且为脏）
+bool bc_flush_blocks_contiguous(BlockID start, uint32_t count);  // 批量刷写连续 block 中已经缓存且为脏的条目
 void bc_invalidate_block(BlockID id);           // 使指定 block 的 cache entry 失效（不写回）
