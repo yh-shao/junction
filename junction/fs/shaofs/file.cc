@@ -21,8 +21,21 @@ static inline bool user_dma_request_ok(const void* buf, off_t offset, size_t len
     return offset >= 0 && (static_cast<uint64_t>(offset) & (BLOCK_SIZE - 1)) == 0 && (reinterpret_cast<uintptr_t>(buf) & (BLOCK_SIZE - 1)) == 0 && (len & (BLOCK_SIZE - 1)) == 0;
 }
 
-static inline void mark_inode_data_cache_dirty(MInode* inode)
+static inline void mark_inode_data_cache_dirty(MInode* inode, uint64_t start, uint64_t end)
 {
+    if (end <= start) return;
+    SpinGuardNP g(&inode->dirty_lock);
+    if (!atomic_read(&inode->has_dirty_data_cache))
+    {
+        inode->dirty_data_start = start;
+        inode->dirty_data_end = end;
+    }
+    else
+    {
+        inode->dirty_data_start = MIN(inode->dirty_data_start, start);
+        inode->dirty_data_end = MAX(inode->dirty_data_end, end);
+    }
+    inode->dirty_data_seq++;
     atomic_write(&inode->has_dirty_data_cache, 1);
 }
 
@@ -66,6 +79,11 @@ static void free_inode_data_blocks(MInode* inode_ptr)
     inode_ptr->file_size = 0;
     inode_ptr->valid_extent_count = 0;
     memset(&inode_ptr->extent_hint, 0, sizeof(inode_ptr->extent_hint));  // 清空 extent hint
+    {
+        SpinGuardNP g(&inode_ptr->dirty_lock);
+        inode_ptr->clear_dirty_data_unlocked();
+        inode_ptr->dirty_data_seq++;
+    }
 }
 
 void truncate_inode(int inum)
@@ -77,7 +95,6 @@ void truncate_inode(int inum)
     if (!write_acc->used || write_acc->file_size == 0) return;
 
     free_inode_data_blocks(&*write_acc);
-    atomic_write(&write_acc->has_dirty_data_cache, 0);
     write_acc.mark_dirty();
 }
 
@@ -308,7 +325,7 @@ static ssize_t file_write_blockwise(int inum, const char* buf, off_t offset, siz
                     auto block_write_acc = bh.write_access(); // 获取 Block 独占写锁保证单块安全
                     dsa_copy(block_write_acc->data + blk_offset, buf + bytes_written, copy_len);
                     block_write_acc.mark_dirty();
-                    mark_inode_data_cache_dirty(const_cast<MInode*>(&(*read_acc)));
+                    mark_inode_data_cache_dirty(const_cast<MInode*>(&(*read_acc)), current_offset, current_offset + copy_len);
 
                     bytes_written += copy_len;
                     fast_path_success = true;
@@ -335,7 +352,7 @@ static ssize_t file_write_blockwise(int inum, const char* buf, off_t offset, siz
                 break;
             }
 
-            BlockHandle bh = bc_get_handle(phys_blk);
+            BlockHandle bh = is_new_block ? get_block_cache().getHandle(phys_blk, false) : bc_get_handle(phys_blk);
             if (unlikely(!bh))
             {
                 log_err("[file_write] Failed to get cache handle for physical block %lu", phys_blk);
@@ -348,7 +365,8 @@ static ssize_t file_write_blockwise(int inum, const char* buf, off_t offset, siz
                 if (is_new_block && copy_len < BLOCK_SIZE) memset(block_write_acc->data, 0, BLOCK_SIZE);   // 新分配的块若未写满，必须填 0
                 dsa_copy(block_write_acc->data + blk_offset, buf + bytes_written, copy_len);
                 block_write_acc.mark_dirty();
-                mark_inode_data_cache_dirty(&*write_acc);
+                atomic_write(&bh.get_entry()->valid, 1);
+                mark_inode_data_cache_dirty(&*write_acc, current_offset, current_offset + copy_len);
             }
 
             uint64_t new_end_pos = current_offset + copy_len;
@@ -434,7 +452,7 @@ static ssize_t file_write_batch_existing(int inum, const char* buf, off_t offset
             {
                 dsa_copyv(vecs.data(), vecs.size());
                 for (auto& acc : accessors) acc.mark_dirty();
-                mark_inode_data_cache_dirty(const_cast<MInode*>(&(*read_acc)));
+                mark_inode_data_cache_dirty(const_cast<MInode*>(&(*read_acc)), offset + bytes_written, offset + bytes_written + batch_bytes);
             }
             vecs.clear();
             accessors.clear();

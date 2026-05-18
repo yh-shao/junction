@@ -353,44 +353,57 @@ int my_fsync(int inum)
     InodeHandle ih = ic_get_inode(inum);
     if (unlikely(!ih)) return -ENOENT;
 
-    // 遍历该 inode 的所有 extent，刷写每个脏数据块
+    uint64_t dirty_start = 0;
+    uint64_t dirty_end = 0;
+    uint64_t dirty_seq = 0;
+    bool has_dirty_data = false;
+
     {
         auto read_acc = ih.read_access();
         if (!read_acc->used) return -ENOENT;
+        MInode* inode_ptr = const_cast<MInode*>(&(*read_acc));
 
-        // 刷写 direct extents 引用的物理块
-        int direct_count = direct_extent_count(&(*read_acc));
-        for (int i = 0; i < direct_count; i++)
         {
-            const iExtent& ext = read_acc->direct_extents[i];
-            for (uint64_t j = 0; j < ext.block_count; j++)
-                bc_flush_block(ext.physical_start + j);
+            SpinGuardNP dirty_g(&inode_ptr->dirty_lock);
+            has_dirty_data = atomic_read(&inode_ptr->has_dirty_data_cache);
+            if (has_dirty_data)
+            {
+                dirty_start = inode_ptr->dirty_data_start;
+                dirty_end = MIN(inode_ptr->dirty_data_end, read_acc->file_size);
+                dirty_seq = inode_ptr->dirty_data_seq;
+            }
         }
 
-        // 刷写 indirect extents 引用的物理块
-        if (direct_count == DIRECT_EXTENT_NUM && read_acc->indirect_extent_block != 0)
+        if (has_dirty_data && dirty_start < dirty_end)
         {
-            // 先刷写 indirect extent block 自身
-            bc_flush_block(read_acc->indirect_extent_block);
+            BlockID first_logical = dirty_start / BLOCK_SIZE;
+            BlockID last_logical = (dirty_end - 1) / BLOCK_SIZE;
 
-            BlockHandle ind_bh = bc_get_handle(read_acc->indirect_extent_block);
-            if (ind_bh)
+            for (BlockID logical = first_logical; logical <= last_logical; logical++)
             {
-                auto ind_acc = ind_bh.read_access();
-                const iExtent* ind_exts = reinterpret_cast<const iExtent*>(ind_acc->data);
-                int indirect_count = indirect_extent_count(&(*read_acc));
-                for (int i = 0; i < indirect_count; i++)
-                {
-                    const iExtent& ext = ind_exts[i];
-                    for (uint64_t j = 0; j < ext.block_count; j++)
-                        bc_flush_block(ext.physical_start + j);
-                }
+                BlockID phys_blk = inode_bmap_locked(inode_ptr, logical, false, nullptr);
+                if (phys_blk != INVALID_BLOCK_ID && !bc_flush_block(phys_blk)) return -EIO;
             }
+        }
+
+        if (uses_indirect_block(&(*read_acc)) && read_acc->indirect_extent_block != 0)
+            bc_flush_block(read_acc->indirect_extent_block);
+    }
+
+    if (has_dirty_data)
+    {
+        auto write_acc = ih.write_access();
+        if (!write_acc->used) return -ENOENT;
+
+        SpinGuardNP dirty_g(&write_acc->dirty_lock);
+        if (write_acc->dirty_data_seq == dirty_seq)
+        {
+            write_acc->clear_dirty_data_unlocked();
+            write_acc->dirty_data_seq++;
         }
     }
 
-    // 刷写 inode 元数据自身
-    ic_flush_inode(inum);
+    if (!ic_flush_inode(inum)) return -EIO;
 
     return 0;
 }

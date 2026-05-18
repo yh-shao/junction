@@ -71,10 +71,7 @@ InodeHandle ic_alloc_inode(file_type_t type, int inum)    // 如果 inum != -1 �
     {
         auto write_acc = handle.write_access();   // 获取排他写锁，对 inode 的内容进行初始化
         memset(static_cast<DInode*>(&(*write_acc)), 0, sizeof(DInode));
-        rwmutex_init(&write_acc->dir_mtx);
-        memset(&write_acc->extent_hint, 0, sizeof(write_acc->extent_hint));
-        spin_lock_init(&write_acc->hint_lock);
-        atomic_write(&write_acc->has_dirty_data_cache, 0);
+        write_acc->init_runtime_state();
         write_acc->idx = inum;
         write_acc->used = true;
         write_acc->type = type;
@@ -128,7 +125,12 @@ bool ic_free_inode(int inum)   // 释放该 inode 持有的所有资源，inum �
         write_acc->valid_extent_count = 0;
         memset(write_acc->direct_extents, 0, sizeof(write_acc->direct_extents));
         memset(&write_acc->extent_hint, 0, sizeof(write_acc->extent_hint));
-        atomic_write(&write_acc->has_dirty_data_cache, 0);
+        
+        {
+            SpinGuardNP g(&write_acc->dirty_lock);
+            write_acc->clear_dirty_data_unlocked();
+            write_acc->dirty_data_seq++;
+        }
 
         write_acc.mark_dirty();
     }

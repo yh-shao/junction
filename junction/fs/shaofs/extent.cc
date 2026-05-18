@@ -299,27 +299,6 @@ static void discard_preallocated_blocks(const BlockID* blocks, int block_count, 
     free_physical_runs(runs, run_count);
 }
 
-static bool zero_fresh_blocks(const BlockID* blocks, int count)
-{
-    for (int i = 0; i < count; i++)
-    {
-        BlockHandle bh = get_block_cache().getHandle(blocks[i], false);
-        if (unlikely(!bh))
-        {
-            log_err("[zero_fresh_blocks] Failed to get cache handle for new block %lu", blocks[i]);
-            return false;
-        }
-
-        {
-            auto acc = bh.write_access();
-            memset(acc->data, 0, BLOCK_SIZE);
-            acc.mark_dirty();
-            atomic_write(&bh.get_entry()->valid, 1);
-        }
-    }
-    return true;
-}
-
 static BlockID bmap_prealloc_append(MInode* inode, BlockID logical_blk)
 {
     BlockID blocks[kAppendPreallocMaxBlocks];
@@ -330,7 +309,7 @@ static BlockID bmap_prealloc_append(MInode* inode, BlockID logical_blk)
     if (got <= 0) return INVALID_BLOCK_ID;
 
     int run_count = build_physical_runs(logical_blk, blocks, got, runs);
-    if (!zero_fresh_blocks(blocks, got) || !bmap_insert_compact_extents(inode, runs, run_count, logical_blk, false))
+    if (!bmap_insert_compact_extents(inode, runs, run_count, logical_blk, false))
     {
         discard_preallocated_blocks(blocks, got, runs, run_count);
         return INVALID_BLOCK_ID;
@@ -345,7 +324,11 @@ BlockID inode_bmap_locked(MInode* inode_ptr, BlockID logical_blk, bool allocate,
     if (is_new) *is_new = false;
 
     BlockID phys_blk = bmap_lookup(inode_ptr, logical_blk);  // 查找 inode 中是否有该逻辑块号，若有则返回相应的物理块号
-    if (phys_blk != INVALID_BLOCK_ID) return phys_blk;
+    if (phys_blk != INVALID_BLOCK_ID)
+    {
+        if (allocate && is_new && logical_blk >= first_block_after_eof(inode_ptr)) *is_new = true;
+        return phys_blk;
+    }
 
     if (!allocate) return INVALID_BLOCK_ID;    // 该 inode 中没有该逻辑块号
 
