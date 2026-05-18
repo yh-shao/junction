@@ -128,6 +128,52 @@ bool is_datablock(BlockID block_id)
     return true;
 }
 
+static inline uint32_t bitmap_clear_range_count_locked(unsigned long* bmap, uint32_t start, uint32_t count, uint32_t* first_unset)
+{
+    uint32_t cleared = 0;
+    uint32_t pos = start;
+    uint32_t remaining = count;
+
+    while (remaining > 0 && BITMAP_POS_SHIFT(pos) != 0)
+    {
+        if (bitmap_test(bmap, pos))
+        {
+            bitmap_clear(bmap, pos);
+            cleared++;
+        }
+        else if (*first_unset == DATABLOCKS_PERGROUP) *first_unset = pos;
+        pos++;
+        remaining--;
+    }
+
+    while (remaining >= BITS_PER_LONG)
+    {
+        unsigned long* word = &bmap[BITMAP_POS_IDX(pos)];
+        unsigned long old = *word;
+
+        cleared += __builtin_popcountl(old);
+        if (old != ~0ul && *first_unset == DATABLOCKS_PERGROUP) *first_unset = pos + (uint32_t)__builtin_ctzl(~old);
+        *word = 0;
+
+        pos += BITS_PER_LONG;
+        remaining -= BITS_PER_LONG;
+    }
+
+    while (remaining > 0)
+    {
+        if (bitmap_test(bmap, pos))
+        {
+            bitmap_clear(bmap, pos);
+            cleared++;
+        }
+        else if (*first_unset == DATABLOCKS_PERGROUP) *first_unset = pos;
+        pos++;
+        remaining--;
+    }
+
+    return cleared;
+}
+
 
 // 批量分配连续物理块，返回实际分配数量。
 // 尽可能在同一个 Block Group 中分配 count 个物理连续的数据块；如果当前组空间不足或存在碎片，它会跨越多次循环（甚至跨越多个 Block Group），拼凑出总计 count 个块，并将它们的 BlockID 记录在 out 数组中。
@@ -246,9 +292,6 @@ void free_extent(const iExtent* ext)
             return;
         }
 
-        auto acc = handle.write_access();
-        unsigned long* bmap = reinterpret_cast<unsigned long*>(acc->data);
-
         // 计算在当前这一个 Group 中，最多能释放多少个连续的块
         uint32_t start_offset = (uint32_t)(current_lba - data_start_lba);
         uint32_t max_blocks_in_group = DATABLOCKS_PERGROUP - start_offset;
@@ -256,37 +299,34 @@ void free_extent(const iExtent* ext)
 
         GroupDescExt* gdesc = &group_info[gid];
         uint32_t actually_freed = 0;
+        uint32_t first_unset = DATABLOCKS_PERGROUP;
+        bool free_count_saturated = false;
 
         {
-            SpinGuardNP g(&gdesc->lock);
+            auto acc = handle.write_access();
+            unsigned long* bmap = reinterpret_cast<unsigned long*>(acc->data);
 
-            // 批量清空 Bitmap
-            for (uint32_t i = 0; i < blocks_to_free_this_round; i++) 
             {
-                uint32_t offset = start_offset + i;
-                if (unlikely(!bitmap_test(bmap, offset))) 
-                {
-                    log_warn("[free_extent] double free detected for blk=%llu (group=%u, offset=%u)", (unsigned long long)(current_lba + i), gid, offset);
-                } 
+                SpinGuardNP g(&gdesc->lock);
+
+                actually_freed = bitmap_clear_range_count_locked(bmap, start_offset, blocks_to_free_this_round, &first_unset);
+
+                // 批量更新空闲计数器
+                if (likely(gdesc->free_blocks_count + actually_freed <= DATABLOCKS_PERGROUP)) __atomic_add_fetch(&gdesc->free_blocks_count, actually_freed, __ATOMIC_RELAXED);
                 else 
                 {
-                    bitmap_clear(bmap, offset);
-                    actually_freed++;
+                    free_count_saturated = true;
+                    __atomic_store_n(&gdesc->free_blocks_count, DATABLOCKS_PERGROUP, __ATOMIC_RELAXED);
                 }
+
+                if (start_offset < gdesc->next_free_hint) gdesc->next_free_hint = start_offset;   // hint 尽量往前推
             }
 
-            // 批量更新空闲计数器
-            if (likely(gdesc->free_blocks_count + actually_freed <= DATABLOCKS_PERGROUP)) __atomic_add_fetch(&gdesc->free_blocks_count, actually_freed, __ATOMIC_RELAXED);
-            else 
-            {
-                log_warn("[free_extent] group %u free_blocks_count saturated, clamping to MAX", gid);
-                __atomic_store_n(&gdesc->free_blocks_count, DATABLOCKS_PERGROUP, __ATOMIC_RELAXED);
-            }
-
-            if (start_offset < gdesc->next_free_hint) gdesc->next_free_hint = start_offset;   // hint 尽量往前推
+            acc.mark_dirty();
         }
 
-        acc.mark_dirty();
+        if (unlikely(first_unset != DATABLOCKS_PERGROUP)) log_warn("[free_extent] double free detected for blk=%llu (group=%u, offset=%u)", (unsigned long long)(data_start_lba + first_unset), gid, first_unset);
+        if (unlikely(free_count_saturated)) log_warn("[free_extent] group %u free_blocks_count saturated, clamping to MAX", gid);
 
         // 推进到下一批（如果有跨组的情况）
         current_lba     += blocks_to_free_this_round;
