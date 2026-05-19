@@ -25,6 +25,8 @@ void MInode::init_runtime_state()
     dirty_data_start = 0;
     dirty_data_end = 0;
     dirty_data_seq = 0;
+    inode_dirty_seq = 0;
+    inode_fsync_seq = 0;
 }
 
 MInode& MInode::operator=(const DInode& disk_inode)

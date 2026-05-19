@@ -431,7 +431,11 @@ int dir_add_entry(int dir_inum, const char* name, int inum, file_type_t type)
     node->name[NAMESIZ - 1] = '\0';
     dir_index_insert_live(index, node);
 
-    dir_ih.write_access().mark_dirty();
+    {
+        auto write_acc = dir_ih.write_access();
+        mark_inode_metadata_dirty(&*write_acc);
+        write_acc.mark_dirty();
+    }
     get_dentry_cache().put(DentryKey(dir_inum, name), {inum, type});
 
     return 0;
@@ -466,7 +470,11 @@ int dir_delete_entry(int dir_inum, const char* name)
     node->free_next = index->free_slots;
     index->free_slots = node;
 
-    dir_ih.write_access().mark_dirty();
+    {
+        auto write_acc = dir_ih.write_access();
+        mark_inode_metadata_dirty(&*write_acc);
+        write_acc.mark_dirty();
+    }
     get_dentry_cache().invalidate(DentryKey(dir_inum, name));
     return 0;
 }

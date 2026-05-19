@@ -78,6 +78,7 @@ InodeHandle ic_alloc_inode(file_type_t type, int inum)    // 如果 inum != -1 �
         write_acc->nlink = 1;    // 肯定是因为创建了文件所以才创建这个 inode，因此有文件名，硬链接数初始时为 1
         write_acc->file_size = 0;
         write_acc->indirect_extent_block = sb.indirect_block_start + inum;
+        mark_inode_metadata_dirty(&*write_acc);
         write_acc.mark_dirty();
         atomic_write(&handle.get_entry()->valid, 1);
     }
@@ -126,6 +127,7 @@ bool ic_free_inode(int inum)   // 释放该 inode 持有的所有资源，inum �
         write_acc->valid_extent_count = 0;
         memset(write_acc->direct_extents, 0, sizeof(write_acc->direct_extents));
         memset(&write_acc->extent_hint, 0, sizeof(write_acc->extent_hint));
+        mark_inode_metadata_dirty(&*write_acc);
         
         {
             SpinGuardNP g(&write_acc->dirty_lock);

@@ -202,6 +202,7 @@ int my_mkdir(const char *pathname, mode_t mode)
     {
         auto write_acc = new_ih.write_access();
         write_acc->nlink++;  // 新目录的 nlink 为 2，ic_alloc_inode 默认将 nlink 设为了 1，所以这里我们只需要加 1
+        mark_inode_metadata_dirty(&*write_acc);
         write_acc.mark_dirty();
     }
 
@@ -212,6 +213,7 @@ int my_mkdir(const char *pathname, mode_t mode)
         {
             auto write_acc = parent_ih.write_access();
             write_acc->nlink++;
+            mark_inode_metadata_dirty(&*write_acc);
             write_acc.mark_dirty();
         }
     }
@@ -356,12 +358,18 @@ int my_fsync(int inum)
     uint64_t dirty_start = 0;
     uint64_t dirty_end = 0;
     uint64_t dirty_seq = 0;
+    uint64_t inode_dirty_seq = 0;
+    uint64_t inode_fsync_seq = 0;
     bool has_dirty_data = false;
+    bool need_inode_flush = false;
 
     {
         auto read_acc = ih.read_access();
         if (!read_acc->used) return -ENOENT;
         MInode* inode_ptr = const_cast<MInode*>(&(*read_acc));
+        inode_dirty_seq = read_acc->inode_dirty_seq;
+        inode_fsync_seq = read_acc->inode_fsync_seq;
+        need_inode_flush = inode_dirty_seq != inode_fsync_seq;
 
         {
             SpinGuardNP dirty_g(&inode_ptr->dirty_lock);
@@ -416,6 +424,8 @@ int my_fsync(int inum)
             bc_flush_block(read_acc->indirect_extent_block);
     }
 
+    if (!has_dirty_data && !need_inode_flush) return 0;
+
     if (has_dirty_data)
     {
         auto write_acc = ih.write_access();
@@ -429,7 +439,14 @@ int my_fsync(int inum)
         }
     }
 
-    if (!ic_flush_inode(inum)) return -EIO;
+    if (need_inode_flush)
+    {
+        if (!ic_flush_inode(inum)) return -EIO;
+
+        auto write_acc = ih.write_access();
+        if (!write_acc->used) return -ENOENT;
+        if (write_acc->inode_dirty_seq == inode_dirty_seq && write_acc->inode_fsync_seq == inode_fsync_seq) write_acc->inode_fsync_seq = inode_dirty_seq;
+    }
 
     return 0;
 }

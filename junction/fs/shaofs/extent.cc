@@ -141,6 +141,7 @@ static bool bmap_try_append_extent(MInode* inode, const iExtent& new_ext)  // �
     {
         inode->direct_extents[0] = new_ext;
         inode->valid_extent_count = 1;
+        mark_inode_metadata_dirty(inode);
         update_extent_hint(inode, new_ext);
         return true;
     }
@@ -163,6 +164,7 @@ static bool bmap_try_append_extent(MInode* inode, const iExtent& new_ext)  // �
             {
                 last.block_count += new_ext.block_count;
                 acc.mark_dirty();
+                mark_inode_metadata_dirty(inode);
                 update_extent_hint(inode, last);
                 return true;
             }
@@ -174,6 +176,7 @@ static bool bmap_try_append_extent(MInode* inode, const iExtent& new_ext)  // �
         if (last.logical_start + last.block_count == new_ext.logical_start && last.physical_start + last.block_count == new_ext.physical_start)
         {
             last.block_count += new_ext.block_count;
+            mark_inode_metadata_dirty(inode);
             update_extent_hint(inode, last);
             return true;
         }
@@ -239,6 +242,7 @@ static bool bmap_insert_compact_extents(MInode* inode, const iExtent* new_exts, 
 
     // 写回元数据
     inode->valid_extent_count = ext_count;
+    mark_inode_metadata_dirty(inode);
     int global_idx = 0;
     for (int i = 0; i < DIRECT_EXTENT_NUM; ++i)  // 写回 Direct 区域
     {

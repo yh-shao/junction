@@ -6,6 +6,8 @@
 #include "utili.h"
 #include <cstring>
 #include <cstdlib>
+#include <cstdint>
+#include <algorithm>
 #include <vector>
 
 struct JournalHeader {
@@ -31,10 +33,14 @@ static constexpr uint32_t kJournalEmpty = 0;
 static constexpr uint32_t kJournalCommitted = 1;
 static constexpr uint32_t kJournalDirty = 2;
 static constexpr uint32_t kMaxJournalEntries = 64;
+static constexpr uint32_t kJournalSlotBlocks = 2 + kMaxJournalEntries;
+static constexpr uint32_t kMaxJournalSlots = 32;
 static_assert(kMaxJournalEntries * sizeof(JournalEntry) <= BLOCK_SIZE, "journal entry table must fit in one block");
 
 static spinlock_t journal_lock;
 static spinlock_t metadata_lock;
+static mutex_t group_lock;
+static condvar_t group_cv;
 static uint64_t journal_seq;
 
 struct BlockRange {
@@ -42,6 +48,43 @@ struct BlockRange {
     uint64_t count;
 };
 static std::vector<BlockRange>* metadata_ranges;
+
+static constexpr uint32_t kGroupCommitMaxReqs = 128;
+static constexpr uint32_t kGroupCommitWindowUs = 0;
+
+struct JournalGroupReq {
+    BlockID block;
+    const void* image;
+    bool done;
+    bool ok;
+    bool queued;
+};
+
+static JournalGroupReq* group_pending[kGroupCommitMaxReqs];
+static uint32_t group_pending_count;
+static bool group_committing;
+
+static mutex_t checkpoint_lock;
+static condvar_t checkpoint_cv;
+static bool checkpoint_worker_started;
+static bool checkpoint_enabled;
+static uint32_t checkpoint_slot_count;
+static uint32_t checkpoint_next_slot;
+static uint32_t checkpoint_pending_slots;
+static uint32_t checkpoint_reserved_slots;
+static bool checkpoint_error;
+
+struct CheckpointSlot {
+    bool reserved;
+    bool pending;
+    uint32_t count;
+    uint64_t seq;
+    BlockID header_block;
+    BlockID blocks[kMaxJournalEntries];
+    alignas(BLOCK_SIZE) char images[kMaxJournalEntries][BLOCK_SIZE];
+};
+
+static CheckpointSlot checkpoint_slots[kMaxJournalSlots];
 
 static inline uint64_t fnv1a64(const void* data, size_t len)
 {
@@ -63,6 +106,19 @@ static inline bool journal_layout_valid()
 static inline BlockID mount_state_lba()
 {
     return sb.journal_blockstart + sb.journal_blocknum - 1;
+}
+
+static inline uint32_t journal_slot_capacity()
+{
+    if (!journal_layout_valid()) return 0;
+    uint64_t usable_blocks = mount_state_lba() - sb.journal_blockstart;
+    uint64_t slots = usable_blocks / kJournalSlotBlocks;
+    return MIN((uint64_t)kMaxJournalSlots, slots);
+}
+
+static inline BlockID journal_slot_base(uint32_t slot)
+{
+    return sb.journal_blockstart + (uint64_t)slot * kJournalSlotBlocks;
 }
 
 static inline uint64_t header_checksum(const JournalHeader& hdr, const JournalEntry* entries)
@@ -110,20 +166,20 @@ static bool write_full_block(BlockID blk, const void* image)
     return storage_write(image, blk, 1) == 0;
 }
 
-static bool read_header(JournalHeader* hdr, JournalEntry* entries)
+static bool read_header_at(BlockID header_lba, JournalHeader* hdr, JournalEntry* entries)
 {
     alignas(BLOCK_SIZE) char header_block[BLOCK_SIZE];
     alignas(BLOCK_SIZE) char entry_block[BLOCK_SIZE];
 
-    if (storage_read(header_block, sb.journal_blockstart, 1) != 0) return false;
+    if (storage_read(header_block, header_lba, 1) != 0) return false;
     memcpy(hdr, header_block, sizeof(*hdr));
 
-    if (storage_read(entry_block, sb.journal_blockstart + 1, 1) != 0) return false;
+    if (storage_read(entry_block, header_lba + 1, 1) != 0) return false;
     memcpy(entries, entry_block, sizeof(JournalEntry) * kMaxJournalEntries);
     return true;
 }
 
-static bool write_header(const JournalHeader& hdr, const JournalEntry* entries)
+static bool write_header_at(BlockID header_lba, const JournalHeader& hdr, const JournalEntry* entries)
 {
     alignas(BLOCK_SIZE) char header_block[BLOCK_SIZE];
     alignas(BLOCK_SIZE) char entry_block[BLOCK_SIZE];
@@ -133,12 +189,159 @@ static bool write_header(const JournalHeader& hdr, const JournalEntry* entries)
     memcpy(header_block, &hdr, sizeof(hdr));
     memcpy(entry_block, entries, sizeof(JournalEntry) * hdr.entry_count);
 
-    if (storage_write(entry_block, sb.journal_blockstart + 1, 1) != 0) return false;
-    if (storage_write(header_block, sb.journal_blockstart, 1) != 0) return false;
+    if (storage_write(entry_block, header_lba + 1, 1) != 0) return false;
+    if (storage_write(header_block, header_lba, 1) != 0) return false;
     return true;
 }
 
-static bool replay_committed(const JournalHeader& hdr, const JournalEntry* entries)
+static bool checkpoint_home_blocks(BlockID header_lba, const BlockID* blocks, const void* const* images, uint32_t count)
+{
+    for (uint32_t i = 0; i < count; ++i)
+        if (storage_write(images[i], blocks[i], 1) != 0) return false;
+
+    return write_zero_block(header_lba);
+}
+
+static void checkpoint_worker(void*)
+{
+    const void* images[kMaxJournalEntries];
+
+    while (true)
+    {
+        mutex_lock(&checkpoint_lock);
+        while (checkpoint_pending_slots == 0)
+            condvar_wait(&checkpoint_cv, &checkpoint_lock);
+
+        uint32_t slot = checkpoint_slot_count;
+        uint64_t best_seq = UINT64_MAX;
+        for (uint32_t i = 0; i < checkpoint_slot_count; i++)
+        {
+            if (checkpoint_slots[i].pending && checkpoint_slots[i].seq < best_seq)
+            {
+                best_seq = checkpoint_slots[i].seq;
+                slot = i;
+            }
+        }
+        if (slot == checkpoint_slot_count)
+        {
+            mutex_unlock(&checkpoint_lock);
+            continue;
+        }
+
+        CheckpointSlot* s = &checkpoint_slots[slot];
+        uint32_t count = s->count;
+        BlockID header_lba = s->header_block;
+        for (uint32_t i = 0; i < count; i++)
+            images[i] = s->images[i];
+        mutex_unlock(&checkpoint_lock);
+
+        bool ok = checkpoint_home_blocks(header_lba, s->blocks, images, count);
+
+        mutex_lock(&checkpoint_lock);
+        checkpoint_error = checkpoint_error || !ok;
+        s->pending = false;
+        s->count = 0;
+        s->seq = 0;
+        checkpoint_pending_slots--;
+        condvar_broadcast(&checkpoint_cv);
+        mutex_unlock(&checkpoint_lock);
+    }
+}
+
+static bool checkpoint_start_worker_locked()
+{
+    if (checkpoint_worker_started) return true;
+    if (thread_spawn(checkpoint_worker, nullptr) != 0) return false;
+    checkpoint_worker_started = true;
+    return true;
+}
+
+static bool checkpoint_wait_idle_locked()
+{
+    while (checkpoint_pending_slots != 0 || checkpoint_reserved_slots != 0)
+        condvar_wait(&checkpoint_cv, &checkpoint_lock);
+    return !checkpoint_error;
+}
+
+static int checkpoint_reserve_slot()
+{
+    if (!checkpoint_enabled || checkpoint_slot_count == 0) return -1;
+
+    mutex_lock(&checkpoint_lock);
+    if (!checkpoint_start_worker_locked())
+    {
+        mutex_unlock(&checkpoint_lock);
+        return -1;
+    }
+
+    while (!checkpoint_error)
+    {
+        for (uint32_t n = 0; n < checkpoint_slot_count; n++)
+        {
+            uint32_t slot = (checkpoint_next_slot + n) % checkpoint_slot_count;
+            CheckpointSlot* s = &checkpoint_slots[slot];
+            if (!s->reserved && !s->pending)
+            {
+                s->reserved = true;
+                s->header_block = journal_slot_base(slot);
+                checkpoint_reserved_slots++;
+                checkpoint_next_slot = (slot + 1) % checkpoint_slot_count;
+                mutex_unlock(&checkpoint_lock);
+                return (int)slot;
+            }
+        }
+
+        condvar_wait(&checkpoint_cv, &checkpoint_lock);
+    }
+    mutex_unlock(&checkpoint_lock);
+    return -1;
+}
+
+static bool checkpoint_schedule_reserved_slot(uint32_t slot, uint64_t seq, const BlockID* blocks, const void* const* images, uint32_t count)
+{
+    mutex_lock(&checkpoint_lock);
+    CheckpointSlot* s = &checkpoint_slots[slot];
+    s->count = count;
+    s->seq = seq;
+    for (uint32_t i = 0; i < count; i++)
+    {
+        s->blocks[i] = blocks[i];
+        memcpy(s->images[i], images[i], BLOCK_SIZE);
+    }
+    s->pending = true;
+    s->reserved = false;
+    checkpoint_reserved_slots--;
+    checkpoint_pending_slots++;
+    condvar_signal(&checkpoint_cv);
+    condvar_broadcast(&checkpoint_cv);
+    mutex_unlock(&checkpoint_lock);
+    return true;
+}
+
+static void checkpoint_release_reserved_slot(uint32_t slot)
+{
+    mutex_lock(&checkpoint_lock);
+    CheckpointSlot* s = &checkpoint_slots[slot];
+    if (s->reserved)
+    {
+        s->reserved = false;
+        s->count = 0;
+        s->seq = 0;
+        checkpoint_reserved_slots--;
+    }
+    condvar_broadcast(&checkpoint_cv);
+    mutex_unlock(&checkpoint_lock);
+}
+
+static bool checkpoint_wait_idle()
+{
+    mutex_lock(&checkpoint_lock);
+    bool ok = checkpoint_wait_idle_locked();
+    mutex_unlock(&checkpoint_lock);
+    return ok;
+}
+
+static bool replay_committed(BlockID header_lba, const JournalHeader& hdr, const JournalEntry* entries)
 {
     alignas(BLOCK_SIZE) char block[BLOCK_SIZE];
 
@@ -150,7 +353,7 @@ static bool replay_committed(const JournalHeader& hdr, const JournalEntry* entri
             log_err("[journal] invalid replay target block %lu", e.home_block);
             return false;
         }
-        if (e.image_block < sb.journal_blockstart || e.image_block >= mount_state_lba()) 
+        if (e.image_block < header_lba + 2 || e.image_block >= header_lba + kJournalSlotBlocks)
         {
             log_err("[journal] invalid image block %lu", e.image_block);
             return false;
@@ -165,7 +368,7 @@ static bool replay_committed(const JournalHeader& hdr, const JournalEntry* entri
         if (storage_write(block, e.home_block, 1) != 0) return false;
     }
 
-    return write_zero_block(sb.journal_blockstart);
+    return write_zero_block(header_lba);
 }
 
 static inline void bitmap_set_local(unsigned long* bmap, uint32_t bit)
@@ -377,7 +580,21 @@ void journal_init()
 {
     spin_lock_init(&journal_lock);
     spin_lock_init(&metadata_lock);
+    mutex_init(&group_lock);
+    condvar_init(&group_cv);
+    mutex_init(&checkpoint_lock);
+    condvar_init(&checkpoint_cv);
     journal_seq = 1;
+    group_pending_count = 0;
+    group_committing = false;
+    checkpoint_worker_started = false;
+    checkpoint_enabled = false;
+    checkpoint_slot_count = journal_slot_capacity();
+    checkpoint_next_slot = 0;
+    checkpoint_pending_slots = 0;
+    checkpoint_reserved_slots = 0;
+    checkpoint_error = false;
+    memset(checkpoint_slots, 0, sizeof(checkpoint_slots));
     if (metadata_ranges == nullptr) 
     {
         metadata_ranges = new std::vector<BlockRange>();
@@ -392,62 +609,96 @@ bool journal_recover()
         log_warn("[journal] invalid or missing journal area, skip recovery");
         return true;
     }
-
-    JournalHeader hdr;
-    JournalEntry entries[kMaxJournalEntries];
-    if (!read_header(&hdr, entries)) return false;
+    checkpoint_enabled = false;
+    checkpoint_slot_count = journal_slot_capacity();
+    if (checkpoint_slot_count == 0)
+    {
+        log_warn("[journal] no usable journal slots, skip recovery");
+        checkpoint_enabled = true;
+        return true;
+    }
 
     JournalHeader mount_hdr;
     if (!read_block_header(mount_state_lba(), &mount_hdr)) return false;
     bool needs_repair = mount_hdr.magic == kJournalMagic && mount_hdr.version == kJournalVersion && mount_hdr.state == kJournalDirty;
 
-    if (hdr.magic != 0 && hdr.state != kJournalEmpty) 
+    struct ReplayTxn {
+        BlockID header_lba;
+        JournalHeader hdr;
+        JournalEntry entries[kMaxJournalEntries];
+    };
+    ReplayTxn txns[kMaxJournalSlots];
+    uint32_t txn_count = 0;
+
+    for (uint32_t slot = 0; slot < checkpoint_slot_count; slot++)
     {
+        BlockID header_lba = journal_slot_base(slot);
+        JournalHeader hdr;
+        JournalEntry entries[kMaxJournalEntries];
+        if (!read_header_at(header_lba, &hdr, entries)) return false;
+        if (hdr.magic == 0 || hdr.state == kJournalEmpty) continue;
+
         if (hdr.magic != kJournalMagic || hdr.version != kJournalVersion) 
         {
-            log_warn("[journal] unknown journal header magic=0x%x version=%u, clearing", hdr.magic, hdr.version);
-            if (!write_zero_block(sb.journal_blockstart)) return false;
+            log_warn("[journal] unknown journal header slot=%u magic=0x%x version=%u, clearing", slot, hdr.magic, hdr.version);
+            if (!write_zero_block(header_lba)) return false;
             needs_repair = true;
         } 
-        else if (hdr.entry_count == 0 || hdr.entry_count > kMaxJournalEntries || hdr.entry_count + 2 >= sb.journal_blocknum) 
+        else if (hdr.entry_count == 0 || hdr.entry_count > kMaxJournalEntries)
         {
-            log_warn("[journal] invalid entry_count=%u, clearing header", hdr.entry_count);
-            if (!write_zero_block(sb.journal_blockstart)) return false;
+            log_warn("[journal] invalid entry_count=%u in slot=%u, clearing header", hdr.entry_count, slot);
+            if (!write_zero_block(header_lba)) return false;
             needs_repair = true;
         } 
         else if (hdr.checksum != header_checksum(hdr, entries)) 
         {
-            log_warn("[journal] incomplete or torn transaction, clearing header");
-            if (!write_zero_block(sb.journal_blockstart)) return false;
+            log_warn("[journal] incomplete or torn transaction in slot=%u, clearing header", slot);
+            if (!write_zero_block(header_lba)) return false;
             needs_repair = true;
         } 
         else if (hdr.state == kJournalCommitted) 
         {
-            log_info("[journal] replaying %u metadata blocks", hdr.entry_count);
-            if (!replay_committed(hdr, entries)) return false;
-            if (hdr.seq >= journal_seq) journal_seq = hdr.seq + 1;
+            txns[txn_count].header_lba = header_lba;
+            txns[txn_count].hdr = hdr;
+            memcpy(txns[txn_count].entries, entries, sizeof(entries));
+            txn_count++;
             needs_repair = true;
         } 
         else 
         {
-            log_warn("[journal] uncommitted transaction state=%u, clearing", hdr.state);
-            if (!write_zero_block(sb.journal_blockstart)) return false;
+            log_warn("[journal] uncommitted transaction state=%u in slot=%u, clearing", hdr.state, slot);
+            if (!write_zero_block(header_lba)) return false;
             needs_repair = true;
         }
+    }
+
+    std::sort(txns, txns + txn_count, [](const ReplayTxn& a, const ReplayTxn& b) {
+        return a.hdr.seq < b.hdr.seq;
+    });
+
+    for (uint32_t i = 0; i < txn_count; i++)
+    {
+        log_info("[journal] replaying txn seq=%lu blocks=%u", txns[i].hdr.seq, txns[i].hdr.entry_count);
+        if (!replay_committed(txns[i].header_lba, txns[i].hdr, txns[i].entries)) return false;
+        if (txns[i].hdr.seq >= journal_seq) journal_seq = txns[i].hdr.seq + 1;
     }
 
     if (needs_repair) 
     {
         log_info("[journal] previous mount was dirty, repairing metadata state");
         if (!repair_filesystem_state()) return false;
-        return write_zero_block(mount_state_lba());
+        bool ok = write_zero_block(mount_state_lba());
+        checkpoint_enabled = true;
+        return ok;
     }
+    checkpoint_enabled = true;
     return true;
 }
 
 void journal_mark_dirty()
 {
     if (!journal_layout_valid()) return;
+    checkpoint_wait_idle();
 
     JournalHeader hdr;
     JournalEntry entries[kMaxJournalEntries];
@@ -467,6 +718,7 @@ void journal_mark_dirty()
 void journal_mark_clean()
 {
     if (!journal_layout_valid()) return;
+    checkpoint_wait_idle();
 
     SpinGuard guard(&journal_lock);
     write_zero_block(mount_state_lba());
@@ -533,13 +785,18 @@ bool journal_commit_blocks(const BlockID* blocks, const void* const* images, uin
 {
     if (count == 0) return true;
     if (!journal_layout_valid()) return false;
-    if (count > kMaxJournalEntries || count + 2 >= sb.journal_blocknum) 
+    if (count > kMaxJournalEntries)
     {
         log_err("[journal] transaction too large: %u blocks", count);
         return false;
     }
 
+    int reserved_slot = checkpoint_reserve_slot();
+    bool async_checkpoint = reserved_slot >= 0;
+    BlockID header_lba = async_checkpoint ? journal_slot_base((uint32_t)reserved_slot) : sb.journal_blockstart;
+
     SpinGuard guard(&journal_lock);
+    if (!async_checkpoint && !checkpoint_wait_idle()) return false;
 
     JournalEntry entries[kMaxJournalEntries];
     memset(entries, 0, sizeof(entries));
@@ -549,12 +806,17 @@ bool journal_commit_blocks(const BlockID* blocks, const void* const* images, uin
         if (!journal_is_metadata_block(blocks[i])) 
         {
             log_err("[journal] refusing to journal non-metadata block %lu", blocks[i]);
+            if (async_checkpoint) checkpoint_release_reserved_slot((uint32_t)reserved_slot);
             return false;
         }
         entries[i].home_block = blocks[i];
-        entries[i].image_block = sb.journal_blockstart + 2 + i;
+        entries[i].image_block = header_lba + 2 + i;
         entries[i].checksum = fnv1a64(images[i], BLOCK_SIZE);
-        if (storage_write(images[i], entries[i].image_block, 1) != 0) return false;
+        if (storage_write(images[i], entries[i].image_block, 1) != 0)
+        {
+            if (async_checkpoint) checkpoint_release_reserved_slot((uint32_t)reserved_slot);
+            return false;
+        }
     }
 
     JournalHeader hdr;
@@ -566,19 +828,122 @@ bool journal_commit_blocks(const BlockID* blocks, const void* const* images, uin
     hdr.seq = journal_seq++;
     hdr.checksum = header_checksum(hdr, entries);
 
-    if (!write_header(hdr, entries)) return false;
+    if (!write_header_at(header_lba, hdr, entries))
+    {
+        if (async_checkpoint) checkpoint_release_reserved_slot((uint32_t)reserved_slot);
+        return false;
+    }
 
-    for (uint32_t i = 0; i < count; ++i)
-        if (storage_write(images[i], blocks[i], 1) != 0) return false;
+    if (async_checkpoint)
+        return checkpoint_schedule_reserved_slot((uint32_t)reserved_slot, hdr.seq, blocks, images, count);
+    return checkpoint_home_blocks(header_lba, blocks, images, count);
+}
 
-    return write_zero_block(sb.journal_blockstart);
+static bool journal_commit_group(JournalGroupReq** reqs, uint32_t req_count)
+{
+    if (req_count == 0) return true;
+
+    BlockID blocks[kMaxJournalEntries];
+    const void* images[kMaxJournalEntries];
+    uint32_t count = 0;
+
+    for (uint32_t i = 0; i < req_count; i++)
+    {
+        JournalGroupReq* req = reqs[i];
+        uint32_t pos = count;
+        for (uint32_t j = 0; j < count; j++)
+        {
+            if (blocks[j] == req->block)
+            {
+                pos = j;
+                break;
+            }
+        }
+
+        if (pos == count)
+        {
+            if (count == kMaxJournalEntries) return false;
+            blocks[count++] = req->block;
+        }
+        images[pos] = req->image;
+    }
+
+    return journal_commit_blocks(blocks, images, count);
+}
+
+static bool journal_commit_single_grouped(BlockID block, const void* image)
+{
+    JournalGroupReq req = {
+        .block = block,
+        .image = image,
+        .done = false,
+        .ok = false,
+        .queued = false,
+    };
+
+    mutex_lock(&group_lock);
+    while (!req.queued)
+    {
+        while (group_pending_count == kGroupCommitMaxReqs)
+            condvar_wait(&group_cv, &group_lock);
+
+        group_pending[group_pending_count++] = &req;
+        req.queued = true;
+        condvar_broadcast(&group_cv);
+    }
+
+    while (!req.done)
+    {
+        if (group_committing)
+        {
+            condvar_wait(&group_cv, &group_lock);
+            continue;
+        }
+
+        group_committing = true;
+
+        if (kGroupCommitWindowUs > 0)
+        {
+            uint64_t deadline = microtime() + kGroupCommitWindowUs;
+            while (group_pending_count < std::min(kGroupCommitMaxReqs, kMaxJournalEntries))
+            {
+                uint64_t now = microtime();
+                if (now >= deadline) break;
+                condvar_wait_timed(&group_cv, &group_lock, deadline - now);
+            }
+        }
+
+        JournalGroupReq* local[kGroupCommitMaxReqs];
+        uint32_t local_count = std::min(group_pending_count, kMaxJournalEntries);
+        for (uint32_t i = 0; i < local_count; i++)
+            local[i] = group_pending[i];
+
+        uint32_t remain = group_pending_count - local_count;
+        for (uint32_t i = 0; i < remain; i++)
+            group_pending[i] = group_pending[local_count + i];
+        group_pending_count = remain;
+        mutex_unlock(&group_lock);
+
+        bool ok = journal_commit_group(local, local_count);
+
+        mutex_lock(&group_lock);
+        for (uint32_t i = 0; i < local_count; i++)
+        {
+            local[i]->ok = ok;
+            local[i]->done = true;
+        }
+        group_committing = false;
+        condvar_broadcast(&group_cv);
+    }
+
+    bool ok = req.ok;
+    mutex_unlock(&group_lock);
+    return ok;
 }
 
 bool journal_commit_single(BlockID block, const void* image)
 {
-    const BlockID blocks[1] = {block};
-    const void* images[1] = {image};
-    return journal_commit_blocks(blocks, images, 1);
+    return journal_commit_single_grouped(block, image);
 }
 
 bool journal_write_metadata(const void* data, size_t size, BlockID lba_start, off_t offset)

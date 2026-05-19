@@ -78,6 +78,7 @@ static void free_inode_data_blocks(MInode* inode_ptr)
     memset(inode_ptr->direct_extents, 0, sizeof(inode_ptr->direct_extents));
     inode_ptr->file_size = 0;
     inode_ptr->valid_extent_count = 0;
+    mark_inode_metadata_dirty(inode_ptr);
     memset(&inode_ptr->extent_hint, 0, sizeof(inode_ptr->extent_hint));  // 清空 extent hint
     {
         SpinGuardNP g(&inode_ptr->dirty_lock);
@@ -370,7 +371,11 @@ static ssize_t file_write_blockwise(int inum, const char* buf, off_t offset, siz
             }
 
             uint64_t new_end_pos = current_offset + copy_len;
-            if (new_end_pos > write_acc->file_size) write_acc->file_size = new_end_pos;
+            if (new_end_pos > write_acc->file_size)
+            {
+                write_acc->file_size = new_end_pos;
+                mark_inode_metadata_dirty(&*write_acc);
+            }
             write_acc.mark_dirty();
         } // inode 写锁释放
 
@@ -788,7 +793,11 @@ ssize_t file_write_direct(int inum, const char* buf, off_t offset, size_t len)
             bc_invalidate_block(phys_blk);
 
             uint64_t new_end_pos = current_offset + copy_len;
-            if (new_end_pos > write_acc->file_size) write_acc->file_size = new_end_pos;
+            if (new_end_pos > write_acc->file_size)
+            {
+                write_acc->file_size = new_end_pos;
+                mark_inode_metadata_dirty(&*write_acc);
+            }
             write_acc.mark_dirty();
         }
 

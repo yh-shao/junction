@@ -14,6 +14,8 @@ struct MInode : public DInode
     uint64_t dirty_data_start;     // buffered write 脏数据区间：[start, end)
     uint64_t dirty_data_end;
     uint64_t dirty_data_seq;
+    uint64_t inode_dirty_seq;      // inode 盘上元数据的变更序号
+    uint64_t inode_fsync_seq;      // 最近一次 fsync 已经持久化的 inode_dirty_seq
 
     void init_runtime_state();
     void drop_dir_index();
@@ -30,6 +32,11 @@ struct MInode : public DInode
 
     MInode& operator=(const DInode& disk_inode);   // 自定义拷贝赋值运算符，只拷贝盘上数据即可
 };
+
+static inline void mark_inode_metadata_dirty(MInode* inode)
+{
+    inode->inode_dirty_seq++;
+}
 
 int alloc_inum();
 void free_inum(int inum);
