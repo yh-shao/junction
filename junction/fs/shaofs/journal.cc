@@ -414,9 +414,76 @@ static bool mark_extent_allocated(unsigned long* group_bitmaps, uint32_t* used_c
     return true;
 }
 
+static inline bool disk_inode_uses_tree(const DInode& din)
+{
+    return din.valid_extent_count > LEGACY_MAX_EXTENT_NUM;
+}
+
+static inline bool disk_root_valid(const ExtentTreeHeader* hdr)
+{
+    return hdr->magic == EXTENT_TREE_ROOT_MAGIC && hdr->version == EXTENT_TREE_VERSION && hdr->leaf_count <= EXTENT_TREE_ROOT_REFS && hdr->indirect_extent_count <= (uint32_t)EXTENT_TREE_ROOT_REFS * (uint32_t)EXTENT_TREE_LEAF_EXTENTS;
+}
+
+static inline bool disk_leaf_valid(const ExtentLeafHeader* hdr)
+{
+    return hdr->magic == EXTENT_TREE_LEAF_MAGIC && hdr->version == EXTENT_TREE_VERSION && hdr->extent_count <= EXTENT_TREE_LEAF_EXTENTS;
+}
+
+static inline const ExtentLeafRef* disk_root_refs(const void* data)
+{
+    return reinterpret_cast<const ExtentLeafRef*>(static_cast<const char*>(data) + sizeof(ExtentTreeHeader));
+}
+
+static inline const iExtent* disk_leaf_extents(const void* data)
+{
+    return reinterpret_cast<const iExtent*>(static_cast<const char*>(data) + sizeof(ExtentLeafHeader));
+}
+
+static bool validate_tree_inode(const DInode& din)
+{
+    if (din.indirect_extent_block == 0) return false;
+
+    alignas(BLOCK_SIZE) char root_block[BLOCK_SIZE];
+    if (storage_read(root_block, din.indirect_extent_block, 1) != 0) return false;
+
+    const ExtentTreeHeader* hdr = reinterpret_cast<const ExtentTreeHeader*>(root_block);
+    if (!disk_root_valid(hdr)) return false;
+    if (hdr->indirect_extent_count != din.valid_extent_count - DIRECT_EXTENT_NUM) return false;
+
+    const ExtentLeafRef* refs = disk_root_refs(root_block);
+    uint32_t seen = 0;
+    BlockID prev_logical = 0;
+    for (uint32_t r = 0; r < hdr->leaf_count; r++)
+    {
+        uint32_t gid, bit;
+        if (!group_for_data_block(refs[r].leaf_block, &gid, &bit)) return false;
+        if (r > 0 && refs[r].logical_start <= prev_logical) return false;
+        prev_logical = refs[r].logical_start;
+
+        alignas(BLOCK_SIZE) char leaf_block[BLOCK_SIZE];
+        if (storage_read(leaf_block, refs[r].leaf_block, 1) != 0) return false;
+
+        const ExtentLeafHeader* leaf = reinterpret_cast<const ExtentLeafHeader*>(leaf_block);
+        if (!disk_leaf_valid(leaf) || leaf->extent_count != refs[r].extent_count || leaf->extent_count == 0) return false;
+        const iExtent* exts = disk_leaf_extents(leaf_block);
+        if (exts[0].logical_start != refs[r].logical_start) return false;
+        for (uint32_t i = 0; i < leaf->extent_count; i++)
+        {
+            if (exts[i].block_count == 0) return false;
+            uint32_t tmp_gid, tmp_bit;
+            if (!group_for_data_block(exts[i].physical_start, &tmp_gid, &tmp_bit)) return false;
+            if (!group_for_data_block(exts[i].physical_start + exts[i].block_count - 1, &tmp_gid, &tmp_bit)) return false;
+            if (i > 0 && exts[i].logical_start <= exts[i - 1].logical_start) return false;
+        }
+        seen += leaf->extent_count;
+    }
+
+    return seen == hdr->indirect_extent_count;
+}
+
 static bool inode_extent_valid(const DInode& din)
 {
-    if (din.valid_extent_count > DIRECT_EXTENT_NUM + EXTENTS_PER_BLOCK) return false;
+    if (din.valid_extent_count > DIRECT_EXTENT_NUM + (uint32_t)EXTENT_TREE_ROOT_REFS * (uint32_t)EXTENT_TREE_LEAF_EXTENTS) return false;
     uint32_t direct_count = MIN(din.valid_extent_count, (uint32_t)DIRECT_EXTENT_NUM);
     for (uint32_t i = 0; i < direct_count; ++i) 
     {
@@ -426,6 +493,7 @@ static bool inode_extent_valid(const DInode& din)
         if (!group_for_data_block(ext.physical_start, &gid, &bit)) return false;
         if (!group_for_data_block(ext.physical_start + ext.block_count - 1, &gid, &bit)) return false;
     }
+    if (disk_inode_uses_tree(din)) return validate_tree_inode(din);
     return true;
 }
 
@@ -516,14 +584,39 @@ static bool repair_filesystem_state()
 
         if (din.valid_extent_count > DIRECT_EXTENT_NUM && din.indirect_extent_block != 0) 
         {
-            iExtent* ind = static_cast<iExtent*>(aligned_alloc(BLOCK_SIZE, BLOCK_SIZE));
-            if (ind && storage_read(ind, din.indirect_extent_block, 1) == 0) 
+            if (disk_inode_uses_tree(din))
             {
-                uint32_t indirect_count = din.valid_extent_count - direct_count;
-                for (uint32_t i = 0; i < indirect_count && i < EXTENTS_PER_BLOCK; ++i)
-                    mark_extent_allocated(group_bitmaps, used_counts, ind[i]);
+                alignas(BLOCK_SIZE) char root_block[BLOCK_SIZE];
+                if (storage_read(root_block, din.indirect_extent_block, 1) == 0)
+                {
+                    const ExtentTreeHeader* hdr = reinterpret_cast<const ExtentTreeHeader*>(root_block);
+                    const ExtentLeafRef* refs = disk_root_refs(root_block);
+                    for (uint32_t r = 0; disk_root_valid(hdr) && r < hdr->leaf_count; r++)
+                    {
+                        iExtent meta_ext = { .logical_start = 0, .physical_start = refs[r].leaf_block, .block_count = 1 };
+                        mark_extent_allocated(group_bitmaps, used_counts, meta_ext);
+
+                        alignas(BLOCK_SIZE) char leaf_block[BLOCK_SIZE];
+                        if (storage_read(leaf_block, refs[r].leaf_block, 1) != 0) continue;
+                        const ExtentLeafHeader* leaf = reinterpret_cast<const ExtentLeafHeader*>(leaf_block);
+                        if (!disk_leaf_valid(leaf)) continue;
+                        const iExtent* exts = disk_leaf_extents(leaf_block);
+                        for (uint32_t i = 0; i < leaf->extent_count; i++)
+                            mark_extent_allocated(group_bitmaps, used_counts, exts[i]);
+                    }
+                }
             }
-            free(ind);
+            else
+            {
+                iExtent* ind = static_cast<iExtent*>(aligned_alloc(BLOCK_SIZE, BLOCK_SIZE));
+                if (ind && storage_read(ind, din.indirect_extent_block, 1) == 0)
+                {
+                    uint32_t indirect_count = din.valid_extent_count - direct_count;
+                    for (uint32_t i = 0; i < indirect_count && i < EXTENTS_PER_BLOCK; ++i)
+                        mark_extent_allocated(group_bitmaps, used_counts, ind[i]);
+                }
+                free(ind);
+            }
         }
     }
 
@@ -535,6 +628,27 @@ static bool repair_filesystem_state()
         uint32_t direct_count = MIN(din.valid_extent_count, (uint32_t)DIRECT_EXTENT_NUM);
         for (uint32_t i = 0; i < direct_count; ++i)
             journal_register_metadata_extent(din.direct_extents[i].physical_start, din.direct_extents[i].block_count);
+
+        if (disk_inode_uses_tree(din) && din.indirect_extent_block != 0)
+        {
+            alignas(BLOCK_SIZE) char root_block[BLOCK_SIZE];
+            if (storage_read(root_block, din.indirect_extent_block, 1) == 0)
+            {
+                const ExtentTreeHeader* hdr = reinterpret_cast<const ExtentTreeHeader*>(root_block);
+                const ExtentLeafRef* refs = disk_root_refs(root_block);
+                for (uint32_t r = 0; disk_root_valid(hdr) && r < hdr->leaf_count; r++)
+                {
+                    journal_register_metadata_block(refs[r].leaf_block);
+                    alignas(BLOCK_SIZE) char leaf_block[BLOCK_SIZE];
+                    if (storage_read(leaf_block, refs[r].leaf_block, 1) != 0) continue;
+                    const ExtentLeafHeader* leaf = reinterpret_cast<const ExtentLeafHeader*>(leaf_block);
+                    if (!disk_leaf_valid(leaf)) continue;
+                    const iExtent* exts = disk_leaf_extents(leaf_block);
+                    for (uint32_t e = 0; e < leaf->extent_count; e++)
+                        journal_register_metadata_extent(exts[e].physical_start, exts[e].block_count);
+                }
+            }
+        }
 
         for (uint32_t i = 0; i < direct_count; ++i) 
         {
@@ -998,23 +1112,54 @@ void journal_build_metadata_map()
         for (uint32_t i = 0; i < INODENUM_PER_BLOCK && scanned < sb.inode_num; ++i, ++scanned) 
         {
             const DInode& din = inode_block[i];
-            if (!din.used || din.type != DIRECTORY) continue;
+            if (!din.used) continue;
+            const bool is_dir = din.type == DIRECTORY;
 
             uint32_t direct_count = MIN(din.valid_extent_count, (uint32_t)DIRECT_EXTENT_NUM);
-            for (uint32_t e = 0; e < direct_count; ++e)
-                journal_register_metadata_extent(din.direct_extents[e].physical_start, din.direct_extents[e].block_count);
+            if (is_dir)
+            {
+                for (uint32_t e = 0; e < direct_count; ++e)
+                    journal_register_metadata_extent(din.direct_extents[e].physical_start, din.direct_extents[e].block_count);
+            }
 
             if (din.valid_extent_count > DIRECT_EXTENT_NUM && din.indirect_extent_block != 0) 
             {
-                iExtent* ind = static_cast<iExtent*>(aligned_alloc(BLOCK_SIZE, BLOCK_SIZE));
-                if (ind == nullptr) continue;
-                if (storage_read(ind, din.indirect_extent_block, 1) == 0) 
+                if (disk_inode_uses_tree(din))
                 {
-                    uint32_t indirect_count = din.valid_extent_count - direct_count;
-                    for (uint32_t e = 0; e < indirect_count && e < EXTENTS_PER_BLOCK; ++e)
-                        journal_register_metadata_extent(ind[e].physical_start, ind[e].block_count);
+                    alignas(BLOCK_SIZE) char root_block[BLOCK_SIZE];
+                    if (storage_read(root_block, din.indirect_extent_block, 1) == 0)
+                    {
+                        const ExtentTreeHeader* hdr = reinterpret_cast<const ExtentTreeHeader*>(root_block);
+                        const ExtentLeafRef* refs = disk_root_refs(root_block);
+                        for (uint32_t r = 0; disk_root_valid(hdr) && r < hdr->leaf_count; r++)
+                        {
+                            journal_register_metadata_block(refs[r].leaf_block);
+                            if (!is_dir) continue;
+
+                            alignas(BLOCK_SIZE) char leaf_block[BLOCK_SIZE];
+                            if (storage_read(leaf_block, refs[r].leaf_block, 1) != 0) continue;
+                            const ExtentLeafHeader* leaf = reinterpret_cast<const ExtentLeafHeader*>(leaf_block);
+                            if (!disk_leaf_valid(leaf)) continue;
+                            const iExtent* exts = disk_leaf_extents(leaf_block);
+                            for (uint32_t e = 0; e < leaf->extent_count; ++e)
+                                journal_register_metadata_extent(exts[e].physical_start, exts[e].block_count);
+                        }
+                    }
                 }
-                free(ind);
+                else
+                {
+                    if (!is_dir) continue;
+
+                    iExtent* ind = static_cast<iExtent*>(aligned_alloc(BLOCK_SIZE, BLOCK_SIZE));
+                    if (ind == nullptr) continue;
+                    if (storage_read(ind, din.indirect_extent_block, 1) == 0)
+                    {
+                        uint32_t indirect_count = din.valid_extent_count - direct_count;
+                        for (uint32_t e = 0; e < indirect_count && e < EXTENTS_PER_BLOCK; ++e)
+                            journal_register_metadata_extent(ind[e].physical_start, ind[e].block_count);
+                    }
+                    free(ind);
+                }
             }
         }
     }

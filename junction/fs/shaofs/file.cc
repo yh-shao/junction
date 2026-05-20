@@ -42,37 +42,12 @@ static inline void mark_inode_data_cache_dirty(MInode* inode, uint64_t start, ui
 // 释放 inode 持有的所有数据块（direct + indirect extents）。调用前必须持有 inode 写锁。
 static void free_inode_data_blocks(MInode* inode_ptr)
 {
-    // 释放 direct extents 中引用的所有物理块
-    int direct_count = direct_extent_count(inode_ptr);
-    for (int i = 0; i < direct_count; i++)
-    {
-        const iExtent& ext = inode_ptr->direct_extents[i];
-        for (uint64_t j = 0; j < ext.block_count; j++)
-            free_block(ext.physical_start + j);
-    }
-
-    // 释放 indirect extents 中引用的所有物理块
-    if (uses_indirect_block(inode_ptr))
-    {
-        BlockHandle ind_bh = bc_get_handle(inode_ptr->indirect_extent_block);
-        if (!ind_bh) 
-        {
-            log_err("[free_inode_data_blocks] Failed to get indirect block [%lu] for inode %d", inode_ptr->indirect_extent_block, inode_ptr->idx);
-            return;
-        }
-
-        {
-            auto ind_acc = ind_bh.read_access();
-            const iExtent* ind_exts = reinterpret_cast<const iExtent*>(ind_acc->data);
-            int indirect_count = indirect_extent_count(inode_ptr);
-            for (int i = 0; i < indirect_count; i++)
-            {
-                const iExtent& ext = ind_exts[i];
-                for (uint64_t j = 0; j < ext.block_count; j++)
-                    free_block(ext.physical_start + j);
-            }
-        }
-    }
+    auto free_data_extent = [](const iExtent& ext, void*) -> bool {
+        free_extent(&ext);
+        return true;
+    };
+    if (!inode_for_each_extent(inode_ptr, true, free_data_extent, nullptr)) log_err("[free_inode_data_blocks] failed to walk extents for inode %d", inode_ptr->idx);
+    if (!inode_free_extent_metadata(inode_ptr)) log_err("[free_inode_data_blocks] failed to free extent metadata for inode %d", inode_ptr->idx);
 
     // 清空 inode 的 extent 元数据
     memset(inode_ptr->direct_extents, 0, sizeof(inode_ptr->direct_extents));
@@ -555,6 +530,8 @@ bool file_prepare_direct_read_hint(int inum, DirectReadHint* hint)
     for (uint32_t i = 0; i < direct_count; i++)
         hint->extents[hint_count++] = read_acc->direct_extents[i];
 
+    if (uses_extent_tree(&*read_acc)) return false;
+
     if (uses_indirect_block(&*read_acc))
     {
         BlockHandle ind_bh = bc_get_handle(read_acc->indirect_extent_block);
@@ -562,7 +539,7 @@ bool file_prepare_direct_read_hint(int inum, DirectReadHint* hint)
 
         auto ind_acc = ind_bh.read_access();
         const iExtent* ind_exts = reinterpret_cast<const iExtent*>(ind_acc->data);
-        uint32_t indirect_count = indirect_extent_count(&*read_acc);
+        uint32_t indirect_count = legacy_indirect_extent_count(&*read_acc);
         for (uint32_t i = 0; i < indirect_count; i++)
             hint->extents[hint_count++] = ind_exts[i];
     }

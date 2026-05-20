@@ -94,6 +94,41 @@ typedef struct {
 } iExtent;    // in-inode extent
 static inline uint64_t extent_size(const iExtent* ext) { return ext->block_count * BLOCK_SIZE; }
 #define EXTENTS_PER_BLOCK (BLOCK_SIZE / sizeof(iExtent))
+#define LEGACY_MAX_EXTENT_NUM   (DIRECT_EXTENT_NUM + EXTENTS_PER_BLOCK)
+
+#define EXTENT_TREE_ROOT_MAGIC  0x53584552u  // "SXER"
+#define EXTENT_TREE_LEAF_MAGIC  0x5358454cu  // "SXEL"
+#define EXTENT_TREE_VERSION     1
+
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t leaf_count;
+    uint32_t indirect_extent_count;
+    uint64_t reserved[2];
+} ExtentTreeHeader;
+
+typedef struct {
+    BlockID logical_start;
+    BlockID leaf_block;
+    uint32_t extent_count;
+    uint32_t reserved;
+} ExtentLeafRef;
+
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t extent_count;
+    uint32_t reserved;
+    uint64_t reserved2[2];
+} ExtentLeafHeader;
+
+static_assert(sizeof(ExtentTreeHeader) == 32);
+static_assert(sizeof(ExtentLeafRef) == 24);
+static_assert(sizeof(ExtentLeafHeader) == 32);
+
+#define EXTENT_TREE_ROOT_REFS       ((BLOCK_SIZE - sizeof(ExtentTreeHeader)) / sizeof(ExtentLeafRef))
+#define EXTENT_TREE_LEAF_EXTENTS    ((BLOCK_SIZE - sizeof(ExtentLeafHeader)) / sizeof(iExtent))
 
 typedef struct {
 	int         idx;

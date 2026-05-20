@@ -50,15 +50,24 @@ static inline void update_extent_hint(MInode* inode, const iExtent& ext)
     }
 }
 
-static inline bool uses_indirect_block(const MInode* inode) 
+static inline bool uses_indirect_block(const DInode* inode) 
 {
     return inode->valid_extent_count > DIRECT_EXTENT_NUM;
 }
-static inline uint32_t direct_extent_count(const MInode* inode)
+static inline bool uses_extent_tree(const DInode* inode)
+{
+    return inode->valid_extent_count > LEGACY_MAX_EXTENT_NUM;
+}
+static inline uint32_t direct_extent_count(const DInode* inode)
 {
     return MIN(inode->valid_extent_count, (uint32_t)DIRECT_EXTENT_NUM);
 }
-static inline uint32_t indirect_extent_count(const MInode* inode)
+static inline uint32_t indirect_extent_count(const DInode* inode)
 {
     return inode->valid_extent_count - direct_extent_count(inode);
+}
+static inline uint32_t legacy_indirect_extent_count(const DInode* inode)
+{
+    if (inode->valid_extent_count <= DIRECT_EXTENT_NUM) return 0;
+    return MIN(inode->valid_extent_count - (uint32_t)DIRECT_EXTENT_NUM, (uint32_t)EXTENTS_PER_BLOCK);
 }

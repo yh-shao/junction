@@ -292,22 +292,11 @@ static void fill_stat_from_inode(const MInode* inode, int inum, struct stat *st)
 
     // 统计已分配的物理块数（st_blocks 单位为 512B 扇区）
     uint64_t allocated_blocks = 0;
-    int direct_count = direct_extent_count(inode);
-    for (int i = 0; i < direct_count; i++)
-        allocated_blocks += inode->direct_extents[i].block_count;
-
-    // indirect extent block 中可能还有更多 extent
-    if (direct_count == DIRECT_EXTENT_NUM && inode->indirect_extent_block != 0)
-    {
-        BlockHandle ind_bh = bc_get_handle(inode->indirect_extent_block);
-        if (ind_bh)
-        {
-            auto ind_acc = ind_bh.read_access();
-            const iExtent* ind_exts = reinterpret_cast<const iExtent*>(ind_acc->data);
-            int indirect_count = indirect_extent_count(inode);
-            for (int i = 0; i < indirect_count; i++) allocated_blocks += ind_exts[i].block_count;
-        }
-    }
+    auto count_extent = [](const iExtent& ext, void* arg) -> bool {
+        *static_cast<uint64_t*>(arg) += ext.block_count;
+        return true;
+    };
+    if (!inode_for_each_extent(inode, true, count_extent, &allocated_blocks)) log_err("[fill_stat_from_inode] failed to walk extents for inode %d", inum);
 
     st->st_blocks = allocated_blocks * (BLOCK_SIZE / 512);
 
@@ -420,8 +409,7 @@ int my_fsync(int inum)
             if (!flush_run()) return -EIO;
         }
 
-        if (uses_indirect_block(&(*read_acc)) && read_acc->indirect_extent_block != 0)
-            bc_flush_block(read_acc->indirect_extent_block);
+        if (!inode_flush_extent_metadata(&(*read_acc))) return -EIO;
     }
 
     if (!has_dirty_data && !need_inode_flush) return 0;

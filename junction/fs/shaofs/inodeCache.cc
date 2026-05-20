@@ -101,25 +101,12 @@ bool ic_free_inode(int inum)   // 释放该 inode 持有的所有资源，inum �
         write_acc->drop_dir_index();
         write_acc->used = false;             // 逻辑删除（新的读写请求拿到锁后看到 used == false 会直接退出）
 
-        // 释放 direct extents 中引用的所有物理块
-        uint32_t direct_count = direct_extent_count(&(*write_acc));
-        for (int i = 0; i < direct_count; i++) free_extent(&write_acc->direct_extents[i]);
-
-        // 释放 indirect extents 中引用的所有物理块
-        if (uses_indirect_block(&(*write_acc)))
-        {
-            BlockHandle ind_bh = bc_get_handle(write_acc->indirect_extent_block);
-            if (ind_bh)
-            {
-                auto ind_acc = ind_bh.write_access();
-                const iExtent* ind_exts = reinterpret_cast<const iExtent*>(ind_acc->data);
-                uint32_t indirect_count = indirect_extent_count(&(*write_acc));
-                for (int i = 0; i < indirect_count; i++) free_extent(&ind_exts[i]);
-
-                memset(ind_acc->data, 0, BLOCK_SIZE);
-                ind_acc.mark_dirty();
-            }
-        }
+        auto free_data_extent = [](const iExtent& ext, void*) -> bool {
+            free_extent(&ext);
+            return true;
+        };
+        if (!inode_for_each_extent(&(*write_acc), true, free_data_extent, nullptr)) log_err("[ic_free_inode] failed to walk extents for inode %d", inum);
+        if (!inode_free_extent_metadata(&(*write_acc))) log_err("[ic_free_inode] failed to free extent metadata for inode %d", inum);
 
         write_acc->type      = UNKNOWN;
         write_acc->nlink     = 0;
