@@ -1,6 +1,6 @@
 # Project Handover / ShaOFS 全局项目交接与 AI 上下文恢复文档
 
-> **文档版本**: v4.10 | **最后更新**: 2026-05-20
+> **文档版本**: v4.11 | **最后更新**: 2026-05-21
 > **目的**: 使任何 AI Code Agent 读取本文档后，能瞬间加载全部项目上下文，无缝继续开发。
 
 > **2026-05-06 补充说明**: 本文档保留了 2026-04-10 之前关于 ShaOFS 架构、测试和优化的历史沉淀。本次交接修正了与当前代码明显不一致的事实，并追加了 FIO-on-Junction 适配、补丁管理脚本和当前验证状态。历史性能测试结果可能不可靠，已从本文档移除；正式性能数据应以重新跑出的 benchmark 原始输出为准。
@@ -24,6 +24,8 @@
 > **2026-05-19 补充说明**: 本次交接追加了 Filebench `varmail.f` 跑通、性能瓶颈分析和 fsync/journal 优化状态。当前 ShaOFS 代码包含 `unlink` dispatch、目录运行时 hash/index、`fsync` dirty byte range + inode metadata sequence 快路径，以及 metadata journal 的 group commit + 多槽 async checkpoint/recovery scan。2026-05-19 当时 `build/CMakeCache.txt` 为 `SHAOFS_IO_PREEMPT=ON`、`SHAOFS_CRASH_CONSISTENCY=ON`，`build/junction/caladan_test.config` 为 `runtime_kthreads=10`、`runtime_spinning_kthreads=0`、`runtime_quantum_us=100`。本阶段 Filebench `shaofs_varmail.f` 最终原始输出位于 `/tmp/shaofs_varmail_ring.log`，约 `173399 ops/s`、`625.1mb/s`；同参数 ext4 300MiB cgroup 对比输出位于 `junction/fs/mytest/scripts/results/ext4_filebench_20260517_155402.log`，约 `110749 ops/s`、`399.4mb/s`。优化后的清理已移除临时 journal stats 输出和临时 fsync fastpath 测试源文件；清理后重新构建通过，但未重新跑完整 Filebench。
 
 > **2026-05-20 补充说明**: 本次交接追加了 ShaOFS DSA/DML 异步 copy 路径的并发修复、清理状态、simple extent tree 优化，以及在 `runtime_kthreads=1`、`runtime_spinning_kthreads=1` 下对 Filebench `fileserver.f` / `webserver.f` / `varmail.f` / `webproxy.f` 的 ShaOFS 与 ext4 对比结果。当前 HEAD 为 `ea98931 simple extent tree: to support more extents for each file; DSA fixed`；该提交把单 inode 从 legacy 的 `6 + 170 = 176` extents 扩展为 direct extents + 固定深度 root/leaf extent tree，当前上限为 `6 + 169 * 169 = 28567` extents，同时保留 legacy 小文件布局以避免常见路径性能下降。当前 `build/junction/caladan_test.config` 已是 1 个 runtime kthread；`build/CMakeCache.txt` 仍为 `SHAOFS_IO_PREEMPT=ON`、`SHAOFS_CRASH_CONSISTENCY=ON`。DSA 仍用于大块 user buffer 与 block cache buffer 之间的内存 copy offload，不负责磁盘 I/O；本轮修复了 batch buffer 64B 对齐、runtime completion callback 上下文错误、DSA request tcache 可抢占复入、以及 preempt-disabled 上下文中非法 async park 等问题。清理后重新执行 `cmake --build build -j$(nproc)` 通过。单核 Filebench 对比中，ShaOFS 相对 ext4 的 IOPS 提升约为 fileserver `2.20x`、webserver `1.95x`、varmail `2.01x`、webproxy `1.31x`；其中 varmail 的最终 DSA 修复后结果来自本轮会话终端输出，尚未保存到稳定日志文件，正式报告前应重跑并保存原始输出。
+
+> **2026-05-21 补充说明**: 本次交接核对了当前仓库状态、配置和 DSA 代码。当前 HEAD 为 `cc9910a basic dsa`，位于 `dsa` 分支；`ea98931` simple extent tree 仍在当前历史中，相关 extent tree 代码仍存在。当前 `build/junction/caladan_test.config` 为 `runtime_kthreads=1`、`runtime_spinning_kthreads=1`、`runtime_quantum_us=100`，`build/CMakeCache.txt` 为 `SHAOFS_IO_PREEMPT=ON`、`SHAOFS_CRASH_CONSISTENCY=ON`。本轮尝试过“复用 `dsa_copyv()` 的 DML batch job，避免每次 init/finalize”的优化，但 A/B 结果没有提升：长版 `large_cached_io` 复用版约 `70176 IOPS / 17544 MiB/s`，回到旧实现后约 `70341 IOPS / 17585 MiB/s`；因此该优化已回滚，当前 `junction/fs/shaofs/dsa.cc` 仍是每次 `dsa_copyv()` 提交前 `dml_init_job()`、结束后 `dml_finalize_job()` 的版本。当前没有保留新的 DSA 性能改动，也没有修改 Junction/Caladan 核心代码。本轮还提出了下一阶段优化方向但尚未实现：小/中等 EOF append 批量分配和写入、regular file `unlink` 延迟释放数据块、以及可选的 ShaOFS 原子 append 路径。详见第二十三章。
 
 ---
 
@@ -558,7 +560,7 @@ inode_bmap_locked(inode_ptr, logical_blk, allocate, is_new):
 
 **2026-05-20 simple extent tree 现状**：
 
-当前 HEAD `ea98931` 已把“单 inode 最多 176 个 extents”的旧限制扩展为固定深度 simple extent tree。这个设计刻意很轻量，目标是保证常见小文件和顺序/append workload 仍走原来的快路径，同时让稀疏写、随机碎片写或强压力测试可以支撑大量 extents。
+2026-05-20 的 `ea98931` 已把“单 inode 最多 176 个 extents”的旧限制扩展为固定深度 simple extent tree；2026-05-21 当前 `cc9910a` 仍保留该实现。这个设计刻意很轻量，目标是保证常见小文件和顺序/append workload 仍走原来的快路径，同时让稀疏写、随机碎片写或强压力测试可以支撑大量 extents。
 
 - `DInode::direct_extents[6]` 不变，前 6 个 extents 仍直接放在 inode 内。
 - 当 `valid_extent_count <= LEGACY_MAX_EXTENT_NUM` 时，`indirect_extent_block` 仍保存 legacy flat `iExtent[170]`，这避免小文件/少 extent 文件为 tree 付出额外 leaf lookup 成本。
@@ -1724,7 +1726,7 @@ IO Summary: 1979495 ops 989422.475 ops/s 32981/692595 rd/wr 579.4mb/s 0.001ms/op
 
 **历史触发条件**：单个文件的物理块分配高度碎片化时，extent 数超过旧布局 `DIRECT_EXTENT_NUM + EXTENTS_PER_BLOCK = 176` 上限。历史上 Filebench `fileserver.f` 的 append-heavy 模式曾触发该问题。
 
-**当前状态**：2026-05-13 已在普通文件 EOF append 路径加入批量预分配，2026-05-20 HEAD `ea98931` 又加入 simple extent tree。现在 `valid_extent_count <= 176` 的文件继续使用 legacy flat indirect block；超过 176 后会把 `indirect_extent_block` 解释为 tree root，并通过 leaf metadata blocks 保存大量 indirect extents。当前代码上限是 `DIRECT_EXTENT_NUM + EXTENT_TREE_ROOT_REFS * EXTENT_TREE_LEAF_EXTENTS = 28567` extents。
+**当前状态**：2026-05-13 已在普通文件 EOF append 路径加入批量预分配，2026-05-20 的 `ea98931` 又加入 simple extent tree；2026-05-21 当前代码仍保留该实现。现在 `valid_extent_count <= 176` 的文件继续使用 legacy flat indirect block；超过 176 后会把 `indirect_extent_block` 解释为 tree root，并通过 leaf metadata blocks 保存大量 indirect extents。当前代码上限是 `DIRECT_EXTENT_NUM + EXTENT_TREE_ROOT_REFS * EXTENT_TREE_LEAF_EXTENTS = 28567` extents。
 
 **仍需注意**：simple extent tree 是固定深度轻量结构，不是通用 B+tree。超过 28567 extents 仍会失败并打印类似 `[extent] extent tree root overflow ...` / `[extent] Extent tree overflow ...`。乱序或极端碎片插入会走 `collect_all_extents()` + sort/compact + rewrite tree 的 slow path，适合测试正确性，不适合作为随机写极致性能路径。后续若要继续扩大容量，应优先设计多级 tree 或进一步增强连续块分配策略。
 
@@ -3260,11 +3262,11 @@ enable_storage 1
 - `file_read_batch()` 在大块 buffered read 中最多收集 `dsa_batch_task_num=32` 个 `Segment` 后调用 `dsa_copyv()`；`file_write_batch_existing()` 在覆盖已有物理块的大写入中同样使用 `dsa_copyv()`；blockwise write 仍调用 `dsa_copy()`，但单块 copy 多数低于默认 DSA 阈值，会 fallback 到 CPU `memcpy`。
 - 小读路径 `file_read_blockwise()` 中原来的 `dsa_copy()` 调用仍是注释状态，实际使用 `memcpy()`；这是当前代码事实，不应在报告中写成小读会走 DSA。
 - Caladan `runtime_async_process()` 的行为是：poll 成功后从 pending list 删除 op，先 `thread_ready_head_locked(op->waiting_th)`，然后如果 `op->complete` 非空才调用 completion callback。当前 DSA 代码将 `async.complete=nullptr`，真正的 request free 和 fallback copy 都在 `runtime_async_park()` 返回后的原 uthread 中执行。
-- 当前 `junction/fs/shaofs/dsa.cc` 中没有 `shaofs_dsa_complete()` / `shaofs_dsa_batch_complete()` 空函数，也不再保存 batch request 的 `nr` / `vecs[]` 字段。这些是本轮清理后删除的 callback 方案遗留内容。
+- 当前 `junction/fs/shaofs/dsa.cc` 中没有 `shaofs_dsa_complete()` / `shaofs_dsa_batch_complete()` 空函数，也不保存 batch request 的 `nr` 字段。注意：当前仍保留 `ShaofsDsaBatchReq::vecs[]`，用于 DML batch 完成后若状态失败，由原 uthread 执行 `memcpy_v(req->vecs, req->task_count)` fallback；不要把它误删。
 - 当前 `junction/fs/shaofs/dsa.cc` 保留了以下必要修复：batch buffer 64B 对齐、DSA request tcache alloc/free 短暂 `preempt_disable()`、`dsa_should_offload()` 中的 `preempt_enabled()` 检查、park 返回后由原 uthread free/fallback、每次 submit 前重设 `async.poll` 并设置 `async.complete=nullptr`。
 - 本轮检查确认 `lib/caladan/runtime/async.c` 和 `lib/caladan/runtime/sched.c` 中没有留下 DSA duplicate-ready / preempt_cnt 诊断日志；`rg` 只在 Caladan 其它正常代码中找到无关 `snprintf`。
 - 本轮结束时 `pgrep -a iokerneld` 和 `pgrep -a junction_run` 没有输出，表示没有残留 IOKernel 或 Junction 运行进程。
-- 当前 HEAD `ea98931` 已包含 simple extent tree 和 DSA 修复；本轮接手检查时 `git status --short` 只显示 `HANDOVER.md` 为 tracked modified，外加大量既有 untracked benchmark/test/build 文件。不要根据 2026-05-19 的历史记录误判 `junction/fs/shaofs/{extent.cc,extent.h,file.cc,fs.h,inode.h,inodeCache.cc,journal.cc,syscall.cc}` 仍是未提交修改。
+- 2026-05-20 当时 HEAD 为 `ea98931`，已包含 simple extent tree 和 DSA 修复。2026-05-21 重新核对时当前 HEAD 已前进到 `cc9910a basic dsa`（`dsa` 分支），但 simple extent tree 仍在当前历史中。当前 `git status --short -- junction/fs/shaofs` 没有显示 ShaOFS 核心文件 dirty diff；不要根据 2026-05-19 的历史记录误判 `junction/fs/shaofs/{extent.cc,extent.h,file.cc,fs.h,inode.h,inodeCache.cc,journal.cc,syscall.cc}` 仍是未提交修改。
 
 ### 21.3 DSA bug 的原因与修复结论
 
@@ -3281,7 +3283,7 @@ enable_storage 1
 2. **DML batch buffer 对齐与越界风险**
    - DML `dml_get_batch_size()` 返回 `task_size * task_count + 64`，并且 DML 内部会用 `dml::align(pointer, 64)` 对 `job->destination_first_ptr` 向上对齐后再写 descriptor/completion record。
    - 修改前 ShaOFS 直接把 batch buffer 放在 `&req->job + dsa_hw_job_size`，没有显式保证 64B 对齐，也没有额外预留对齐 padding，存在 DML 写入越过 ShaOFS 预期区域并污染 request 元数据的风险。
-   - 当前修复：`dsa_batch_buffer()` 显式向上 64B 对齐，`dsa_batch_req_size` 额外加 `kDsaBatchBufferAlignment` padding。
+   - 当前修复：`dsa_batch_buffer()` 显式向上 64B 对齐，`dsa_batch_req_size` 额外加 `kDsaBatchBufferAlign` padding。
 
 3. **DSA request tcache 可被 uthread 抢占复入**
    - Caladan tcache 是 perthread/per-kthread magazine cache，fast path 会直接修改 `ltc->rounds`、`ltc->loaded` 和 free-list 指针。
@@ -3298,7 +3300,7 @@ enable_storage 1
    - `runtime_async_op` 位于 `ShaofsDsaReq` / `ShaofsDsaBatchReq` offset 0；Caladan tcache free-list 也使用对象开头保存 next 指针。
    - 当前代码在每次 submit 前重新设置 `req->async.poll` 和 `req->async.complete=nullptr`，不能依赖 request 复用后的旧值。
 
-本轮清理删除的无用内容：空 completion 函数、batch request 中不再使用的 `nr` / `vecs[]` 字段、以及对应的赋值。保留的 DSA 修改均直接服务于正确性或并发安全，不属于 debug 输出。
+本轮清理删除的无用内容：空 completion 函数、batch request 中不再使用的 `nr` 字段、以及对应的赋值。`vecs[]` 仍然是必要字段，用于 DSA batch 失败后的原 uthread fallback copy。保留的 DSA 修改均直接服务于正确性或并发安全，不属于 debug 输出。
 
 ### 21.4 本轮运行过的 DSA / varmail 验证
 
@@ -3342,7 +3344,7 @@ exit code 0
 
 - `junction/fs/shaofs/dsa.cc` 当前包含本轮必要修复。`cmake --build build -j$(nproc)` 已在 DSA 清理后通过。
 - `HANDOVER.md` 是本次交接更新文件。
-- 当前 HEAD `ea98931` 已包含 ShaOFS simple extent tree、DSA 修复及相关 file/fs/inode/inodeCache/journal/syscall 适配；本轮接手检查时这些 ShaOFS 核心文件相对 HEAD 没有 diff。当前 tracked modified 文件是 `HANDOVER.md`。
+- 2026-05-20 当时 HEAD `ea98931` 已包含 ShaOFS simple extent tree、DSA 修复及相关 file/fs/inode/inodeCache/journal/syscall 适配。2026-05-21 当前 HEAD 为 `cc9910a basic dsa`，相对 `ea98931` 主要修改 `junction/fs/shaofs/dsa.cc`；当前 `git status --short -- junction/fs/shaofs` 没有显示 ShaOFS 核心文件 dirty diff。
 - 当前 `junction/fs/mytest/benchmark/`、`junction/fs/mytest/scripts/` 和大量测试 C 文件是 untracked 工作区内容，但其中许多已被前序 benchmark、Filebench/FIO/FxMark 适配流程引用。是否纳入版本控制需要用户决定。
 - Filebench 源码应继续通过 `junction/fs/mytest/benchmark/patch/filebench_changes.patch` 和 `toggle_filebench.sh` 管理；跑 ext4 时 `run_ext4_filebench.sh` 会 revert Filebench patch 并重建原生 Filebench，跑 Junction/ShaOFS 前必须重新 `toggle_filebench.sh apply`。
 - 本轮没有修改 Junction 核心 syscall/VFS 代码，也没有修改 Caladan runtime 代码；临时 runtime async/sched 诊断日志已清理。
@@ -3371,14 +3373,14 @@ exit code 0
 
 ## 第二十二章：2026-05-20 Simple Extent Tree 交接补充
 
-本章补充记录本轮会话中“让单个 inode 可以分配更多 extent”的优化。上一版交接遗漏了这部分，这是不完整的；当前代码和 git 历史明确表明该优化已经进入 HEAD。
+本章补充记录 2026-05-20 会话中“让单个 inode 可以分配更多 extent”的优化。上一版交接遗漏了这部分，这是不完整的；当前代码和 git 历史明确表明该优化已经进入当前历史。2026-05-21 当前 HEAD 是 `cc9910a basic dsa`，但 simple extent tree 相关代码仍然存在。
 
 ### 22.1 代码和 commit 证据
 
-当前 HEAD：
+2026-05-20 当时的提交：
 
 ```text
-ea98931 (HEAD -> syh) simple extent tree: to support more extents for each file; DSA fixed
+ea98931 simple extent tree: to support more extents for each file; DSA fixed
 ```
 
 该提交修改了：
@@ -3512,3 +3514,141 @@ sudo timeout 600s ./junction_run caladan_test.config -- mytest/test_shaofs_mt_fu
 3. `write_tree_from_sorted()` 在 legacy 和 tree 布局之间转换时，旧 tree leaf metadata 是否存在泄漏。当前代码在 `write_tree_from_sorted()` 中分配新 leaf 并写 root；如果未来支持 tree 文件 extent 数下降回 legacy，应专门审查旧 leaf 回收逻辑。
 4. `bmap_insert_compact_extents()` 的 vector 收集、sort 和 compact 是否维持 logical_start 单调性；root refs 依赖每个 leaf 的第一个 logical_start 做二分。
 5. Direct read hint 对 tree 文件必须保持禁用，否则会把 tree root 误解释为 flat extent array。
+
+## 第二十三章：2026-05-21 当前会话交接补充
+
+本章记录 2026-05-21 当前会话结束前的最新状态。重点是：当前代码事实、DSA job 复用优化为何没有保留、Filebench/varmail 的最新回归结果、以及下一阶段更深层优化的可执行方案。
+
+### 23.1 本次实际检查过的内容
+
+本次按“先读当前项目事实，再更新交接文档”的原则核对了以下内容：
+
+```bash
+sed -n "1,260p" HANDOVER.md
+rg -n "dsa_copy|dsa_copyv|read|write|fsync|journal|extent|dir_add_entry|dir_delete_entry" junction/fs/shaofs
+sed -n "1,820p" junction/fs/shaofs/file.cc
+sed -n "1,520p" junction/fs/shaofs/syscall.cc
+sed -n "1,620p" junction/fs/shaofs/dir.cc
+sed -n "1,180p" junction/fs/shaofs/namei.cc
+sed -n "1,240p" junction/fs/shaofs/blockCache.cc
+sed -n "1,260p" junction/fs/shaofs/generic_cache/cache.h
+sed -n "1,980p" junction/fs/shaofs/extent.cc
+sed -n "1,380p" junction/fs/shaofs/group.cc
+sed -n "1,240p" junction/fs/shaofs/fs.h
+sed -n "1,140p" junction/fs/shaofs/inode.h
+sed -n "1,160p" junction/fs/shaofs/inodeCache.cc
+sed -n "1,540p" junction/fs/shaofs/dsa.cc
+sed -n "1,240p" junction/fs/mytest/benchmark/filebench_wml/shaofs_varmail.f
+git -C /home/syh/MyProj1/junction log -1 --oneline
+git -C /home/syh/MyProj1/junction log --oneline --decorate --max-count=12
+git -C /home/syh/MyProj1/junction status --short -- HANDOVER.md junction/fs/shaofs junction/fs/mytest/benchmark/patch junction/fs/mytest/benchmark/filebench_wml junction/fs/mytest/scripts build/junction/caladan_test.config build/CMakeCache.txt
+sed -n "1,120p" build/junction/caladan_test.config
+rg -n "SHAOFS_IO_PREEMPT|SHAOFS_CRASH_CONSISTENCY" build/CMakeCache.txt
+```
+
+部分带管道或复杂 shell 语法的只读命令在当前 sandbox 中仍可能失败并输出 `bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`。遇到这种情况时，本轮使用不带管道的 `sed`、`git -C` 或已批准命令完成核对。
+
+### 23.2 当前确认的客观状态
+
+- 当前 HEAD 为 `cc9910a basic dsa`，当前分支为 `dsa`；`ea98931 simple extent tree: to support more extents for each file; DSA fixed` 仍在历史中。
+- 当前 `build/junction/caladan_test.config` 为 `runtime_kthreads 1`、`runtime_spinning_kthreads 1`、`runtime_guaranteed_kthreads 0`、`runtime_quantum_us 100`、`enable_storage 1`。
+- 当前 `build/CMakeCache.txt` 为 `SHAOFS_IO_PREEMPT:BOOL=ON`、`SHAOFS_CRASH_CONSISTENCY:BOOL=ON`。
+- `git status --short -- junction/fs/shaofs` 没有输出，表示当前 ShaOFS 核心源码相对 HEAD 没有 dirty diff。
+- `junction/fs/mytest/benchmark/filebench_wml/`、`junction/fs/mytest/benchmark/patch/`、`junction/fs/mytest/scripts/` 当前仍是 untracked 工作区目录，但其中包含当前 Filebench/FIO/FxMark/ext4 对比流程依赖的 WML、patch 和脚本。不要直接 `git clean` 或批量删除。
+- 当前 `junction/fs/shaofs/dsa.cc` 中 `dsa_copyv()` 仍是每次调用 `dml_init_job(DML_PATH_HW, &req->job)`，完成后 `dml_finalize_job(&req->job)` 的实现；本轮尝试过的 batch job 复用优化没有保留。
+- 当前 `ShaofsDsaBatchReq` 仍包含 `Segment vecs[dsa_batch_task_num]`。该字段用于 DML batch submit 成功但完成状态失败时，由原 uthread fallback `memcpy_v(req->vecs, req->task_count)`，不是无用字段。
+- 当前 DSA request tcache alloc/free 仍在短临界区内 `preempt_disable()` / `preempt_enable()`，并且 `dsa_should_offload()` / `dsa_batch_should_offload()` 会在 `!preempt_enabled()` 时 fallback CPU memcpy。这些是并发正确性保护。
+
+### 23.3 本轮运行过的构建和测试
+
+本轮先实现了一个 DML batch job 复用实验，随后按约束进行正确性和性能验证。由于 A/B 未显示收益，最终没有保留该代码修改。
+
+- `cmake --build build -j$(nproc)`：在实验实现后构建通过。
+- `large_dsa_verify`：在 Junction/ShaOFS 下通过，输出 `large DSA verify passed`。
+- `large_cached_io 4 FSHAO:/large_cached_dsa 16777216 262144 50 128 0`：复用版结果 `60577.82 IOPS`、`15144.45 MiB/s`；此前同参数历史结果约 `61068 IOPS`、`15267 MiB/s`，未提升。
+- 长版 `large_cached_io 4 FSHAO:/large_cached_dsa_long 16777216 262144 50 4096 0`：复用版结果 `70176.05 IOPS`、`17544.01 MiB/s`。
+- 回滚到旧实现后同参数长版 `large_cached_io 4 FSHAO:/large_cached_dsa_long_base 16777216 262144 50 4096 0`：结果 `70341.12 IOPS`、`17585.28 MiB/s`。旧实现略高，差异接近噪声但没有证明复用版有收益。
+- `shaofs_varmail.f`：复用版完整跑完，结果 `11678062 ops`、`194630.026 ops/s`、`701.5mb/s`，与此前 `194260 - 196091 ops/s` 区间一致，说明没有明显回归，但也没有证明性能提升。
+- 测试结束后已执行 `pkill -9 iokerneld`，随后 `pgrep -a iokerneld` 和 `pgrep -a junction_run` 均无输出。
+
+结论：DML batch job 复用实验没有可测收益，且会增加状态管理复杂度；已回滚，不应在下一轮误以为这是待完成的半成品。
+
+### 23.4 当前代码热路径理解
+
+从本轮代码阅读看，Filebench 四项 workload 的主要压力不是单纯大块 DSA copy，而是小文件元数据和小/中等 append 路径：
+
+- `fileserver.f` 当前是 40 files、1 thread、2s runtime 的 smoke workload；包含 create、writewholefile、20 次 append、readwholefile、delete、stat。
+- `webserver.f` 是 1000 files、100 threads、60s runtime，主要是多次 open/readwholefile/close，加一个 appendlog。
+- `shaofs_varmail.f` 是 1000 files、16 threads、60s runtime，包含 delete/create/append/fsync/open/read/append/fsync/open/read，是当前 fsync、目录、inode、block cache、unlink 混合路径的代表。
+- `webproxy.f` 是 10000 files、100 threads、60s runtime，包含 delete/create/append 后多次 open/readwholefile/close；当前单核优势最小，适合作为后续瓶颈定位目标。
+
+当前关键热路径事实：
+
+- `file_write()` 对 `len < kFileBatchCopyMin(64KB)` 进入 `file_write_blockwise()`，按 4KB 循环处理；Filebench 的 16KB append 正好主要走这条路径。
+- `file_write_blockwise()` 在需要扩展文件时，每个 block 调一次 `inode_bmap_locked(..., allocate=true)`，最终通常走 `alloc_block()` 单块分配；只有普通文件 EOF append 且 `file_size >= 256KB` 时才触发 `bmap_prealloc_append()` 的 64/128-block 预分配。
+- `varmail` / `webproxy` 的平均文件和 append 大约 16KB，很多文件不会达到 256KB，因此现有 append 预分配对这些 workload 覆盖有限。
+- `dir_add_entry()` / `dir_delete_entry()` 已有目录运行时 hash index 和 free slot 链表；目录 lookup 已不是单纯线性扫描，但 create/delete 仍会写目录数据块并更新 dentry cache。
+- `my_fsync()` 已使用 dirty byte range、contiguous block flush 和 inode metadata sequence 快路径；继续优化 fsync 前应先 profile，避免破坏 crash-consistency 语义。
+- `ic_free_inode()` 当前在 unlink 热路径中同步遍历并释放 regular file 的所有数据 extents 和 extent metadata；Filebench delete-heavy workload 会直接承担 bitmap 回收成本。
+
+### 23.5 下一阶段建议代码修改方案（尚未实现）
+
+下一阶段应优先优化 Filebench 小文件路径，而不是继续做 DSA 固定开销微调。建议按以下顺序实现，每一步都要先跑 baseline，再 A/B 验证；无收益则回滚。
+
+1. **小/中等 EOF append 批量分配与写入**
+   - 在 `extent.cc` 增加受 inode 写锁保护的 helper，例如 `inode_alloc_append_range_locked()`。
+   - 内部调用 `alloc_blocks()` 一次获取多个块，把物理连续块合并为 `iExtent` runs，再复用 `bmap_insert_compact_extents()` 写回 legacy/tree extent metadata。
+   - 在 `file.cc` 增加 append/extend 批量写路径：当写入从 EOF 开始、会新增至少 2 个 blocks、且不是目录文件时，一次持有 inode 写锁完成 bmap、file_size、dirty range 和 block cache entry 初始化。
+   - 非 EOF 覆盖写、稀疏远距离写、目录写、已有 partial block 合并等复杂场景继续走现有 `file_write_blockwise()`，降低正确性风险。
+
+2. **regular file unlink 延迟释放数据块**
+   - 目标是把 Filebench 测量期内 `deletefile` 的 bitmap 回收成本从前台热路径移开。
+   - `ic_free_inode()` 对 regular file 可先把 extents 拷贝到 deferred-free queue，立即清空 inode、释放 inum、使目录项删除可见；实际 `free_extent()` 在 `shaofs_sync_all()` / `final_flush()` 前 drain。
+   - 目录文件、extent metadata blocks、crash recovery 相关元数据不能简单延迟；实现前必须明确 dirty mount repair 如何处理“inode 已清空但数据块尚未回收”的泄漏窗口。若无法证明 crash 语义，先只在 `CRASH_CONSISTENCY=0` 或明确 benchmark-only 开关下启用。
+
+3. **ShaOFS O_APPEND 原子 append 快路径（可选）**
+   - 当前 `usys_write()` 对 ShaOFS `O_APPEND` 是先 `my_lseek(SEEK_END)` 再 `my_write()`，既有额外查 size 成本，也不是严格原子 append。
+   - 可增加 `my_write_append()` / `file_write_append()`，在 inode 写锁内读取 EOF 并写入，减少一次 syscall 层 lseek 和竞争窗口。
+   - 这会触碰 `junction/fs/file.cc` 的 ShaOFS 分支，虽然属于集成路径，但仍应保持最小改动，不要重构 Junction VFS。
+
+4. **profile 后再考虑 fsync/journal 改动**
+   - `my_fsync()` 和 journal group commit 已经过多轮优化。下一步若要改，应先用 varmail operation breakdown、内部计数或 perf 证明瓶颈在 journal，而不是 append allocation、unlink 或目录路径。
+
+### 23.6 建议验证矩阵
+
+修改前后至少保存以下命令的 stdout/stderr、退出码、当前 HEAD、`build/CMakeCache.txt` 中两个 ShaOFS 开关、`build/junction/caladan_test.config` 和 WML 文件副本：
+
+```bash
+cmake --build build -j$(nproc)
+
+gcc /home/syh/MyProj1/junction/junction/fs/mytest/large_dsa_verify.c -o /home/syh/MyProj1/junction/build/junction/mytest/large_dsa_verify -lpthread
+gcc /home/syh/MyProj1/junction/junction/fs/mytest/large_cached_io.c -o /home/syh/MyProj1/junction/build/junction/mytest/large_cached_io -lpthread
+sudo bash /home/syh/mkfs/mkfs.sh
+sudo /home/syh/MyProj1/junction/lib/caladan/iokerneld ias
+cd /home/syh/MyProj1/junction/build/junction
+sudo timeout 30s ./junction_run caladan_test.config -- mytest/large_dsa_verify
+sudo timeout 60s ./junction_run caladan_test.config -- mytest/large_cached_io 4 FSHAO:/large_cached_dsa 16777216 262144 50 128 0
+
+sudo timeout 90s ./junction_run caladan_test.config -- /home/syh/MyProj1/junction/junction/fs/mytest/benchmark/filebench/filebench -f /home/syh/MyProj1/junction/junction/fs/mytest/benchmark/filebench_wml/fileserver.f
+sudo timeout 120s ./junction_run caladan_test.config -- /home/syh/MyProj1/junction/junction/fs/mytest/benchmark/filebench/filebench -f /home/syh/MyProj1/junction/junction/fs/mytest/benchmark/filebench_wml/shaofs_varmail.f
+sudo timeout 120s ./junction_run caladan_test.config -- /home/syh/MyProj1/junction/junction/fs/mytest/benchmark/filebench/filebench -f /home/syh/MyProj1/junction/junction/fs/mytest/benchmark/filebench_wml/webproxy.f
+sudo timeout 120s ./junction_run caladan_test.config -- /home/syh/MyProj1/junction/junction/fs/mytest/benchmark/filebench/filebench -f /home/syh/MyProj1/junction/junction/fs/mytest/benchmark/filebench_wml/webserver.f
+
+sudo pkill -9 iokerneld
+pgrep -a iokerneld
+pgrep -a junction_run
+```
+
+对于会改变 extent/unlink 语义的改动，还应补跑：
+
+- `test_shaofs_many_extents.c`
+- `test_shaofs_mt_full_extents.c` 的 `write-verify`、`verify-only`、`verify-unlink` 模式
+- `test_shaofs_unlink.c`、`test_shaofs_concurrent_correctness.c`、`test_shaofs_syscall_correctness.c`（若当前工作区版本可编译）
+
+### 23.7 当前未决问题和风险
+
+- **Filebench 和脚本目录仍是 untracked**：这些文件对当前实验很重要，但尚未纳入版本控制。下一位接手者不要依赖 `git clean` 恢复干净状态，除非用户明确批准并确认哪些文件可删除。
+- **DSA batch job 复用已证明无收益并回滚**：不要继续沿这个方向做复杂状态复用，除非有新的 profile 证明 `dml_init_job()` / `dml_finalize_job()` 是主要瓶颈。
+- **small append batching 需要严控边界**：目录写、稀疏写、非 EOF 覆盖写和 partial-block 写都容易引入数据一致性问题，第一版应只覆盖 regular file EOF append 的简单场景。
+- **deferred unlink 与 crash consistency 有冲突风险**：如果 inode 已清空但数据块尚未回收，crash 后可能出现空间泄漏或 bitmap/GDT 不一致。实现前必须设计清楚恢复策略，或只在明确 benchmark-only 模式启用。
+- **性能结论仍需多轮复测**：当前 Filebench 四项结果是单次或少数几次结果，正式报告需要多轮、固定配置、保存原始日志和方差。
