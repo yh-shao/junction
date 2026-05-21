@@ -7,6 +7,7 @@
 #include <cstring>
 #include <cstdlib>
 extern "C" {
+#include <asm/ops.h>
 #include <base/slab.h>
 #include <base/tcache.h>
 #include <runtime/async.h>
@@ -22,21 +23,25 @@ static_assert(offsetof(ShaofsDsaReq, async) == 0);
 
 struct ShaofsDsaBatchReq {
     runtime_async_op async;
-    uint32_t is_inited;    // 判断这个 job 是否已经初始化过
     dml_status_t status;
+    uint32_t task_count;
+    Segment vecs[dsa_batch_task_num];
     alignas(64) dml_job_t job;
 };
 static_assert(offsetof(ShaofsDsaBatchReq, async) == 0);
 
+
 static uint32_t dsa_hw_job_size;         // job 描述符的大小
-static uint32_t dsa_batch_buffer_size;   // batch buffer 的大小
 static uint32_t dsa_req_size;
+static uint32_t dsa_batch_buffer_size;
 static uint32_t dsa_batch_req_size;
 static size_t dsa_threshold;
 static bool dsa_first;
 static bool dsa_ready;
 static constexpr size_t kDefaultDsaThreshold = 64 * 1024;
-static constexpr uintptr_t kDsaBatchBufferAlignment = 64;
+static constexpr size_t kDsaBatchBusyMinBytes = 64 * 1024;
+static constexpr size_t kDsaBatchIdleMinBytes = 256 * 1024;
+static constexpr uintptr_t kDsaBatchBufferAlign = 64;
 
 static struct slab    dsa_req_slab;
 static struct tcache* dsa_req_tcache;
@@ -58,6 +63,14 @@ static bool dsa_should_offload(size_t len)
 {
     if (!preempt_enabled()) return false;
     return len >= dsa_threshold && dsa_ready && (dsa_first || runtime_async_would_hide_latency() || dsa_process_has_parallelism());
+}
+
+static bool dsa_batch_should_offload(size_t len, size_t nr)
+{
+    if (!preempt_enabled() || !dsa_ready || dsa_batch_req_size == 0) return false;
+    if (nr < DML_MIN_BATCH_SIZE || len < kDsaBatchBusyMinBytes) return false;
+    if (dsa_first || runtime_async_would_hide_latency() || dsa_process_has_parallelism()) return true;
+    return len >= kDsaBatchIdleMinBytes;
 }
 
 static int dsa_req_pool_init(size_t req_size)
@@ -176,20 +189,20 @@ static void shaofs_dsa_batch_req_free(ShaofsDsaBatchReq* req)
     preempt_enable();
 }
 
+static uint8_t* dsa_batch_buffer(ShaofsDsaBatchReq* req)
+{
+    uintptr_t end = reinterpret_cast<uintptr_t>(&req->job) + dsa_hw_job_size;
+    return reinterpret_cast<uint8_t*>((end + kDsaBatchBufferAlign - 1) & ~(kDsaBatchBufferAlign - 1));
+}
+
 static void memcpy_v(const Segment* vecs, size_t nr)
 {
     for (size_t i = 0; i < nr; i++)
     {
+        if (unlikely(!vecs[i].dst) || unlikely(!vecs[i].src)) return;
         if (vecs[i].len == 0) continue;
         memcpy(vecs[i].dst, vecs[i].src, vecs[i].len);
     }
-}
-
-static uint8_t* dsa_batch_buffer(ShaofsDsaBatchReq* req)
-{
-    uintptr_t start = reinterpret_cast<uintptr_t>(&req->job) + dsa_hw_job_size;
-    start = (start + kDsaBatchBufferAlignment - 1) & ~(kDsaBatchBufferAlignment - 1);
-    return reinterpret_cast<uint8_t*>(start);
 }
 
 static bool shaofs_dsa_poll(runtime_async_op* op)
@@ -202,8 +215,21 @@ static bool shaofs_dsa_poll(runtime_async_op* op)
 static bool shaofs_dsa_batch_poll(runtime_async_op* op)
 {
     ShaofsDsaBatchReq* req = reinterpret_cast<ShaofsDsaBatchReq*>(op);
-    req->status = dml_check_job(reinterpret_cast<dml_job_t*>(&req->job));
+    req->status = dml_check_job(&req->job);
     return req->status != DML_STATUS_BEING_PROCESSED;
+}
+
+static void shaofs_dsa_wait(runtime_async_op* op)
+{
+    if (likely(preempt_enabled()))
+    {
+        runtime_async_park(op);
+        return;
+    }
+
+    // runtime_async_park enters Caladan scheduler and requires a clean preemption state. 
+    // If the caller is already preempt-disabled, keep the DSA job off the scheduler pending list and poll it locally.
+    while (!op->poll(op)) cpu_relax();
 }
 
 int dsa_init(const ShaofsDsaOptions* opts)
@@ -229,13 +255,12 @@ int dsa_init(const ShaofsDsaOptions* opts)
         return 0;
     }
 
+    job->operation = DML_OP_BATCH;
     dml_status_t status = dml_get_batch_size(job, dsa_batch_task_num, &dsa_batch_buffer_size);
     if (status != DML_STATUS_OK)
     {
-        log_info("[shaofs_dsa_init] Warning: Could not get DSA batch size (Status: %d). Falling back to CPU memcpy.\n", status);
-        dml_finalize_job(job);
-        free(job);
-        return 0;
+        dsa_batch_buffer_size = 0;
+        log_info("[shaofs_dsa_init] Warning: DML batch setup failed (Status: %d). Multi-segment copies will use CPU memcpy.\n", status);
     }
 
     uint8_t src = 0xAA, dst = 0x00;
@@ -262,12 +287,16 @@ int dsa_init(const ShaofsDsaOptions* opts)
         return ret;
     }
 
-    dsa_batch_req_size = offsetof(ShaofsDsaBatchReq, job) + dsa_hw_job_size + kDsaBatchBufferAlignment + dsa_batch_buffer_size;
-    ret = dsa_batch_req_pool_init(dsa_batch_req_size);
-    if (ret)
+    if (dsa_batch_buffer_size != 0)
     {
-        log_info("[shaofs_dsa_init] Warning: Could not initialize DSA batch request cache. Falling back to CPU memcpy.\n");
-        return ret;
+        const uintptr_t batch_req_size = offsetof(ShaofsDsaBatchReq, job) + dsa_hw_job_size + kDsaBatchBufferAlign + dsa_batch_buffer_size;
+        ret = dsa_batch_req_pool_init(batch_req_size);
+        if (ret)
+        {
+            dsa_batch_buffer_size = 0;
+            dsa_batch_req_size = 0;
+            log_info("[shaofs_dsa_init] Warning: Could not initialize DSA batch request cache. Multi-segment copies will use CPU memcpy.\n");
+        }
     }
 
     dsa_threshold = opts ? opts->threshold : kDefaultDsaThreshold;
@@ -326,111 +355,117 @@ void dsa_copy(void* dst, const void* src, size_t len)
         return;
     }
 
-    runtime_async_park(&req->async);
+    shaofs_dsa_wait(&req->async);
     status = req->status;
     shaofs_dsa_req_free(req);
     if (unlikely(status != DML_STATUS_OK)) memcpy(dst, src, len);
-}
-
-static void dsa_copyv_chunk(const Segment* vecs, size_t nr)
-{
-    size_t total_len = 0;
-    for (size_t i = 0; i < nr; i++)
-    {
-        if (unlikely(!vecs[i].dst) || unlikely(!vecs[i].src)) return;
-        if (unlikely(vecs[i].len > DML_MAX_32U))
-        {
-            memcpy_v(vecs, nr);
-            return;
-        }
-        total_len += vecs[i].len;
-    }
-
-    if (nr == 0 || total_len == 0) return;
-    if (nr == 1)
-    {
-        dsa_copy(vecs[0].dst, vecs[0].src, vecs[0].len);
-        return;
-    }
-
-    if (!dsa_should_offload(total_len) || dsa_batch_req_size == 0)
-    {
-        memcpy_v(vecs, nr);
-        return;
-    }
-
-    ShaofsDsaBatchReq* req = shaofs_dsa_batch_req_alloc();
-    if (!req)
-    {
-        memcpy_v(vecs, nr);
-        return;
-    }
-
-    dml_job_t* job = reinterpret_cast<dml_job_t*>(&req->job);
-    if (unlikely(req->is_inited != 0xDEADBEEF))   // 只会进行一次初始化
-    {
-        dml_status_t status = dml_init_job(DML_PATH_HW, job);
-        if (unlikely(status != DML_STATUS_OK))
-        {
-            shaofs_dsa_batch_req_free(req);
-            memcpy_v(vecs, nr);
-            return;
-        }
-
-        job->operation      = DML_OP_BATCH;
-
-        req->is_inited = 0xDEADBEEF;
-    }
-
-    req->async.poll     = shaofs_dsa_batch_poll;
-    req->async.complete = nullptr;
-    req->status = DML_STATUS_BEING_PROCESSED;
-
-    uint32_t batch_buffer_size = 0;
-    dml_status_t status = dml_get_batch_size(job, static_cast<uint32_t>(nr), &batch_buffer_size);
-    if (unlikely(status != DML_STATUS_OK || batch_buffer_size > dsa_batch_buffer_size))
-    {
-        shaofs_dsa_batch_req_free(req);
-        memcpy_v(vecs, nr);
-        return;
-    }
-    job->destination_first_ptr = dsa_batch_buffer(req);
-    job->destination_length    = batch_buffer_size;
-
-    for (size_t i = 0; i < nr; i++)
-    {
-        status = dml_batch_set_mem_move_by_index(job, static_cast<uint32_t>(i), const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(vecs[i].src)), reinterpret_cast<uint8_t*>(vecs[i].dst), static_cast<uint32_t>(vecs[i].len), 0);
-        if (unlikely(status != DML_STATUS_OK))
-        {
-            shaofs_dsa_batch_req_free(req);
-            memcpy_v(vecs, nr);
-            return;
-        }
-    }
-
-    status = dml_submit_job(job);
-    if (unlikely(status != DML_STATUS_OK))
-    {
-        shaofs_dsa_batch_req_free(req);
-        memcpy_v(vecs, nr);
-        return;
-    }
-
-    runtime_async_park(&req->async);
-    status = req->status;
-    shaofs_dsa_batch_req_free(req);
-    if (unlikely(status != DML_STATUS_OK)) memcpy_v(vecs, nr);
 }
 
 void dsa_copyv(const Segment* vecs, size_t nr)   // 复制 nr 个 buffer
 {
     if (unlikely(!vecs) || nr == 0) return;
 
-    while (nr > 0)
+    if (nr == 1)
     {
-        size_t chunk = MIN(nr, dsa_batch_task_num);
-        dsa_copyv_chunk(vecs, chunk);
-        vecs += chunk;
-        nr   -= chunk;
+        dsa_copy(vecs[0].dst, vecs[0].src, vecs[0].len);
+        return;
     }
+
+    size_t total_len = 0;
+    size_t active_nr = 0;
+    Segment active[dsa_batch_task_num];
+
+    for (size_t i = 0; i < nr; i++)
+    {
+        if (unlikely(!vecs[i].dst) || unlikely(!vecs[i].src)) return;
+        if (vecs[i].len == 0) continue;
+        if (unlikely(vecs[i].len > DML_MAX_32U) || active_nr == dsa_batch_task_num)
+        {
+            memcpy_v(vecs, nr);
+            return;
+        }
+        active[active_nr++] = vecs[i];
+        total_len += vecs[i].len;
+    }
+
+    if (active_nr == 0) return;
+    if (active_nr == 1)
+    {
+        dsa_copy(active[0].dst, active[0].src, active[0].len);
+        return;
+    }
+
+    if (!dsa_batch_should_offload(total_len, active_nr))
+    {
+        memcpy_v(active, active_nr);
+        return;
+    }
+
+    ShaofsDsaBatchReq* req = shaofs_dsa_batch_req_alloc();
+    if (!req)
+    {
+        memcpy_v(active, active_nr);
+        return;
+    }
+
+    dml_status_t status = dml_init_job(DML_PATH_HW, &req->job);
+    if (unlikely(status != DML_STATUS_OK))
+    {
+        shaofs_dsa_batch_req_free(req);
+        memcpy_v(active, active_nr);
+        return;
+    }
+
+    uint32_t batch_buffer_size = 0;
+    req->job.operation = DML_OP_BATCH;
+    status = dml_get_batch_size(&req->job, static_cast<uint32_t>(active_nr), &batch_buffer_size);
+    if (unlikely(status != DML_STATUS_OK || batch_buffer_size > dsa_batch_buffer_size))
+    {
+        dml_finalize_job(&req->job);
+        shaofs_dsa_batch_req_free(req);
+        memcpy_v(active, active_nr);
+        return;
+    }
+
+    req->async.poll     = shaofs_dsa_batch_poll;
+    req->async.complete = nullptr;
+    req->status         = DML_STATUS_BEING_PROCESSED;
+    req->task_count     = static_cast<uint32_t>(active_nr);
+    req->job.destination_first_ptr = dsa_batch_buffer(req);
+    req->job.destination_length    = batch_buffer_size;
+
+    for (uint32_t i = 0; i < req->task_count; i++)
+    {
+        req->vecs[i] = active[i];
+        status = dml_batch_set_mem_move_by_index(&req->job, i,
+                                                 const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(active[i].src)),
+                                                 reinterpret_cast<uint8_t*>(active[i].dst),
+                                                 static_cast<uint32_t>(active[i].len),
+                                                 DML_FLAG_BLOCK_ON_FAULT);
+        if (unlikely(status != DML_STATUS_OK))
+        {
+            dml_finalize_job(&req->job);
+            shaofs_dsa_batch_req_free(req);
+            memcpy_v(active, active_nr);
+            return;
+        }
+    }
+
+    status = dml_submit_job(&req->job);
+    if (unlikely(status != DML_STATUS_OK))
+    {
+        dml_finalize_job(&req->job);
+        shaofs_dsa_batch_req_free(req);
+        memcpy_v(active, active_nr);
+        return;
+    }
+
+    shaofs_dsa_wait(&req->async);
+    status = req->status;
+    dml_finalize_job(&req->job);
+    if (unlikely(status != DML_STATUS_OK))
+    {
+        memcpy_v(req->vecs, req->task_count);
+    }
+    shaofs_dsa_batch_req_free(req);
 }
