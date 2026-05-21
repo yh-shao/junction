@@ -321,13 +321,14 @@ void HandleKickUintrFinish(thread_t *th, u_sigframe *uintr_frame,
 
 inline bool __nofp InterruptNeeded(thread_t *th) {
   if (ACCESS_ONCE(th->interrupt_state.cnt)) return true;
-  struct kthread *k = getk();
-  // struct kthread *k = &ks[perthread_read(thread_id)];
-  bool need = false;
-  if (likely(k->q_ptrs != nullptr)) need = preempt_cede_needed(k) | preempt_yield_needed(k) | storage_available_completions(k);
-  putk();
-  // return preempt_cede_needed(k) | preempt_yield_needed(k);
-  return need;
+  // This runs before the interrupted xstate is saved. Avoid getk()/putk() here: putk() may invoke preempt() from inside the UINTR frame and corrupt the signal return path. The handler has not yielded yet, so myk() is stable enough for this read-only pending-work check.
+  struct kthread *k = myk();
+  if (unlikely(k == nullptr || k->q_ptrs == nullptr)) 
+  {
+    log_err("InterruptNeeded: k or k->q_ptrs is nullptr !!!!!!!!!!!!!");
+    return false;
+  }
+  return preempt_cede_needed(k) | preempt_yield_needed(k) | storage_available_completions(k);
 }
 
 extern "C" __nofp void uintr_entry(u_sigframe *uintr_frame) {
@@ -353,11 +354,6 @@ extern "C" __nofp void uintr_entry(u_sigframe *uintr_frame) {
   stack &syscall_stack = *th->stack;
 
   // Check if we need to deliver signals or yield/cede.
-  // struct kthread *k = &ks[perthread_read(thread_id)];
-  // log_info("UINTR: cpu=%d tid=%u k=%p k->tid=%d q_ptrs=%p preempt=%d", sched_getcpu(), perthread_read(thread_id), k, k->tid, k->q_ptrs, preempt_enabled());
-  // bool have_io = storage_available_completions(k);
-  // if (!have_io && !InterruptNeeded(th)) return;
-
   if (!InterruptNeeded(th)) return;
 
   const uint64_t in_use_xfeatures = GetActiveXstates();
