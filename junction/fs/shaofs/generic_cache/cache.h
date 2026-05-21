@@ -47,8 +47,13 @@ private:
 
             // 获取到一个可以驱逐的 CacheEntry，当前这个 CachEntry 的 refcnt 为 0 （且肯定没有线程在使用这个 CacheEntry）
             atomic_inc(&victim->ref_count);       // Pin 住该 CacheEntry （当前正在访问该 CacheEntry） 将不会被再次选中 evict
+            if (!rwmutex_try_rdlock(&victim->rw_mtx))
+            {
+                atomic_dec(&victim->ref_count);
+                policy->touch(victim);
+                continue;
+            }
 
-            rwmutex_rdlock(&victim->rw_mtx);    // 拿”读”锁：阻止其它线程写入该 CacheEntry，但允许其它线程并发读取，提高并发性
             spin_unlock_np(&shard_lock);        // 释放全局锁，允许其它线程访问 Hashmap，此时其它线程可能会访问到这个 victim cache entry
 
             bool write_success = true;
