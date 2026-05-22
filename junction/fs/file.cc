@@ -286,8 +286,9 @@ ssize_t usys_write(int fd, const void *buf, size_t len) {
     int inum = f->get_inode()->get_inum();
     bool direct = f->get_flags() & kFlagDirect;
     f->get_shaofs_direct_read_hint()->valid = false;
-    if (f->get_flags() & O_APPEND) f->get_off_ref() = my_lseek(inum, 0, SEEK_END, 0);
-    return my_write(inum, buf, &f->get_off_ref(), len, direct);
+    bool append = f->get_flags() & O_APPEND;
+    if (append && direct) f->get_off_ref() = my_lseek(inum, 0, SEEK_END, 0);
+    return my_write(inum, buf, &f->get_off_ref(), len, direct, append);
   }
 
   Status<size_t> ret = f->Write(writable_span(buf, len), &f->get_off_ref());
@@ -607,7 +608,7 @@ ssize_t usys_pwrite64(int fd, const void *buf, size_t len, off_t offset) {
   {
     bool direct = f->get_flags() & kFlagDirect;
     f->get_shaofs_direct_read_hint()->valid = false;
-    return my_write(f->get_inode()->get_inum(), buf, &offset, len, direct);
+    return my_write(f->get_inode()->get_inum(), buf, &offset, len, direct, false);
   }
 
   Status<size_t> ret = f->Write(writable_span(buf, len), &offset);

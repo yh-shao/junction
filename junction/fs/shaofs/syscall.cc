@@ -131,13 +131,18 @@ ssize_t my_read(int inum, void *buf, off_t* off, size_t len, bool direct)
     return ret;
 }
 
-ssize_t my_write(int inum, const void *buf, off_t* off, size_t len, bool direct)
+ssize_t my_write(int inum, const void *buf, off_t* off, size_t len, bool direct, bool append)
 {
     RuntimeFSBaseGuard g;
 
-    ssize_t ret = direct ? file_write_direct(inum, (const char*)buf, *off, len)
-                         : file_write(inum, (const char*)buf, *off, len);
-    if (ret >= 0) *off += ret;
+    ssize_t ret;
+    if (append && !direct)
+        ret = file_write_append(inum, (const char*)buf, len, off);
+    else
+        ret = direct ? file_write_direct(inum, (const char*)buf, *off, len)
+                     : file_write(inum, (const char*)buf, *off, len);
+
+    if (ret >= 0 && !(append && !direct)) *off += ret;
     return ret;
 }
 

@@ -7,6 +7,7 @@
 
 ssize_t file_read(int inum, char* buf, off_t offset, size_t len);
 ssize_t file_write(int inum, const char* buf, off_t offset, size_t len);
+ssize_t file_write_append(int inum, const char* buf, size_t len, off_t* new_off);
 ssize_t file_read_direct(int inum, char* buf, off_t offset, size_t len);
 ssize_t file_write_direct(int inum, const char* buf, off_t offset, size_t len);
 ssize_t file_readv_direct(int inum, const struct iovec* iov, int iovcnt, off_t offset);

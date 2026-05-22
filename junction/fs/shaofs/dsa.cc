@@ -2,6 +2,7 @@
 #include "dsa.h"
 #include "junction/kernel/proc.h"
 #include "dml/dml.h"
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
@@ -35,13 +36,27 @@ static uint32_t dsa_hw_job_size;         // job 描述符的大小
 static uint32_t dsa_req_size;
 static uint32_t dsa_batch_buffer_size;
 static uint32_t dsa_batch_req_size;
-static size_t dsa_threshold;
-static bool dsa_first;
 static bool dsa_ready;
-static constexpr size_t kDefaultDsaThreshold = 64 * 1024;
-static constexpr size_t kDsaBatchBusyMinBytes = 64 * 1024;
-static constexpr size_t kDsaBatchIdleMinBytes = 256 * 1024;
+
+static constexpr size_t kDsaDefaultWriteBusyBytes = 64 * 1024;
+static constexpr size_t kDsaDefaultReadBusyBytes = 128 * 1024;
+static constexpr size_t kDsaDefaultInternalBusyBytes = 64 * 1024;
+static constexpr size_t kDsaDefaultSingleBusyBytes = 256 * 1024;
+static constexpr size_t kDsaDefaultIdleBytes = 256 * 1024;
+static constexpr size_t kDsaDefaultParallelBytes = 128 * 1024;
 static constexpr uintptr_t kDsaBatchBufferAlign = 64;
+
+struct ShaofsDsaPolicy {
+    bool enable_hw;
+    bool force;
+    bool stats;
+    size_t single_busy_bytes[SHAOFS_DSA_KIND_NR];
+    size_t batch_busy_bytes[SHAOFS_DSA_KIND_NR];
+    size_t idle_bytes;
+    size_t parallel_bytes;
+};
+
+static ShaofsDsaPolicy dsa_policy;
 
 static struct slab    dsa_req_slab;
 static struct tcache* dsa_req_tcache;
@@ -55,22 +70,224 @@ static DEFINE_SPINLOCK(dsa_batch_req_pool_lock);
 static DEFINE_PERTHREAD(struct tcache_perthread, dsa_batch_req_pt);
 static DEFINE_PERTHREAD(bool, dsa_batch_req_pt_ready);
 
+enum ShaofsDsaCpuReason {
+    DSA_CPU_HW_UNAVAILABLE = 0,
+    DSA_CPU_PREEMPT_DISABLED,
+    DSA_CPU_BELOW_THRESHOLD,
+    DSA_CPU_TOO_FEW_SEGMENTS,
+    DSA_CPU_TOO_MANY_SEGMENTS,
+    DSA_CPU_NO_LATENCY_HIDE,
+    DSA_CPU_TOO_LARGE,
+    DSA_CPU_ALLOC_FAIL,
+    DSA_CPU_SETUP_FAIL,
+    DSA_CPU_SUBMIT_FAIL,
+    DSA_CPU_COMPLETION_ERROR,
+    DSA_CPU_REASON_NR,
+};
+
+struct ShaofsDsaStats {
+    std::atomic<uint64_t> cpu_bytes[SHAOFS_DSA_KIND_NR][DSA_CPU_REASON_NR];
+    std::atomic<uint64_t> dsa_single_ops[SHAOFS_DSA_KIND_NR];
+    std::atomic<uint64_t> dsa_single_bytes[SHAOFS_DSA_KIND_NR];
+    std::atomic<uint64_t> dsa_batch_ops[SHAOFS_DSA_KIND_NR];
+    std::atomic<uint64_t> dsa_batch_bytes[SHAOFS_DSA_KIND_NR];
+    std::atomic<uint64_t> dsa_batch_segments[SHAOFS_DSA_KIND_NR];
+};
+
+static ShaofsDsaStats dsa_stats;
+
+static ShaofsDsaCopyKind dsa_normalize_kind(ShaofsDsaCopyKind kind)
+{
+    return kind >= SHAOFS_DSA_READ_TO_USER && kind < SHAOFS_DSA_KIND_NR ? kind : SHAOFS_DSA_INTERNAL;
+}
+
+static const char* dsa_kind_name(ShaofsDsaCopyKind kind)
+{
+    switch (dsa_normalize_kind(kind))
+    {
+    case SHAOFS_DSA_READ_TO_USER:
+        return "read_to_user";
+    case SHAOFS_DSA_WRITE_FROM_USER:
+        return "write_from_user";
+    case SHAOFS_DSA_INTERNAL:
+        return "internal";
+    default:
+        return "unknown";
+    }
+}
+
+static const char* dsa_cpu_reason_name(ShaofsDsaCpuReason reason)
+{
+    switch (reason)
+    {
+    case DSA_CPU_HW_UNAVAILABLE:
+        return "hw_unavailable";
+    case DSA_CPU_PREEMPT_DISABLED:
+        return "preempt_disabled";
+    case DSA_CPU_BELOW_THRESHOLD:
+        return "below_threshold";
+    case DSA_CPU_TOO_FEW_SEGMENTS:
+        return "too_few_segments";
+    case DSA_CPU_TOO_MANY_SEGMENTS:
+        return "too_many_segments";
+    case DSA_CPU_NO_LATENCY_HIDE:
+        return "no_latency_hide";
+    case DSA_CPU_TOO_LARGE:
+        return "too_large";
+    case DSA_CPU_ALLOC_FAIL:
+        return "alloc_fail";
+    case DSA_CPU_SETUP_FAIL:
+        return "setup_fail";
+    case DSA_CPU_SUBMIT_FAIL:
+        return "submit_fail";
+    case DSA_CPU_COMPLETION_ERROR:
+        return "completion_error";
+    default:
+        return "unknown";
+    }
+}
+
+static uint64_t dsa_parse_u64_env(const char* name, uint64_t fallback)
+{
+    const char* value = getenv(name);
+    if (!value || *value == '\0') return fallback;
+
+    char* end = nullptr;
+    errno = 0;
+    unsigned long long parsed = strtoull(value, &end, 0);
+    if (errno != 0 || end == value || *end != '\0') return fallback;
+    return static_cast<uint64_t>(parsed);
+}
+
+static bool dsa_parse_bool_env(const char* name, bool fallback)
+{
+    return dsa_parse_u64_env(name, fallback ? 1 : 0) != 0;
+}
+
+static size_t dsa_parse_size_env(const char* name, size_t fallback)
+{
+    uint64_t parsed = dsa_parse_u64_env(name, fallback);
+    return parsed > SIZE_MAX ? fallback : static_cast<size_t>(parsed);
+}
+
+static void dsa_policy_init(const ShaofsDsaOptions* opts)
+{
+    dsa_policy.enable_hw = opts ? opts->enable_hw : true;
+    dsa_policy.force = opts ? opts->dsa_first : false;
+    dsa_policy.stats = false;
+
+    dsa_policy.single_busy_bytes[SHAOFS_DSA_READ_TO_USER] = kDsaDefaultSingleBusyBytes;
+    dsa_policy.single_busy_bytes[SHAOFS_DSA_WRITE_FROM_USER] = kDsaDefaultSingleBusyBytes;
+    dsa_policy.single_busy_bytes[SHAOFS_DSA_INTERNAL] = kDsaDefaultSingleBusyBytes;
+    dsa_policy.batch_busy_bytes[SHAOFS_DSA_READ_TO_USER] = kDsaDefaultReadBusyBytes;
+    dsa_policy.batch_busy_bytes[SHAOFS_DSA_WRITE_FROM_USER] = kDsaDefaultWriteBusyBytes;
+    dsa_policy.batch_busy_bytes[SHAOFS_DSA_INTERNAL] = kDsaDefaultInternalBusyBytes;
+    dsa_policy.idle_bytes = kDsaDefaultIdleBytes;
+    dsa_policy.parallel_bytes = kDsaDefaultParallelBytes;
+
+    if (opts && opts->threshold != 0)
+    {
+        for (int i = 0; i < SHAOFS_DSA_KIND_NR; i++)
+        {
+            dsa_policy.single_busy_bytes[i] = opts->threshold;
+            dsa_policy.batch_busy_bytes[i] = opts->threshold;
+        }
+    }
+
+    dsa_policy.enable_hw = dsa_parse_bool_env("SHAOFS_DSA_ENABLE_HW", dsa_policy.enable_hw);
+    dsa_policy.force = dsa_parse_bool_env("SHAOFS_DSA_FORCE", dsa_policy.force);
+    dsa_policy.stats = dsa_parse_bool_env("SHAOFS_DSA_STATS", dsa_policy.stats);
+    dsa_policy.batch_busy_bytes[SHAOFS_DSA_WRITE_FROM_USER] = dsa_parse_size_env("SHAOFS_DSA_WRITE_BUSY_BYTES", dsa_policy.batch_busy_bytes[SHAOFS_DSA_WRITE_FROM_USER]);
+    dsa_policy.batch_busy_bytes[SHAOFS_DSA_READ_TO_USER] = dsa_parse_size_env("SHAOFS_DSA_READ_BUSY_BYTES", dsa_policy.batch_busy_bytes[SHAOFS_DSA_READ_TO_USER]);
+    dsa_policy.idle_bytes = dsa_parse_size_env("SHAOFS_DSA_BATCH_IDLE_BYTES", dsa_policy.idle_bytes);
+    dsa_policy.parallel_bytes = dsa_parse_size_env("SHAOFS_DSA_PARALLEL_BYTES", dsa_policy.parallel_bytes);
+}
+
 static bool dsa_process_has_parallelism()
 {
     return junction::IsJunctionThread() && junction::myproc().thread_count() > 2;
 }
-static bool dsa_should_offload(size_t len)
+
+static void dsa_record_cpu(ShaofsDsaCopyKind kind, ShaofsDsaCpuReason reason, size_t bytes)
 {
-    if (!preempt_enabled()) return false;
-    return len >= dsa_threshold && dsa_ready && (dsa_first || runtime_async_would_hide_latency() || dsa_process_has_parallelism());
+    if (likely(!dsa_policy.stats)) return;
+    kind = dsa_normalize_kind(kind);
+    if (reason < 0 || reason >= DSA_CPU_REASON_NR) return;
+    dsa_stats.cpu_bytes[kind][reason].fetch_add(bytes, std::memory_order_relaxed);
 }
 
-static bool dsa_batch_should_offload(size_t len, size_t nr)
+static void dsa_record_single(ShaofsDsaCopyKind kind, size_t bytes)
 {
-    if (!preempt_enabled() || !dsa_ready || dsa_batch_req_size == 0) return false;
-    if (nr < DML_MIN_BATCH_SIZE || len < kDsaBatchBusyMinBytes) return false;
-    if (dsa_first || runtime_async_would_hide_latency() || dsa_process_has_parallelism()) return true;
-    return len >= kDsaBatchIdleMinBytes;
+    if (likely(!dsa_policy.stats)) return;
+    kind = dsa_normalize_kind(kind);
+    dsa_stats.dsa_single_ops[kind].fetch_add(1, std::memory_order_relaxed);
+    dsa_stats.dsa_single_bytes[kind].fetch_add(bytes, std::memory_order_relaxed);
+}
+
+static void dsa_record_batch(ShaofsDsaCopyKind kind, size_t bytes, size_t segments)
+{
+    if (likely(!dsa_policy.stats)) return;
+    kind = dsa_normalize_kind(kind);
+    dsa_stats.dsa_batch_ops[kind].fetch_add(1, std::memory_order_relaxed);
+    dsa_stats.dsa_batch_bytes[kind].fetch_add(bytes, std::memory_order_relaxed);
+    dsa_stats.dsa_batch_segments[kind].fetch_add(segments, std::memory_order_relaxed);
+}
+
+static bool dsa_should_offload(size_t len, ShaofsDsaCopyKind kind, ShaofsDsaCpuReason* reason)
+{
+    kind = dsa_normalize_kind(kind);
+    if (!dsa_ready)
+    {
+        *reason = DSA_CPU_HW_UNAVAILABLE;
+        return false;
+    }
+    if (!preempt_enabled())
+    {
+        *reason = DSA_CPU_PREEMPT_DISABLED;
+        return false;
+    }
+    if (len < dsa_policy.single_busy_bytes[kind])
+    {
+        *reason = DSA_CPU_BELOW_THRESHOLD;
+        return false;
+    }
+    if (dsa_policy.force || runtime_async_would_hide_latency()) return true;
+    if (dsa_process_has_parallelism() && len >= dsa_policy.parallel_bytes) return true;
+    if (len >= dsa_policy.idle_bytes) return true;
+
+    *reason = DSA_CPU_NO_LATENCY_HIDE;
+    return false;
+}
+
+static bool dsa_batch_should_offload(size_t len, size_t nr, ShaofsDsaCopyKind kind, ShaofsDsaCpuReason* reason)
+{
+    kind = dsa_normalize_kind(kind);
+    if (!dsa_ready || dsa_batch_req_size == 0)
+    {
+        *reason = DSA_CPU_HW_UNAVAILABLE;
+        return false;
+    }
+    if (!preempt_enabled())
+    {
+        *reason = DSA_CPU_PREEMPT_DISABLED;
+        return false;
+    }
+    if (nr < DML_MIN_BATCH_SIZE)
+    {
+        *reason = DSA_CPU_TOO_FEW_SEGMENTS;
+        return false;
+    }
+    if (len < dsa_policy.batch_busy_bytes[kind])
+    {
+        *reason = DSA_CPU_BELOW_THRESHOLD;
+        return false;
+    }
+    if (dsa_policy.force || runtime_async_would_hide_latency()) return true;
+    if (dsa_process_has_parallelism() && len >= dsa_policy.parallel_bytes) return true;
+    if (len >= dsa_policy.idle_bytes) return true;
+
+    *reason = DSA_CPU_NO_LATENCY_HIDE;
+    return false;
 }
 
 static int dsa_req_pool_init(size_t req_size)
@@ -234,7 +451,12 @@ static void shaofs_dsa_wait(runtime_async_op* op)
 
 int dsa_init(const ShaofsDsaOptions* opts)
 {
-    if (opts && !opts->enable_hw) return 0;
+    dsa_policy_init(opts);
+    if (!dsa_policy.enable_hw)
+    {
+        log_info("[shaofs_dsa_init] DSA hardware path disabled by policy.\n");
+        return 0;
+    }
 
     dml_path_t execution_path = DML_PATH_HW;
     if (dml_get_job_size(execution_path, &dsa_hw_job_size) != DML_STATUS_OK)
@@ -299,19 +521,31 @@ int dsa_init(const ShaofsDsaOptions* opts)
         }
     }
 
-    dsa_threshold = opts ? opts->threshold : kDefaultDsaThreshold;
-    dsa_first     = opts ? opts->dsa_first : false;
-    dsa_ready     = true;
-    log_info("[shaofs_dsa_init] DSA hardware path initialized successfully (threshold=%zu bytes, force=%d).\n", dsa_threshold, dsa_first);
+    dsa_ready = true;
+    log_info("[shaofs_dsa_init] DSA hardware path initialized successfully (force=%d, stats=%d, write_busy=%zu, read_busy=%zu, idle=%zu, parallel=%zu).\n", dsa_policy.force, dsa_policy.stats, dsa_policy.batch_busy_bytes[SHAOFS_DSA_WRITE_FROM_USER], dsa_policy.batch_busy_bytes[SHAOFS_DSA_READ_TO_USER], dsa_policy.idle_bytes, dsa_policy.parallel_bytes);
     return 0;
 }
 
 void dsa_copy(void* dst, const void* src, size_t len)
 {
+    dsa_copy_ex(dst, src, len, SHAOFS_DSA_INTERNAL);
+}
+
+void dsa_copy_ex(void* dst, const void* src, size_t len, ShaofsDsaCopyKind kind)
+{
+    kind = dsa_normalize_kind(kind);
     if (unlikely(!dst) || unlikely(!src) || len == 0) return;
 
-    if (!dsa_should_offload(len) || dsa_req_size == 0 || len > DML_MAX_32U)   // 使用 CPU 进行 memcpy
+    ShaofsDsaCpuReason reason = DSA_CPU_BELOW_THRESHOLD;
+    if (len > DML_MAX_32U)
     {
+        dsa_record_cpu(kind, DSA_CPU_TOO_LARGE, len);
+        memcpy(dst, src, len);
+        return;
+    }
+    if (!dsa_should_offload(len, kind, &reason) || dsa_req_size == 0)
+    {
+        dsa_record_cpu(kind, reason, len);
         memcpy(dst, src, len);
         return;
     }
@@ -319,6 +553,7 @@ void dsa_copy(void* dst, const void* src, size_t len)
     ShaofsDsaReq* req = shaofs_dsa_req_alloc();
     if (!req)
     {
+        dsa_record_cpu(kind, DSA_CPU_ALLOC_FAIL, len);
         memcpy(dst, src, len);
         return;
     }
@@ -329,6 +564,7 @@ void dsa_copy(void* dst, const void* src, size_t len)
         if (unlikely(init_status != DML_STATUS_OK))
         {
             shaofs_dsa_req_free(req);
+            dsa_record_cpu(kind, DSA_CPU_SETUP_FAIL, len);
             memcpy(dst, src, len);
             return;
         }
@@ -351,23 +587,35 @@ void dsa_copy(void* dst, const void* src, size_t len)
     if (unlikely(status != DML_STATUS_OK))
     {
         shaofs_dsa_req_free(req);
+        dsa_record_cpu(kind, DSA_CPU_SUBMIT_FAIL, len);
         memcpy(dst, src, len);
         return;
     }
 
+    dsa_record_single(kind, len);
     shaofs_dsa_wait(&req->async);
     status = req->status;
     shaofs_dsa_req_free(req);
-    if (unlikely(status != DML_STATUS_OK)) memcpy(dst, src, len);
+    if (unlikely(status != DML_STATUS_OK))
+    {
+        dsa_record_cpu(kind, DSA_CPU_COMPLETION_ERROR, len);
+        memcpy(dst, src, len);
+    }
 }
 
-void dsa_copyv(const Segment* vecs, size_t nr)   // 复制 nr 个 buffer
+void dsa_copyv(const Segment* vecs, size_t nr)
 {
+    dsa_copyv_ex(vecs, nr, SHAOFS_DSA_INTERNAL);
+}
+
+void dsa_copyv_ex(const Segment* vecs, size_t nr, ShaofsDsaCopyKind kind)   // 复制 nr 个 buffer
+{
+    kind = dsa_normalize_kind(kind);
     if (unlikely(!vecs) || nr == 0) return;
 
     if (nr == 1)
     {
-        dsa_copy(vecs[0].dst, vecs[0].src, vecs[0].len);
+        dsa_copy_ex(vecs[0].dst, vecs[0].src, vecs[0].len, kind);
         return;
     }
 
@@ -381,6 +629,7 @@ void dsa_copyv(const Segment* vecs, size_t nr)   // 复制 nr 个 buffer
         if (vecs[i].len == 0) continue;
         if (unlikely(vecs[i].len > DML_MAX_32U) || active_nr == dsa_batch_task_num)
         {
+            dsa_record_cpu(kind, unlikely(vecs[i].len > DML_MAX_32U) ? DSA_CPU_TOO_LARGE : DSA_CPU_TOO_MANY_SEGMENTS, total_len + vecs[i].len);
             memcpy_v(vecs, nr);
             return;
         }
@@ -391,12 +640,14 @@ void dsa_copyv(const Segment* vecs, size_t nr)   // 复制 nr 个 buffer
     if (active_nr == 0) return;
     if (active_nr == 1)
     {
-        dsa_copy(active[0].dst, active[0].src, active[0].len);
+        dsa_copy_ex(active[0].dst, active[0].src, active[0].len, kind);
         return;
     }
 
-    if (!dsa_batch_should_offload(total_len, active_nr))
+    ShaofsDsaCpuReason reason = DSA_CPU_BELOW_THRESHOLD;
+    if (!dsa_batch_should_offload(total_len, active_nr, kind, &reason))
     {
+        dsa_record_cpu(kind, reason, total_len);
         memcpy_v(active, active_nr);
         return;
     }
@@ -404,6 +655,7 @@ void dsa_copyv(const Segment* vecs, size_t nr)   // 复制 nr 个 buffer
     ShaofsDsaBatchReq* req = shaofs_dsa_batch_req_alloc();
     if (!req)
     {
+        dsa_record_cpu(kind, DSA_CPU_ALLOC_FAIL, total_len);
         memcpy_v(active, active_nr);
         return;
     }
@@ -412,6 +664,7 @@ void dsa_copyv(const Segment* vecs, size_t nr)   // 复制 nr 个 buffer
     if (unlikely(status != DML_STATUS_OK))
     {
         shaofs_dsa_batch_req_free(req);
+        dsa_record_cpu(kind, DSA_CPU_SETUP_FAIL, total_len);
         memcpy_v(active, active_nr);
         return;
     }
@@ -423,6 +676,7 @@ void dsa_copyv(const Segment* vecs, size_t nr)   // 复制 nr 个 buffer
     {
         dml_finalize_job(&req->job);
         shaofs_dsa_batch_req_free(req);
+        dsa_record_cpu(kind, DSA_CPU_SETUP_FAIL, total_len);
         memcpy_v(active, active_nr);
         return;
     }
@@ -437,15 +691,12 @@ void dsa_copyv(const Segment* vecs, size_t nr)   // 复制 nr 个 buffer
     for (uint32_t i = 0; i < req->task_count; i++)
     {
         req->vecs[i] = active[i];
-        status = dml_batch_set_mem_move_by_index(&req->job, i,
-                                                 const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(active[i].src)),
-                                                 reinterpret_cast<uint8_t*>(active[i].dst),
-                                                 static_cast<uint32_t>(active[i].len),
-                                                 DML_FLAG_BLOCK_ON_FAULT);
+        status = dml_batch_set_mem_move_by_index(&req->job, i, const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(active[i].src)), reinterpret_cast<uint8_t*>(active[i].dst), static_cast<uint32_t>(active[i].len), DML_FLAG_BLOCK_ON_FAULT);
         if (unlikely(status != DML_STATUS_OK))
         {
             dml_finalize_job(&req->job);
             shaofs_dsa_batch_req_free(req);
+            dsa_record_cpu(kind, DSA_CPU_SETUP_FAIL, total_len);
             memcpy_v(active, active_nr);
             return;
         }
@@ -456,16 +707,42 @@ void dsa_copyv(const Segment* vecs, size_t nr)   // 复制 nr 个 buffer
     {
         dml_finalize_job(&req->job);
         shaofs_dsa_batch_req_free(req);
+        dsa_record_cpu(kind, DSA_CPU_SUBMIT_FAIL, total_len);
         memcpy_v(active, active_nr);
         return;
     }
 
+    dsa_record_batch(kind, total_len, active_nr);
     shaofs_dsa_wait(&req->async);
     status = req->status;
     dml_finalize_job(&req->job);
     if (unlikely(status != DML_STATUS_OK))
     {
+        dsa_record_cpu(kind, DSA_CPU_COMPLETION_ERROR, total_len);
         memcpy_v(req->vecs, req->task_count);
     }
     shaofs_dsa_batch_req_free(req);
+}
+
+void dsa_dump_stats()
+{
+    if (!dsa_policy.stats) return;
+
+    for (int i = 0; i < SHAOFS_DSA_KIND_NR; i++)
+    {
+        auto kind = static_cast<ShaofsDsaCopyKind>(i);
+        uint64_t single_ops = dsa_stats.dsa_single_ops[i].load(std::memory_order_relaxed);
+        uint64_t single_bytes = dsa_stats.dsa_single_bytes[i].load(std::memory_order_relaxed);
+        uint64_t batch_ops = dsa_stats.dsa_batch_ops[i].load(std::memory_order_relaxed);
+        uint64_t batch_bytes = dsa_stats.dsa_batch_bytes[i].load(std::memory_order_relaxed);
+        uint64_t batch_segments = dsa_stats.dsa_batch_segments[i].load(std::memory_order_relaxed);
+        log_info("[shaofs_dsa_stats] kind=%s dsa_single_ops=%lu dsa_single_bytes=%lu dsa_batch_ops=%lu dsa_batch_bytes=%lu dsa_batch_avg_segments=%lu", dsa_kind_name(kind), single_ops, single_bytes, batch_ops, batch_bytes, batch_ops ? batch_segments / batch_ops : 0);
+
+        for (int r = 0; r < DSA_CPU_REASON_NR; r++)
+        {
+            uint64_t bytes = dsa_stats.cpu_bytes[i][r].load(std::memory_order_relaxed);
+            if (bytes == 0) continue;
+            log_info("[shaofs_dsa_stats] kind=%s cpu_reason=%s bytes=%lu", dsa_kind_name(kind), dsa_cpu_reason_name(static_cast<ShaofsDsaCpuReason>(r)), bytes);
+        }
+    }
 }
