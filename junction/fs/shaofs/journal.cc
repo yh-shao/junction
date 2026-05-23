@@ -905,32 +905,25 @@ bool journal_commit_blocks(const BlockID* blocks, const void* const* images, uin
         return false;
     }
 
-    int reserved_slot = checkpoint_reserve_slot();
-    bool async_checkpoint = reserved_slot >= 0;
-    BlockID header_lba = async_checkpoint ? journal_slot_base((uint32_t)reserved_slot) : sb.journal_blockstart;
+    BlockID header_lba = sb.journal_blockstart;
 
     SpinGuard guard(&journal_lock);
-    if (!async_checkpoint && !checkpoint_wait_idle()) return false;
+    if (!checkpoint_wait_idle()) return false;
 
     JournalEntry entries[kMaxJournalEntries];
     memset(entries, 0, sizeof(entries));
 
     for (uint32_t i = 0; i < count; ++i) 
     {
-        if (!journal_is_metadata_block(blocks[i])) 
+        if (!journal_is_metadata_block(blocks[i]))
         {
             log_err("[journal] refusing to journal non-metadata block %lu", blocks[i]);
-            if (async_checkpoint) checkpoint_release_reserved_slot((uint32_t)reserved_slot);
             return false;
         }
         entries[i].home_block = blocks[i];
         entries[i].image_block = header_lba + 2 + i;
         entries[i].checksum = fnv1a64(images[i], BLOCK_SIZE);
-        if (storage_write(images[i], entries[i].image_block, 1) != 0)
-        {
-            if (async_checkpoint) checkpoint_release_reserved_slot((uint32_t)reserved_slot);
-            return false;
-        }
+        if (storage_write(images[i], entries[i].image_block, 1) != 0) return false;
     }
 
     JournalHeader hdr;
@@ -942,14 +935,8 @@ bool journal_commit_blocks(const BlockID* blocks, const void* const* images, uin
     hdr.seq = journal_seq++;
     hdr.checksum = header_checksum(hdr, entries);
 
-    if (!write_header_at(header_lba, hdr, entries))
-    {
-        if (async_checkpoint) checkpoint_release_reserved_slot((uint32_t)reserved_slot);
-        return false;
-    }
+    if (!write_header_at(header_lba, hdr, entries)) return false;
 
-    if (async_checkpoint)
-        return checkpoint_schedule_reserved_slot((uint32_t)reserved_slot, hdr.seq, blocks, images, count);
     return checkpoint_home_blocks(header_lba, blocks, images, count);
 }
 

@@ -38,6 +38,10 @@ constexpr size_t kOversizeRatio = 2;
 
 namespace junction {
 
+File::~File() {
+  if (ino_ && ino_->get_mode() == SHAOFS) my_close(ino_->get_inum());
+}
+
 namespace detail {
 
 void file_desc::OnDescriptorClose(file_desc::close_handle &handle) {

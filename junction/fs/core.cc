@@ -528,29 +528,25 @@ long usys_renameat2(int olddirfd, const char *oldpath, int newdirfd,
   return 0;
 }
 
-long usys_openat(int dirfd, const char *pathname, int flags, mode_t mode) {
-  if (const char* realpath = SHAOFS_REALPATH(pathname))   // 判断 pathname 是否具有指定前缀（从而识别用的是 shaofs）
-  {
-    int inum = my_open(realpath, flags, mode);
-    // log_info("opened file inum: %d", inum);
-    if (inum < 0)
-    {
-      log_info("[openat(%s)] This is a relative path (not supported currently).", realpath);
-      return -1;
-    }
+static long OpenShaOFSFile(const char* realpath, int flags, mode_t mode)
+{
+  int inum = my_open(realpath, flags, mode);
+  if (inum < 0) return inum;
 
-    Process &p = myproc();
-    FileTable &ftbl = p.get_file_table();
-    auto [opflag, fmode] = FromFlags(flags);
-    std::shared_ptr<Inode> myinode = std::make_shared<MyInode>(inum); 
-    // log_info("ino_num: %lu", myinode->get_inum());
-  
-    auto my_dentry = std::make_shared<junction::DirectoryEntry>("dummy_name", nullptr, myinode);
-    Status<std::shared_ptr<File>> f = std::make_shared<File>(FileType::kNormal, opflag, fmode, my_dentry);
-    if (opflag & kFlagDirect) file_prepare_direct_read_hint(inum, (*f)->get_shaofs_direct_read_hint());
-    if (flags & kFlagAppend) (*f)->get_off_ref() = my_lseek(inum, 0, SEEK_END, 0);   // 此处 old_offset 可以忽略
-    return ftbl.Insert(std::move(*f), (flags & kFlagCloseExec) > 0);
-  }
+  Process &p = myproc();
+  FileTable &ftbl = p.get_file_table();
+  auto [opflag, fmode] = FromFlags(flags);
+  std::shared_ptr<Inode> myinode = std::make_shared<MyInode>(inum);
+
+  auto my_dentry = std::make_shared<junction::DirectoryEntry>("dummy_name", nullptr, myinode);
+  Status<std::shared_ptr<File>> f = std::make_shared<File>(FileType::kNormal, opflag, fmode, my_dentry);
+  if (opflag & kFlagDirect) file_prepare_direct_read_hint(inum, (*f)->get_shaofs_direct_read_hint());
+  if (flags & kFlagAppend) (*f)->get_off_ref() = my_lseek(inum, 0, SEEK_END, 0);   // 此处 old_offset 可以忽略
+  return ftbl.Insert(std::move(*f), (flags & kFlagCloseExec) > 0);
+}
+
+long usys_openat(int dirfd, const char *pathname, int flags, mode_t mode) {
+  if (const char* realpath = SHAOFS_REALPATH(pathname)) return OpenShaOFSFile(realpath, flags, mode);
 
   Process &p = myproc();
   Status<Entry> entry = LookupEntry(p, dirfd, pathname);
@@ -566,6 +562,8 @@ long usys_openat(int dirfd, const char *pathname, int flags, mode_t mode) {
 }
 
 long usys_open(const char *pathname, int flags, mode_t mode) {
+  if (const char* realpath = SHAOFS_REALPATH(pathname)) return OpenShaOFSFile(realpath, flags, mode);
+
   Process &p = myproc();
   FSRoot &fs = p.get_fs();
   Status<Entry> entry = LookupEntry(fs, pathname);

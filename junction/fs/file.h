@@ -129,7 +129,7 @@ class File : public std::enable_shared_from_this<File> {
   File(FileType type, unsigned int flags, FileMode mode)
       : type_(type), flags_(flags), mode_(mode), ino_(nullptr) {}
 
-  virtual ~File() = default;
+  virtual ~File();
 
   virtual Status<size_t> Read(std::span<std::byte> buf, off_t *off) {
     return MakeError(EINVAL);

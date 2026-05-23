@@ -2,6 +2,9 @@
 #include <sys/stat.h>
 
 int my_open(const char *pathname, int flags, mode_t mode);
+void shaofs_reset_inode_lifecycle(int inum);
+void shaofs_pin_open_inode(int inum);
+void my_close(int inum);
 ssize_t my_read (int inum,       void *buf, off_t* off, size_t len, bool direct);
 ssize_t my_write(int inum, const void *buf, off_t* off, size_t len, bool direct, bool append);
 int my_mkdir(const char *pathname, mode_t mode);

@@ -4,6 +4,7 @@
 #include "inode.h"
 #include "extent.h"
 #include "group.h"
+#include "syscall.h"
 #include <cstring>
 
 static GlobalInodeCache* g_inode_cache_ptr = nullptr;
@@ -54,11 +55,12 @@ InodeHandle ic_alloc_inode(file_type_t type, int inum)    // 如果 inum != -1 �
         }
         new_alloc_inum = true;
     }
-    if (inum == -1) 
+    if (inum == -1)
     {
         log_err("[ic_alloc_inode()] Fail to allocate a new inode: invalid inum");
         return InodeHandle(); // 返回空 Handle
     }
+    shaofs_reset_inode_lifecycle(inum);
 
     InodeHandle handle = get_inode_cache().getHandle(inum, false);  // 直接通过 get() 获取 Handle（ref_count >= 1，不会被驱逐），然后就地初始化
     if (!handle) 

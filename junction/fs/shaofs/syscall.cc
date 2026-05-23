@@ -9,6 +9,116 @@
 #include "extent.h"
 #include "junction/fs/file.h"
 
+struct InodeLifecycle {
+    spinlock_t lock;
+    uint32_t open_count;
+    bool unlink_pending;
+    bool free_in_progress;
+};
+
+static InodeLifecycle inode_lifecycle[INODENUM];
+static volatile int inode_lifecycle_initialized;
+static spinlock_t inode_lifecycle_init_lock = SPINLOCK_INITIALIZER;
+
+static void init_inode_lifecycle_table()
+{
+    if (likely(atomic_read(&inode_lifecycle_initialized))) return;
+
+    SpinGuardNP g(&inode_lifecycle_init_lock);
+    if (atomic_read(&inode_lifecycle_initialized)) return;
+
+    for (int i = 0; i < INODENUM; i++)
+    {
+        spin_lock_init(&inode_lifecycle[i].lock);
+        inode_lifecycle[i].open_count = 0;
+        inode_lifecycle[i].unlink_pending = false;
+        inode_lifecycle[i].free_in_progress = false;
+    }
+    atomic_write(&inode_lifecycle_initialized, 1);
+}
+
+static InodeLifecycle* get_inode_lifecycle(int inum)
+{
+    if (unlikely(inum < 0 || inum >= INODENUM)) return nullptr;
+    init_inode_lifecycle_table();
+    return &inode_lifecycle[inum];
+}
+
+void shaofs_reset_inode_lifecycle(int inum)
+{
+    InodeLifecycle* state = get_inode_lifecycle(inum);
+    if (unlikely(!state)) return;
+
+    SpinGuardNP g(&state->lock);
+    state->open_count = 0;
+    state->unlink_pending = false;
+    state->free_in_progress = false;
+}
+
+void shaofs_pin_open_inode(int inum)
+{
+    InodeLifecycle* state = get_inode_lifecycle(inum);
+    if (unlikely(!state)) return;
+
+    SpinGuardNP g(&state->lock);
+    state->open_count++;
+}
+
+void my_close(int inum)
+{
+    RuntimeFSBaseGuard g;
+
+    InodeLifecycle* state = get_inode_lifecycle(inum);
+    if (unlikely(!state)) return;
+
+    bool should_free = false;
+    {
+        SpinGuardNP guard(&state->lock);
+        if (likely(state->open_count > 0)) state->open_count--;
+        if (state->open_count == 0 && state->unlink_pending && !state->free_in_progress)
+        {
+            state->free_in_progress = true;
+            should_free = true;
+        }
+    }
+
+    if (!should_free) return;
+
+    bool freed = ic_free_inode(inum);
+    {
+        SpinGuardNP guard(&state->lock);
+        if (freed) state->unlink_pending = false;
+        state->free_in_progress = false;
+    }
+}
+
+static int shaofs_unlink_inode(int inum)
+{
+    InodeLifecycle* state = get_inode_lifecycle(inum);
+    if (unlikely(!state)) return -EINVAL;
+
+    bool should_free = false;
+    {
+        SpinGuardNP guard(&state->lock);
+        if (state->open_count == 0 && !state->free_in_progress)
+        {
+            state->free_in_progress = true;
+            should_free = true;
+        }
+        else state->unlink_pending = true;
+    }
+
+    if (!should_free) return 0;
+
+    bool freed = ic_free_inode(inum);
+    {
+        SpinGuardNP guard(&state->lock);
+        if (freed) state->unlink_pending = false;
+        state->free_in_progress = false;
+    }
+    return freed ? 0 : -EIO;
+}
+
 
 int my_open2(const char* pathname, int flags, mode_t mode)
 {
@@ -41,30 +151,32 @@ int my_open(const char* pathname, int flags, mode_t mode)
     {
         char name[NAMESIZ];
         int parent_inum = nameiparent(pathname, name);  // 查找父目录 Inode，并提取最后一级的文件名
-        if (parent_inum == -1) 
+        if (parent_inum == -1)
         {
             log_err("[fs_open] Invalid path or parent directory missing: %s", pathname);
-            return -1;
+            return -ENOENT;
         }
 
         while (true)   // retry 循环
         {
           file_type_t type;
-          inum = dir_lookup(parent_inum, name, &type);
+          inum = dir_lookup_pin(parent_inum, name, &type);
           if (inum != -1) // 文件已经存在于该目录中
           {
-            if (flags & junction::kFlagExclusive) 
+            if (flags & junction::kFlagExclusive)
             {
+                my_close(inum);
                 log_err("[fs_open] File already exists (O_EXCL triggered): %s", pathname);
-                return -1;
+                return -EEXIST;
             }
 
-            if (type == DIRECTORY) 
+            if (type == DIRECTORY)
             {
+                my_close(inum);
                 log_err("[fs_open] Cannot open a directory with O_CREAT: %s", pathname);
-                return -1;
+                return -EISDIR;
             }
-            
+
             break;
           }
           else   // 文件不存在，执行真正的创建逻辑
@@ -73,27 +185,29 @@ int my_open(const char* pathname, int flags, mode_t mode)
             if (!new_ih) 
             {
                 log_err("[fs_open] Inode space exhausted for %s", pathname);
-                return -1;
+                return -ENOSPC;
             }
             int new_inum = new_ih.read_access()->idx;
+            shaofs_pin_open_inode(new_inum);
 
             int ret = dir_add_entry(parent_inum, name, new_inum, REGULAR);  // 将新文件注册到父目录中
-            if (ret != 0)   
+            if (ret != 0)
             {
+                my_close(new_inum);
                 ic_free_inode(new_inum); // 回滚刚分配的 Inode
 
                 if (ret == -EEXIST)
                 {
-                  if (flags & junction::kFlagExclusive) 
+                  if (flags & junction::kFlagExclusive)
                   {
                     log_err("[fs_open] Concurrent creation conflict (O_EXCL): %s", pathname);
-                    return -1;
+                    return -EEXIST;
                   }
                   continue;
                 }
 
                 log_err("Fail to add dentry");
-                return -1;
+                return ret;
             }
 
             inum = new_inum; // 创建成功！
@@ -104,11 +218,26 @@ int my_open(const char* pathname, int flags, mode_t mode)
     }
     else   // 普通打开，不带创建语义
     {
-        inum = namei(pathname);
-        if (inum == -1) 
+        char name[NAMESIZ];
+        int parent_inum = nameiparent(pathname, name);
+        if (parent_inum == -1)
+        {
+            log_err("[fs_open] Invalid path or parent directory missing: %s", pathname);
+            return -ENOENT;
+        }
+
+        file_type_t type;
+        inum = dir_lookup_pin(parent_inum, name, &type);
+        if (inum == -1)
         {
             log_err("[fs_open] File not found: %s", pathname);
-            return -1;
+            return -ENOENT;
+        }
+        if (type == DIRECTORY)
+        {
+            my_close(inum);
+            log_err("[fs_open] Cannot open directory as regular file: %s", pathname);
+            return -EISDIR;
         }
     }
 
@@ -160,12 +289,28 @@ int my_mkdir(const char *pathname, mode_t mode)
         return -1; // ENOENT
     }
 
-    // 乐观的快速查重（无锁并发）
     file_type_t type;
-    if (dir_lookup(parent_inum, name, &type) != -1) 
+    int existing_inum = dir_lookup(parent_inum, name, &type);
+    if (existing_inum != -1)
     {
-        log_err("[my_mkdir] Directory/File already exists: %s", pathname);
-        return -EEXIST;
+        InodeHandle existing_ih = ic_get_inode(existing_inum);
+        if (!existing_ih)
+        {
+            log_err("[my_mkdir] Failed to verify existing entry: %s", pathname);
+            return -EIO;
+        }
+
+        bool stale;
+        {
+            auto acc = existing_ih.read_access();
+            stale = !acc->used;
+        }
+        if (!stale)
+        {
+            log_err("[my_mkdir] Directory/File already exists: %s", pathname);
+            return -EEXIST;
+        }
+        if (dir_delete_stale_entry(parent_inum, name) != 0) return -EEXIST;
     }
 
     // 分配新的目录 Inode
@@ -239,15 +384,11 @@ int my_unlink(const char *pathname)
     int parent_inum = nameiparent(pathname, name);
     if (parent_inum == -1) return -ENOENT;
 
+    int inum;
     file_type_t type;
-    int inum = dir_lookup(parent_inum, name, &type);
-    if (inum == -1) return -ENOENT;
-    if (type == DIRECTORY) return -EISDIR;
-
-    if (dir_delete_entry(parent_inum, name) != 0) return -ENOENT;
-    if (!ic_free_inode(inum)) return -EIO;
-
-    return 0;
+    int ret = dir_delete_file_entry(parent_inum, name, &inum, &type);
+    if (ret != 0) return ret;
+    return shaofs_unlink_inode(inum);
 }
 
 off_t my_lseek(int inum, off_t offset, int whence, off_t old_off)

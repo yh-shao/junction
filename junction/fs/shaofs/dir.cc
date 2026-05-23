@@ -3,6 +3,7 @@
 #include "inodeCache.h"
 #include "file.h"
 #include "dentryCache.h"
+#include "syscall.h"
 
 struct DirIndexNode
 {
@@ -312,13 +313,8 @@ static DirIndex* dir_ensure_index_locked(int dir_inum, const InodeHandle& dir_ih
     return existing;
 }
 
-int dir_lookup(int dir_inum, const char* name, file_type_t* type)
+static int dir_lookup_locked(int dir_inum, const InodeHandle& dir_ih, const char* name, file_type_t* type)
 {
-    InodeHandle dir_ih = ic_get_inode(dir_inum);
-    if (!dir_ih) return -1;
-
-    DirReadGuard rguard(dir_ih);   // 目录读锁，允许并发 lookup
-
     if (DirIndex* index = dir_get_index_locked(dir_ih))
     {
         DirIndexNode* node = dir_index_find(index, name, dir_name_hash(name));
@@ -339,6 +335,26 @@ int dir_lookup(int dir_inum, const char* name, file_type_t* type)
     });
 
     return found_inum;
+}
+
+int dir_lookup(int dir_inum, const char* name, file_type_t* type)
+{
+    InodeHandle dir_ih = ic_get_inode(dir_inum);
+    if (!dir_ih) return -1;
+
+    DirReadGuard rguard(dir_ih);
+    return dir_lookup_locked(dir_inum, dir_ih, name, type);
+}
+
+int dir_lookup_pin(int dir_inum, const char* name, file_type_t* type)
+{
+    InodeHandle dir_ih = ic_get_inode(dir_inum);
+    if (!dir_ih) return -1;
+
+    DirReadGuard rguard(dir_ih);
+    int inum = dir_lookup_locked(dir_inum, dir_ih, name, type);
+    if (inum != -1) shaofs_pin_open_inode(inum);
+    return inum;
 }
 
 bool dir_is_empty(int dir_inum)
@@ -441,19 +457,8 @@ int dir_add_entry(int dir_inum, const char* name, int inum, file_type_t type)
     return 0;
 }
 
-int dir_delete_entry(int dir_inum, const char* name)
+static int dir_delete_node_locked(const InodeHandle& dir_ih, int dir_inum, const char* name, DirIndex* index, DirIndexNode* node)
 {
-    InodeHandle dir_ih = ic_get_inode(dir_inum);
-    if (!dir_ih) return -1;
-
-    DirWriteGuard wguard(dir_ih);
-
-    DirIndex* index = dir_ensure_index_locked(dir_inum, dir_ih);
-    if (unlikely(!index)) return -1;
-
-    DirIndexNode* node = dir_index_find(index, name, dir_name_hash(name));
-    if (!node) return -1;
-
     Dirent empty_entry;
     memset(&empty_entry, 0, sizeof(empty_entry));
 
@@ -477,4 +482,64 @@ int dir_delete_entry(int dir_inum, const char* name)
     }
     get_dentry_cache().invalidate(DentryKey(dir_inum, name));
     return 0;
+}
+
+int dir_delete_entry(int dir_inum, const char* name)
+{
+    InodeHandle dir_ih = ic_get_inode(dir_inum);
+    if (!dir_ih) return -1;
+
+    DirWriteGuard wguard(dir_ih);
+
+    DirIndex* index = dir_ensure_index_locked(dir_inum, dir_ih);
+    if (unlikely(!index)) return -1;
+
+    DirIndexNode* node = dir_index_find(index, name, dir_name_hash(name));
+    if (!node) return -1;
+
+    return dir_delete_node_locked(dir_ih, dir_inum, name, index, node);
+}
+
+int dir_delete_stale_entry(int dir_inum, const char* name)
+{
+    InodeHandle dir_ih = ic_get_inode(dir_inum);
+    if (!dir_ih) return -ENOENT;
+
+    DirWriteGuard wguard(dir_ih);
+
+    DirIndex* index = dir_ensure_index_locked(dir_inum, dir_ih);
+    if (unlikely(!index)) return -ENOENT;
+
+    DirIndexNode* node = dir_index_find(index, name, dir_name_hash(name));
+    if (!node) return -ENOENT;
+
+    InodeHandle target_ih = ic_get_inode(node->inum);
+    if (!target_ih) return -EIO;
+
+    {
+        auto acc = target_ih.read_access();
+        if (acc->used) return -EEXIST;
+    }
+
+    return dir_delete_node_locked(dir_ih, dir_inum, name, index, node);
+}
+
+int dir_delete_file_entry(int dir_inum, const char* name, int* inum, file_type_t* type)
+{
+    InodeHandle dir_ih = ic_get_inode(dir_inum);
+    if (!dir_ih) return -ENOENT;
+
+    DirWriteGuard wguard(dir_ih);
+
+    DirIndex* index = dir_ensure_index_locked(dir_inum, dir_ih);
+    if (unlikely(!index)) return -ENOENT;
+
+    DirIndexNode* node = dir_index_find(index, name, dir_name_hash(name));
+    if (!node) return -ENOENT;
+
+    if (inum) *inum = node->inum;
+    if (type) *type = node->type;
+    if (node->type == DIRECTORY) return -EISDIR;
+
+    return dir_delete_node_locked(dir_ih, dir_inum, name, index, node);
 }
