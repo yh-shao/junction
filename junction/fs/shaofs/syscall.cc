@@ -7,6 +7,7 @@
 #include "inodeCache.h"
 #include "blockCache.h"
 #include "extent.h"
+#include "profile.h"
 #include "junction/fs/file.h"
 
 struct InodeLifecycle {
@@ -67,6 +68,7 @@ void shaofs_pin_open_inode(int inum)
 void my_close(int inum)
 {
     RuntimeFSBaseGuard g;
+    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_MY_CLOSE);
 
     InodeLifecycle* state = get_inode_lifecycle(inum);
     if (unlikely(!state)) return;
@@ -139,13 +141,15 @@ int my_open2(const char* pathname, int flags, mode_t mode)
     return 1;
 }
 
-int my_open(const char* pathname, int flags, mode_t mode)
+int my_open(const char* pathname, int flags, mode_t mode, file_type_t* type_out)
 {
     // log_info("open(%s)", pathname);
 
     RuntimeFSBaseGuard g;
+    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_MY_OPEN);
 
     int inum = -1;
+    file_type_t opened_type = REGULAR;
 
     if (flags & junction::kFlagCreate)
     {
@@ -177,6 +181,7 @@ int my_open(const char* pathname, int flags, mode_t mode)
                 return -EISDIR;
             }
 
+            opened_type = type;
             break;
           }
           else   // 文件不存在，执行真正的创建逻辑
@@ -211,6 +216,7 @@ int my_open(const char* pathname, int flags, mode_t mode)
             }
 
             inum = new_inum; // 创建成功！
+            opened_type = REGULAR;
             // log_info("created a new file: %s", pathname);
             break;
           }
@@ -218,27 +224,42 @@ int my_open(const char* pathname, int flags, mode_t mode)
     }
     else   // 普通打开，不带创建语义
     {
-        char name[NAMESIZ];
-        int parent_inum = nameiparent(pathname, name);
-        if (parent_inum == -1)
+        if (strcmp(pathname, "/") == 0)
         {
-            log_err("[fs_open] Invalid path or parent directory missing: %s", pathname);
-            return -ENOENT;
+            inum = ROOT_INO;
+            opened_type = DIRECTORY;
+            shaofs_pin_open_inode(inum);
         }
+        else
+        {
+            char name[NAMESIZ];
+            int parent_inum = nameiparent(pathname, name);
+            if (parent_inum == -1)
+            {
+                log_err("[fs_open] Invalid path or parent directory missing: %s", pathname);
+                return -ENOENT;
+            }
 
-        file_type_t type;
-        inum = dir_lookup_pin(parent_inum, name, &type);
-        if (inum == -1)
-        {
-            log_err("[fs_open] File not found: %s", pathname);
-            return -ENOENT;
+            file_type_t type;
+            inum = dir_lookup_pin(parent_inum, name, &type);
+            if (inum == -1)
+            {
+                log_err("[fs_open] File not found: %s", pathname);
+                return -ENOENT;
+            }
+            opened_type = type;
         }
-        if (type == DIRECTORY)
-        {
-            my_close(inum);
-            log_err("[fs_open] Cannot open directory as regular file: %s", pathname);
-            return -EISDIR;
-        }
+    }
+
+    if ((flags & junction::kFlagDirectory) && opened_type != DIRECTORY)
+    {
+        my_close(inum);
+        return -ENOTDIR;
+    }
+    if (opened_type == DIRECTORY && ((flags & junction::kAccessModeMask) != O_RDONLY || (flags & (junction::kFlagTruncate | junction::kFlagDirect))))
+    {
+        my_close(inum);
+        return -EISDIR;
     }
 
     // 处理文件截断
@@ -247,12 +268,15 @@ int my_open(const char* pathname, int flags, mode_t mode)
         truncate_inode(inum);
     }
 
+    if (type_out) *type_out = opened_type;
     return inum;
 }
 
 ssize_t my_read(int inum, void *buf, off_t* off, size_t len, bool direct)
 {
     RuntimeFSBaseGuard g;
+    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_MY_READ);
+    shaofs_profile_record_bytes(SHAOFS_PROF_MY_READ, len);
 
     ssize_t ret = direct ? file_read_direct(inum, (char*)buf, *off, len)
                          : file_read(inum, (char*)buf, *off, len);
@@ -263,6 +287,8 @@ ssize_t my_read(int inum, void *buf, off_t* off, size_t len, bool direct)
 ssize_t my_write(int inum, const void *buf, off_t* off, size_t len, bool direct, bool append)
 {
     RuntimeFSBaseGuard g;
+    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_MY_WRITE);
+    shaofs_profile_record_bytes(SHAOFS_PROF_MY_WRITE, len);
 
     ssize_t ret;
     if (append && !direct)
@@ -379,6 +405,7 @@ int my_mkdir(const char *pathname, mode_t mode)
 int my_unlink(const char *pathname)
 {
     RuntimeFSBaseGuard g;
+    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_MY_UNLINK);
 
     char name[NAMESIZ];
     int parent_inum = nameiparent(pathname, name);
@@ -486,6 +513,7 @@ int my_newfstatat(const char *pathname, struct stat *statbuf)
 int my_fsync(int inum)
 {
     RuntimeFSBaseGuard g;
+    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_MY_FSYNC);
 
     InodeHandle ih = ic_get_inode(inum);
     if (unlikely(!ih)) return -ENOENT;
@@ -519,6 +547,7 @@ int my_fsync(int inum)
 
         if (has_dirty_data && dirty_start < dirty_end)
         {
+            SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_MY_FSYNC_DATA_FLUSH);
             BlockID first_logical = dirty_start / BLOCK_SIZE;
             BlockID last_logical = (dirty_end - 1) / BLOCK_SIZE;
             BlockID run_start = INVALID_BLOCK_ID;
@@ -555,7 +584,11 @@ int my_fsync(int inum)
             if (!flush_run()) return -EIO;
         }
 
-        if (!inode_flush_extent_metadata(&(*read_acc))) return -EIO;
+        if (need_inode_flush)
+        {
+            SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_MY_FSYNC_EXTENT_FLUSH);
+            if (!inode_flush_extent_metadata(&(*read_acc))) return -EIO;
+        }
     }
 
     if (!has_dirty_data && !need_inode_flush) return 0;
@@ -575,6 +608,7 @@ int my_fsync(int inum)
 
     if (need_inode_flush)
     {
+        SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_MY_FSYNC_INODE_FLUSH);
         if (!ic_flush_inode(inum)) return -EIO;
 
         auto write_acc = ih.write_access();

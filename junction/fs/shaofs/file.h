@@ -25,3 +25,4 @@ struct DirectReadHint {
 };
 bool file_prepare_direct_read_hint(int inum, DirectReadHint* hint);
 ssize_t file_read_direct_hint(const DirectReadHint* hint, char* buf, off_t offset, size_t len);
+void init_file_io();

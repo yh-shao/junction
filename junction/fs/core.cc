@@ -530,7 +530,8 @@ long usys_renameat2(int olddirfd, const char *oldpath, int newdirfd,
 
 static long OpenShaOFSFile(const char* realpath, int flags, mode_t mode)
 {
-  int inum = my_open(realpath, flags, mode);
+  file_type_t type = UNKNOWN;
+  int inum = my_open(realpath, flags, mode, &type);
   if (inum < 0) return inum;
 
   Process &p = myproc();
@@ -538,10 +539,11 @@ static long OpenShaOFSFile(const char* realpath, int flags, mode_t mode)
   auto [opflag, fmode] = FromFlags(flags);
   std::shared_ptr<Inode> myinode = std::make_shared<MyInode>(inum);
 
+  FileType file_type = type == DIRECTORY ? FileType::kDirectory : FileType::kNormal;
   auto my_dentry = std::make_shared<junction::DirectoryEntry>("dummy_name", nullptr, myinode);
-  Status<std::shared_ptr<File>> f = std::make_shared<File>(FileType::kNormal, opflag, fmode, my_dentry);
-  if (opflag & kFlagDirect) file_prepare_direct_read_hint(inum, (*f)->get_shaofs_direct_read_hint());
-  if (flags & kFlagAppend) (*f)->get_off_ref() = my_lseek(inum, 0, SEEK_END, 0);   // 此处 old_offset 可以忽略
+  Status<std::shared_ptr<File>> f = std::make_shared<File>(file_type, opflag, fmode, my_dentry);
+  if (type == REGULAR && (opflag & kFlagDirect)) file_prepare_direct_read_hint(inum, (*f)->get_shaofs_direct_read_hint());
+  if (type == REGULAR && (flags & kFlagAppend)) (*f)->get_off_ref() = my_lseek(inum, 0, SEEK_END, 0);   // 此处 old_offset 可以忽略
   return ftbl.Insert(std::move(*f), (flags & kFlagCloseExec) > 0);
 }
 

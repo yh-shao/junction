@@ -1,7 +1,7 @@
 #include "fs.h"
 #include <sys/stat.h>
 
-int my_open(const char *pathname, int flags, mode_t mode);
+int my_open(const char *pathname, int flags, mode_t mode, file_type_t* type_out);
 void shaofs_reset_inode_lifecycle(int inum);
 void shaofs_pin_open_inode(int inum);
 void my_close(int inum);

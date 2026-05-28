@@ -2,8 +2,8 @@
 #include "blockCache.h"
 #include "journal.h"
 #include "utili.h"
+#include "profile.h"
 #include "generic_cache/backend.h"
-#include <cstring>
 #include <utility>
 
 extern "C" {
@@ -44,17 +44,80 @@ void init_block_cache(size_t capacity, size_t shard_num)
     }
     else log_info("Heap allocated: base_addr=%p, size=%zu, using this buffer as BlockCache", buffer, total_mem);
 
-    g_block_cache_ptr = new GlobalBlockCache(capacity, shard_num, &NVMeSSD::getInstance(), []() { return new LRUPolicy<BlockID, BlockData>(); }, buffer);
+    g_block_cache_ptr = new GlobalBlockCache(capacity, shard_num, &NVMeSSD::getInstance(), []() { return new MetadataAwareLRUPolicy(); }, buffer);
     log_info("block cache initialized with %zu shards, each shard has %zu capacity, total capacity is %zu", g_block_cache_ptr->get_shard_count(), g_block_cache_ptr->get_shard_capacity(), g_block_cache_ptr->get_total_capacity());
 }
 
-BlockHandle bc_get_handle(BlockID id) { return get_block_cache().getHandle(id);   }
-bool bc_flush_block(BlockID id)       { return get_block_cache().flush_entry(id); }
+BlockHandle bc_get_handle(BlockID id, bool fetch_on_miss)
+{
+    if (shaofs_profile_enabled())
+    {
+        bool cached = static_cast<bool>(get_block_cache().find_cached(id));
+        ShaofsProfileEvent event;
+        if (fetch_on_miss) event = cached ? SHAOFS_PROF_BC_GET_HIT : SHAOFS_PROF_BC_GET_MISS;
+        else event = cached ? SHAOFS_PROF_BC_GET_NOFETCH_HIT : SHAOFS_PROF_BC_GET_NOFETCH_MISS;
+        shaofs_profile_record(event, 0);
+        shaofs_profile_record_blocks(event, 1);
+    }
+    return get_block_cache().getHandle(id, fetch_on_miss);
+}
+
+BlockHandle bc_get_handle(BlockID id) { return bc_get_handle(id, true); }
+
+bool bc_flush_block(BlockID id)
+{
+    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_BC_FLUSH_BLOCK);
+    shaofs_profile_record_blocks(SHAOFS_PROF_BC_FLUSH_BLOCK, 1);
+    return get_block_cache().flush_entry(id);
+}
+
+bool bc_flush_block_batched(BlockID id)
+{
+    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_BC_FLUSH_BLOCK);
+    shaofs_profile_record_blocks(SHAOFS_PROF_BC_FLUSH_BLOCK, 1);
+
+    BlockHandle h = get_block_cache().find_cached(id);
+    if (!h) return true;
+
+    auto* entry = h.get_entry();
+    if (!atomic_read(&entry->dirty) || !atomic_read(&entry->valid)) return true;
+
+    auto acc = h.read_access();
+    if (!atomic_read(&entry->dirty) || !atomic_read(&entry->valid)) return true;
+
+#if CRASH_CONSISTENCY
+    if (journal_is_metadata_block(id))
+    {
+        if (!journal_commit_single_batched(id, acc->data)) return false;
+        if (journal_commit_returns_after_checkpoint(id)) atomic_write(&entry->dirty, 0);
+        return true;
+    }
+#endif
+
+    if (!DMA_write_block(static_cast<const void*>(acc->data), id)) return false;
+    atomic_write(&entry->dirty, 0);
+    return true;
+}
 void bc_invalidate_block(BlockID id)  {        get_block_cache().invalidate(id);  }
 void bc_flush_all()                   {        get_block_cache().flush_all();     }
 
+bool bc_mark_block_dirty(BlockHandle& h)
+{
+    if (unlikely(!h)) return false;
+    atomic_write(&h.get_entry()->dirty, 1);
+    return true;
+}
+
+bool bc_is_cached_valid(BlockID id)
+{
+    BlockHandle h = get_block_cache().find_cached(id);
+    return h && atomic_read(&h.get_entry()->valid);
+}
+
 bool bc_flush_blocks_contiguous(BlockID start, uint32_t count)
 {
+    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_BC_FLUSH_BLOCKS_CONTIGUOUS);
+    shaofs_profile_record_blocks(SHAOFS_PROF_BC_FLUSH_BLOCKS_CONTIGUOUS, count);
     static constexpr uint32_t kMaxBatch = 16;
     struct StorageBlockEntryCompat { uint64_t lba; char* data; };
 
@@ -95,7 +158,10 @@ bool bc_flush_blocks_contiguous(BlockID start, uint32_t count)
                 sgl_ptrs[i] = &sgl_entries[i];
             }
 
+            uint64_t write_start = shaofs_profile_enabled() ? shaofs_profile_now_us() : 0;
             ok = nr == 1 ? (storage_write(entries[0]->data.data, run_start, 1) == 0) : (write_blocks_to_disk(run_start, nr, sgl_ptrs) == 0);
+            if (write_start) shaofs_profile_record(SHAOFS_PROF_BC_DATA_BATCH_WRITEBACK, shaofs_profile_now_us() - write_start);
+            shaofs_profile_record_blocks(SHAOFS_PROF_BC_DATA_BATCH_WRITEBACK, nr);
             if (ok)
             {
                 for (uint32_t i = 0; i < nr; i++)
@@ -151,7 +217,14 @@ bool bc_flush_blocks_contiguous(BlockID start, uint32_t count)
 bool bc_write_backend(BlockID id, const BlockData& value)
 {
 #if CRASH_CONSISTENCY
-    if (journal_is_metadata_block(id)) return journal_commit_single(id, value.data);
+    if (journal_is_metadata_block(id))
+    {
+        SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_BC_METADATA_WRITEBACK);
+        shaofs_profile_record_blocks(SHAOFS_PROF_BC_METADATA_WRITEBACK, 1);
+        return journal_commit_single(id, value.data);
+    }
 #endif
+    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_BC_DATA_WRITEBACK);
+    shaofs_profile_record_blocks(SHAOFS_PROF_BC_DATA_WRITEBACK, 1);
     return DMA_write_block(static_cast<const void*>(value.data), id);
 }

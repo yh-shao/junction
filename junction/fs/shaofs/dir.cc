@@ -4,6 +4,7 @@
 #include "file.h"
 #include "dentryCache.h"
 #include "syscall.h"
+#include "profile.h"
 
 struct DirIndexNode
 {
@@ -248,6 +249,7 @@ static DirIndex* dir_get_index_locked(const InodeHandle& dir_ih)
 
 static int dir_build_index_locked(int dir_inum, const InodeHandle& dir_ih, DirIndex* index)
 {
+    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_DIR_BUILD_INDEX_LOCKED);
     size_t slots;
     {
         auto acc = dir_ih.read_access();
@@ -290,6 +292,7 @@ static int dir_build_index_locked(int dir_inum, const InodeHandle& dir_ih, DirIn
 
 static DirIndex* dir_ensure_index_locked(int dir_inum, const InodeHandle& dir_ih)
 {
+    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_DIR_ENSURE_INDEX_LOCKED);
     if (DirIndex* index = dir_get_index_locked(dir_ih)) return index;
 
     DirIndex* new_index = static_cast<DirIndex*>(szalloc(sizeof(DirIndex)));
@@ -339,6 +342,7 @@ static int dir_lookup_locked(int dir_inum, const InodeHandle& dir_ih, const char
 
 int dir_lookup(int dir_inum, const char* name, file_type_t* type)
 {
+    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_DIR_LOOKUP);
     InodeHandle dir_ih = ic_get_inode(dir_inum);
     if (!dir_ih) return -1;
 
@@ -348,6 +352,7 @@ int dir_lookup(int dir_inum, const char* name, file_type_t* type)
 
 int dir_lookup_pin(int dir_inum, const char* name, file_type_t* type)
 {
+    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_DIR_LOOKUP_PIN);
     InodeHandle dir_ih = ic_get_inode(dir_inum);
     if (!dir_ih) return -1;
 
@@ -383,6 +388,7 @@ bool dir_is_empty(int dir_inum)
 
 int dir_add_entry(int dir_inum, const char* name, int inum, file_type_t type)
 {
+    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_DIR_ADD_ENTRY);
     InodeHandle dir_ih = ic_get_inode(dir_inum);
     if (!dir_ih) return -1;
 
@@ -526,6 +532,7 @@ int dir_delete_stale_entry(int dir_inum, const char* name)
 
 int dir_delete_file_entry(int dir_inum, const char* name, int* inum, file_type_t* type)
 {
+    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_DIR_DELETE_FILE_ENTRY);
     InodeHandle dir_ih = ic_get_inode(dir_inum);
     if (!dir_ih) return -ENOENT;
 

@@ -2,11 +2,11 @@
 #include "blockCache.h"
 #include "group.h"
 #include "inode.h"
-#include <vector>
 #include <algorithm>
 #include <cstring>
 #include "inodeCache.h"
 #include "journal.h"
+#include "profile.h"
 
 extern "C" {
 #include "../runtime/defs.h"
@@ -17,7 +17,66 @@ static constexpr int kLegacyMaxExtents = static_cast<int>(LEGACY_MAX_EXTENT_NUM)
 static constexpr int kAppendPreallocSmallBlocks = 16;
 static constexpr int kAppendPreallocMediumBlocks = 64;
 static constexpr int kAppendPreallocMaxBlocks = 128;
-static constexpr uint64_t kAppendPreallocMinFileSize = 256ull * 1024;
+static constexpr int kMaxInodeExtents = DIRECT_EXTENT_NUM + EXTENT_TREE_ROOT_REFS * EXTENT_TREE_LEAF_EXTENTS;
+static constexpr int kExtentScratchSlots = 8;
+
+struct ExtentScratch {
+    volatile int busy;
+    iExtent extents[kMaxInodeExtents + kAppendPreallocMaxBlocks];
+};
+
+static ExtentScratch extent_scratch[kExtentScratchSlots];
+static bool extent_scratch_ready;
+
+static void init_extent_scratch_once()
+{
+    if (likely(extent_scratch_ready)) return;
+
+    static spinlock_t init_lock = SPINLOCK_INITIALIZER;
+    SpinGuardNP g(&init_lock);
+    if (extent_scratch_ready) return;
+
+    for (int i = 0; i < kExtentScratchSlots; i++)
+        extent_scratch[i].busy = 0;
+    extent_scratch_ready = true;
+}
+
+class ExtentScratchGuard {
+    ExtentScratch* scratch_;
+
+public:
+    ExtentScratchGuard()
+    {
+        init_extent_scratch_once();
+        unsigned int cpu;
+        {
+            kguard k;
+            cpu = k->curr_cpu;
+        }
+        unsigned int start = cpu % kExtentScratchSlots;
+        while (true)
+        {
+            for (int i = 0; i < kExtentScratchSlots; i++)
+            {
+                ExtentScratch* candidate = &extent_scratch[(start + i) % kExtentScratchSlots];
+                int expected = 0;
+                if (__atomic_compare_exchange_n(&candidate->busy, &expected, 1, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+                {
+                    scratch_ = candidate;
+                    return;
+                }
+            }
+            thread_yield();
+        }
+    }
+
+    ~ExtentScratchGuard() { __atomic_store_n(&scratch_->busy, 0, __ATOMIC_RELEASE); }
+
+    iExtent* data() { return scratch_->extents; }
+
+    ExtentScratchGuard(const ExtentScratchGuard&) = delete;
+    ExtentScratchGuard& operator=(const ExtentScratchGuard&) = delete;
+};
 
 static inline BlockID first_block_after_eof(const MInode* inode)
 {
@@ -26,7 +85,9 @@ static inline BlockID first_block_after_eof(const MInode* inode)
 
 static inline bool should_prealloc_append(const MInode* inode, BlockID logical_blk)
 {
-    return inode->type == REGULAR && inode->file_size >= kAppendPreallocMinFileSize && logical_blk == first_block_after_eof(inode);
+    (void)inode;
+    (void)logical_blk;
+    return false;
 }
 
 static inline int append_prealloc_blocks(const MInode* inode)
@@ -143,11 +204,20 @@ static int find_leaf_ref(const ExtentLeafRef* refs, uint32_t leaf_count, BlockID
     return best;
 }
 
-static bool collect_all_extents(const MInode* inode, std::vector<iExtent>& out)
+static bool collect_all_extents(const MInode* inode, iExtent* out, int capacity, int* out_count)
 {
+    if (!out || !out_count || capacity <= 0) return false;
+    *out_count = 0;
+
+    auto append_extent = [&] (const iExtent& ext) -> bool {
+        if (*out_count >= capacity) return false;
+        out[(*out_count)++] = ext;
+        return true;
+    };
+
     uint32_t direct_cnt = direct_extent_count(inode);
-    out.reserve(inode->valid_extent_count);
-    for (uint32_t i = 0; i < direct_cnt; ++i) out.push_back(inode->direct_extents[i]);
+    for (uint32_t i = 0; i < direct_cnt; ++i)
+        if (!append_extent(inode->direct_extents[i])) return false;
 
     if (!uses_indirect_block(inode)) return true;
 
@@ -163,7 +233,8 @@ static bool collect_all_extents(const MInode* inode, std::vector<iExtent>& out)
     {
         const iExtent* exts = reinterpret_cast<const iExtent*>(root_acc->data);
         uint32_t ind_cnt = legacy_indirect_extent_count(inode);
-        for (uint32_t i = 0; i < ind_cnt; ++i) out.push_back(exts[i]);
+        for (uint32_t i = 0; i < ind_cnt; ++i)
+            if (!append_extent(exts[i])) return false;
         return true;
     }
 
@@ -193,10 +264,11 @@ static bool collect_all_extents(const MInode* inode, std::vector<iExtent>& out)
         }
 
         const iExtent* exts = leaf_extents(leaf_acc->data);
-        for (uint32_t i = 0; i < leaf->extent_count; i++) out.push_back(exts[i]);
+        for (uint32_t i = 0; i < leaf->extent_count; i++)
+            if (!append_extent(exts[i])) return false;
     }
 
-    return out.size() == inode->valid_extent_count;
+    return *out_count == static_cast<int>(inode->valid_extent_count);
 }
 
 static bool write_legacy_extents(MInode* inode, const iExtent* all_extents, int ext_count)
@@ -242,7 +314,7 @@ static bool write_tree_leaf(BlockID leaf_block, const iExtent* exts, uint32_t co
 {
     journal_register_metadata_block(leaf_block);
 
-    BlockHandle leaf_bh = get_block_cache().getHandle(leaf_block, false);
+    BlockHandle leaf_bh = bc_get_handle(leaf_block, false);
     if (unlikely(!leaf_bh)) return false;
 
     auto acc = leaf_bh.write_access();
@@ -366,6 +438,67 @@ static bool bmap_lookup_tree(MInode* inode, BlockID logical_blk, iExtent* found)
     return true;
 }
 
+static bool bmap_lookup_extent(MInode* inode, BlockID logical_blk, iExtent* found)
+{
+    if (!found || inode->valid_extent_count == 0) return false;
+
+    if (spin_try_lock_np(&inode->hint_lock))
+    {
+        iExtent hint = inode->extent_hint;
+        spin_unlock_np(&inode->hint_lock);
+        if (block_in_extent(logical_blk, hint))
+        {
+            *found = hint;
+            return true;
+        }
+    }
+
+    uint32_t total_exts = inode->valid_extent_count, direct_count = direct_extent_count(inode);
+    if (total_exts == 1)
+    {
+        const iExtent& ext = inode->direct_extents[0];
+        if (block_in_extent(logical_blk, ext))
+        {
+            *found = ext;
+            update_extent_hint(inode, ext);
+            return true;
+        }
+    }
+
+    iExtent ext;
+    if (lookup_extent(inode->direct_extents, direct_count, logical_blk, &ext) != INVALID_BLOCK_ID)
+    {
+        *found = ext;
+        update_extent_hint(inode, ext);
+        return true;
+    }
+
+    if (!uses_indirect_block(inode)) return false;
+
+    if (uses_extent_tree(inode))
+    {
+        if (!bmap_lookup_tree(inode, logical_blk, &ext)) return false;
+        *found = ext;
+        update_extent_hint(inode, ext);
+        return true;
+    }
+
+    BlockHandle ind_bh = bc_get_handle(inode->indirect_extent_block);
+    if (unlikely(!ind_bh))
+    {
+        log_err("[bmap_lookup_extent()] Failed to get indirect block [%lu] for inode %d", inode->indirect_extent_block, inode->idx);
+        return false;
+    }
+
+    auto acc = ind_bh.read_access();
+    const iExtent* ind_exts = reinterpret_cast<const iExtent*>(acc->data);
+    if (lookup_extent(ind_exts, legacy_indirect_extent_count(inode), logical_blk, &ext) == INVALID_BLOCK_ID) return false;
+
+    *found = ext;
+    update_extent_hint(inode, ext);
+    return true;
+}
+
 static bool tree_load_last_extent(MInode* inode, iExtent* out)
 {
     if (!out) return false;
@@ -451,71 +584,14 @@ static bool tree_append_new_extent(MInode* inode, const iExtent& new_ext)
 
 static BlockID bmap_lookup(MInode* inode, BlockID logical_blk)   // 在 inode 中查找这个 logical_blk，若能找到，则返回对应的实际物理块号
 {
-    if (inode->valid_extent_count == 0) return INVALID_BLOCK_ID;
-
-    // Fast Path: Hint 缓存
-    if (spin_try_lock_np(&inode->hint_lock))
-    {
-        iExtent hint = inode->extent_hint;
-        spin_unlock_np(&inode->hint_lock);
-        if (block_in_extent(logical_blk, hint)) return hint.physical_start + (logical_blk - hint.logical_start);
-    }
-
-    uint32_t total_exts = inode->valid_extent_count, direct_count = direct_extent_count(inode);
-
-    // Fast Path: 单 extent
-    if (total_exts == 1)
-    {
-        const iExtent& ext = inode->direct_extents[0];
-        if (block_in_extent(logical_blk, ext)) 
-        {
-            update_extent_hint(inode, ext);
-            return ext.physical_start + (logical_blk - ext.logical_start);
-        }
-    }
-
-    // 在 direct extents 中进行查找
     iExtent found;
-    BlockID phys_blk = lookup_extent(inode->direct_extents, direct_count, logical_blk, &found);
-    if (phys_blk != INVALID_BLOCK_ID)
-    {
-        update_extent_hint(inode, found);
-        return phys_blk;
-    }
+    if (!bmap_lookup_extent(inode, logical_blk, &found)) return INVALID_BLOCK_ID;
+    return found.physical_start + (logical_blk - found.logical_start);
+}
 
-    // 在 indirect extents 中进行查找
-    if (uses_indirect_block(inode))
-    {
-        if (uses_extent_tree(inode))
-        {
-            if (bmap_lookup_tree(inode, logical_blk, &found))
-            {
-                update_extent_hint(inode, found);
-                return found.physical_start + (logical_blk - found.logical_start);
-            }
-            return INVALID_BLOCK_ID;
-        }
-
-        BlockHandle ind_bh = bc_get_handle(inode->indirect_extent_block);   // TODO：此时如果发生加载，则会阻塞所有需要读取这个 inode 的线程，可以优化为采用 prefetch 策略
-        if (unlikely(!ind_bh)) 
-        {
-            log_err("[bmap_lookup_locked()] Failed to get indirect block [%lu] for inode %d", inode->indirect_extent_block, inode->idx);
-            return INVALID_BLOCK_ID;
-        }
-
-        {
-            auto acc = ind_bh.read_access();
-            const iExtent* ind_exts = reinterpret_cast<const iExtent*>(acc->data);
-            phys_blk = lookup_extent(ind_exts, legacy_indirect_extent_count(inode), logical_blk, &found);
-            if (phys_blk != INVALID_BLOCK_ID)
-            {
-                update_extent_hint(inode, found);
-                return phys_blk;
-            }
-        }
-    }
-
-    return INVALID_BLOCK_ID;
+bool inode_lookup_extent_locked(MInode* inode_ptr, BlockID logical_blk, iExtent* out_extent)
+{
+    return bmap_lookup_extent(inode_ptr, logical_blk, out_extent);
 }
 
 static bool bmap_try_append_extent(MInode* inode, const iExtent& new_ext)  // 尝试追加到末尾 extent 中
@@ -629,20 +705,22 @@ static bool bmap_try_append(MInode* inode, BlockID logical_blk, BlockID phys_blk
 
 static bool bmap_insert_compact_extents(MInode* inode, const iExtent* new_exts, int new_count, BlockID hint_logical_blk, bool report_overflow)
 {
-    std::vector<iExtent> all;
-    if (!collect_all_extents(inode, all)) return false;
+    ExtentScratchGuard scratch;
+    iExtent* all = scratch.data();
+    int ext_count = 0;
+    if (!collect_all_extents(inode, all, kMaxInodeExtents + kAppendPreallocMaxBlocks, &ext_count)) return false;
 
     for (int i = 0; i < new_count; i++)
     {
         if (new_exts[i].block_count == 0) continue;
-        all.push_back(new_exts[i]);
+        if (ext_count >= kMaxInodeExtents + kAppendPreallocMaxBlocks) return false;
+        all[ext_count++] = new_exts[i];
     }
 
-    int ext_count = compact_extents_inplace(all.data(), all.size());
-    all.resize(ext_count);
+    ext_count = compact_extents_inplace(all, ext_count);
 
     bool was_tree = uses_extent_tree(inode);
-    if (!write_tree_from_sorted(inode, all.data(), ext_count))
+    if (!write_tree_from_sorted(inode, all, ext_count))
     {
         if (report_overflow) log_err("[extent] Extent tree overflow for inode %d!", inode->idx);
         return false;
@@ -691,6 +769,44 @@ static void discard_preallocated_blocks(const BlockID* blocks, int block_count, 
     free_physical_runs(runs, run_count);
 }
 
+int inode_append_run_locked(MInode* inode, BlockID logical_start, int max_blocks, BlockID* out_blocks)
+{
+    if (!inode || !out_blocks || max_blocks <= 0) return 0;
+    max_blocks = MIN(max_blocks, kAppendPreallocMaxBlocks);
+
+    int mapped = 0;
+    while (mapped < max_blocks)
+    {
+        BlockID phys = bmap_lookup(inode, logical_start + (BlockID)mapped);
+        if (phys == INVALID_BLOCK_ID) break;
+        out_blocks[mapped++] = phys;
+    }
+    if (mapped == max_blocks) return mapped;
+
+    BlockID new_blocks[kAppendPreallocMaxBlocks];
+    iExtent runs[kAppendPreallocMaxBlocks];
+    int want = max_blocks - mapped;
+    int got = alloc_blocks(new_blocks, want);
+    if (got <= 0) return mapped;
+
+    int run_count = build_physical_runs(logical_start + (BlockID)mapped, new_blocks, got, runs);
+    bool inserted = false;
+    if (run_count == 1 && bmap_try_append_extent(inode, runs[0]))
+        inserted = true;
+    else
+        inserted = bmap_insert_compact_extents(inode, runs, run_count, logical_start + (BlockID)mapped, true);
+
+    if (!inserted)
+    {
+        discard_preallocated_blocks(new_blocks, got, runs, run_count);
+        return mapped;
+    }
+
+    for (int i = 0; i < got; i++)
+        out_blocks[mapped + i] = new_blocks[i];
+    return mapped + got;
+}
+
 static BlockID bmap_prealloc_append(MInode* inode, BlockID logical_blk)
 {
     BlockID blocks[kAppendPreallocMaxBlocks];
@@ -701,10 +817,13 @@ static BlockID bmap_prealloc_append(MInode* inode, BlockID logical_blk)
     if (got <= 0) return INVALID_BLOCK_ID;
 
     int run_count = build_physical_runs(logical_blk, blocks, got, runs);
-    if (!bmap_insert_compact_extents(inode, runs, run_count, logical_blk, false))
+    if (run_count != 1 || !bmap_try_append_extent(inode, runs[0]))
     {
-        discard_preallocated_blocks(blocks, got, runs, run_count);
-        return INVALID_BLOCK_ID;
+        if (!bmap_insert_compact_extents(inode, runs, run_count, logical_blk, false))
+        {
+            discard_preallocated_blocks(blocks, got, runs, run_count);
+            return INVALID_BLOCK_ID;
+        }
     }
 
     return blocks[0];
@@ -775,16 +894,18 @@ bool inode_for_each_extent_metadata_block(const MInode* inode, bool (*cb)(BlockI
 
 static bool flush_metadata_block_cb(BlockID block, void*)
 {
-    return bc_flush_block(block);
+    return bc_flush_block_batched(block);
 }
 
 bool inode_flush_extent_metadata(const MInode* inode)
 {
+    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_EXTENT_METADATA_FLUSH);
     return inode_for_each_extent_metadata_block(inode, flush_metadata_block_cb, nullptr);
 }
 
 bool inode_free_extent_metadata(MInode* inode)
 {
+    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_EXTENT_METADATA_FREE);
     if (!inode || !uses_extent_tree(inode)) return true;
 
     BlockHandle root_bh = bc_get_handle(inode->indirect_extent_block);
@@ -819,6 +940,7 @@ bool inode_free_extent_metadata(MInode* inode)
 // 约定：调用此函数前，caller 必须持有该 inode 的读锁（无需allocate）或写锁（需要allocate）
 BlockID inode_bmap_locked(MInode* inode_ptr, BlockID logical_blk, bool allocate, bool* is_new)
 {
+    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_INODE_BMAP_LOCKED);
     if (is_new) *is_new = false;
 
     BlockID phys_blk = bmap_lookup(inode_ptr, logical_blk);  // 查找 inode 中是否有该逻辑块号，若有则返回相应的物理块号

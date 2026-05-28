@@ -189,3 +189,33 @@ found:   // 从找到的空闲位开始，贪婪地连续分配
     *hint_io = (off == nr_bits) ? 0 : off;
     return count;
 }
+
+static inline int alloc_consecutive_bits_nowrap_locked(bitmap_t bmap, uint32_t nr_bits, uint32_t* hint_io, int requested, int* out_start, bool* wrapped)
+{
+    if (wrapped) *wrapped = false;
+    if (nr_bits == 0 || requested <= 0) return 0;
+
+    uint32_t hint = (*hint_io >= nr_bits) ? 0 : *hint_io;
+    uint32_t off;
+
+    for (off = hint; off < nr_bits; ++off)
+        if (!bitmap_test(bmap, off)) goto found;
+
+    *hint_io = 0;
+    if (wrapped) *wrapped = true;
+    return 0;
+
+found:
+    *out_start = (int)off;
+    int count = 0;
+    while (count < requested && off < nr_bits && !bitmap_test(bmap, off))
+    {
+        bitmap_set(bmap, off);
+        off++;
+        count++;
+    }
+
+    *hint_io = (off == nr_bits) ? 0 : off;
+    if (off == nr_bits && wrapped) *wrapped = true;
+    return count;
+}

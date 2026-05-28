@@ -66,7 +66,7 @@ set(caladan_test_config
 "host_addr 192.168.127.7
 host_netmask 255.255.255.0
 host_gateway 192.168.127.1
-runtime_kthreads ${n_kthreads}
+runtime_kthreads 1             # 原本的值是 ${n_kthreads}，将其修改成 1，从而生成的 caladan_test_config 文件中 runtime_kthreads 被配置为 1
 runtime_spinning_kthreads 0
 runtime_guaranteed_kthreads 0
 runtime_priority lc

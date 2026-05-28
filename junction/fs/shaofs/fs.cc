@@ -3,6 +3,7 @@
 #include <cstring>
 #include "group.h"
 #include "journal.h"
+#include "file.h"
 extern "C" {
 #include "runtime/runtime.h"
 }
@@ -63,6 +64,7 @@ void init_meta()
     journal_build_metadata_map();
 
     init_group();
+    init_file_io();
 
 #if IO_PREEMPT
     barrier();

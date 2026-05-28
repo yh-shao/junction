@@ -2,9 +2,12 @@
 #include "fs.h"
 #include "blockCache.h"
 #include "journal.h"
+#include "profile.h"
 
 int core_to_group[NCPU];   // 每个 core 从哪个 group 中分配空闲块
 GroupDescExt* group_info;
+
+static constexpr uint32_t kGroupRuntimeWrapSeen = 1u << 0;
 
 static inline BlockID group_bitmap_lba(uint32_t gid)    { return sb.group_blockstart + (uint64_t)gid * TOTALBLOCKS_PERGROUP; }
 static inline BlockID group_data_startlba(uint32_t gid) { return group_bitmap_lba(gid) + BMAPNUM_PERGROUP; }
@@ -45,6 +48,7 @@ void init_group()
         group_info[i].next_free_hint    = disk_gdt[i].next_free_hint;
         group_info[i].flags             = disk_gdt[i].flags;
         group_info[i].owner_count       = 0;
+        group_info[i].runtime_flags     = 0;
         group_info[i].bitmap_lba        = group_bitmap_lba(i);
         group_info[i].data_start_lba    = group_data_startlba(i);
 
@@ -179,6 +183,7 @@ static inline uint32_t bitmap_clear_range_count_locked(unsigned long* bmap, uint
 // 尽可能在同一个 Block Group 中分配 count 个物理连续的数据块；如果当前组空间不足或存在碎片，它会跨越多次循环（甚至跨越多个 Block Group），拼凑出总计 count 个块，并将它们的 BlockID 记录在 out 数组中。
 int alloc_blocks(BlockID* out, int count)
 {
+    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_EXTENT_ALLOC);
     if (unlikely(count <= 0)) return 0;
 
     int total_allocated = 0;
@@ -227,6 +232,7 @@ int alloc_blocks(BlockID* out, int count)
 
         int got = 0;
         int start_offset = 0;
+        bool wrapped = false;
 
         {
             kguard k;
@@ -238,12 +244,23 @@ int alloc_blocks(BlockID* out, int count)
 
             int want = MIN(count - total_allocated, gdesc->free_blocks_count);
             uint32_t hint = gdesc->next_free_hint;
-            got = alloc_consecutive_bits_locked(bmap, DATABLOCKS_PERGROUP, &hint, want, &start_offset);
+            if (gdesc->runtime_flags & kGroupRuntimeWrapSeen)
+                got = alloc_consecutive_bits_locked(bmap, DATABLOCKS_PERGROUP, &hint, want, &start_offset);
+            else
+                got = alloc_consecutive_bits_nowrap_locked(bmap, DATABLOCKS_PERGROUP, &hint, want, &start_offset, &wrapped);
+
             if (got > 0)
             {
+                if (wrapped) gdesc->runtime_flags |= kGroupRuntimeWrapSeen;
                 gdesc->next_free_hint = hint;
                 __atomic_sub_fetch(&gdesc->free_blocks_count, got, __ATOMIC_RELAXED);
                 acc.mark_dirty();
+            }
+            else if (wrapped)
+            {
+                gdesc->runtime_flags |= kGroupRuntimeWrapSeen;
+                gdesc->next_free_hint = 0;
+                continue;
             }
             else
             {
@@ -260,12 +277,16 @@ int alloc_blocks(BlockID* out, int count)
         }
     }
 
+    shaofs_profile_record_blocks(SHAOFS_PROF_EXTENT_ALLOC, total_allocated);
+    if (total_allocated != count) shaofs_profile_record_failure(SHAOFS_PROF_EXTENT_ALLOC);
     return total_allocated;
 }
 
 void free_extent(const iExtent* ext)
 {
+    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_EXTENT_FREE);
     if (unlikely(ext == nullptr || ext->block_count == 0)) return;
+    shaofs_profile_record_blocks(SHAOFS_PROF_EXTENT_FREE, ext->block_count);
 
     BlockID  current_lba     = ext->physical_start;
     uint64_t remaining_count = ext->block_count;
@@ -319,7 +340,10 @@ void free_extent(const iExtent* ext)
                     __atomic_store_n(&gdesc->free_blocks_count, DATABLOCKS_PERGROUP, __ATOMIC_RELAXED);
                 }
 
-                if (start_offset < gdesc->next_free_hint) gdesc->next_free_hint = start_offset;   // hint 尽量往前推
+                if (gdesc->runtime_flags & kGroupRuntimeWrapSeen)
+                {
+                    if (start_offset < gdesc->next_free_hint) gdesc->next_free_hint = start_offset;
+                }
             }
 
             acc.mark_dirty();
@@ -360,7 +384,7 @@ void sync_all_gdt()
     {
         SpinGuardNP g(&group_info[i].lock);
         disk_gdt[i].free_blocks_count = group_info[i].free_blocks_count;
-        disk_gdt[i].next_free_hint    = group_info[i].next_free_hint;
+        disk_gdt[i].next_free_hint    = (group_info[i].free_blocks_count == DATABLOCKS_PERGROUP) ? 0 : group_info[i].next_free_hint;
         disk_gdt[i].flags             = group_info[i].flags;
         disk_gdt[i].pad1              = 0;
         disk_gdt[i].pad2[0]           = 0;

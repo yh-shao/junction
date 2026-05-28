@@ -26,6 +26,11 @@ private:
     uint32_t touch_counter = 0;                       // 概率化计数器
     static constexpr uint32_t TOUCH_SAMPLE = 16;      // 每 16 次 hit 才 touch 一次 policy（必须是 2 的幂，从而可以使用位运算优化）
 
+    void clean_entry_locked(EntryType* entry)
+    {
+        atomic_write(&entry->dirty, 0);
+    }
+
     // 调用 evict_locked() 前必须持有全局锁，从而没有其它线程可以再访问 Hashmap、LRU 链表，中间可能会临时释放全局锁，函数返回时仍持有全局锁。返回值表示是否成功腾出了一个 CacheEntry
     bool evict_locked()   //  驱逐一个 cache entry，并写回后端（如果 dirty）
     {
@@ -57,12 +62,17 @@ private:
             spin_unlock_np(&shard_lock);        // 释放全局锁，允许其它线程访问 Hashmap，此时其它线程可能会访问到这个 victim cache entry
 
             bool write_success = true;
-            if (atomic_read(&victim->dirty) && atomic_read(&victim->valid)) write_success = backend->write(victim->key, victim->data);
-            if (write_success) atomic_write(&victim->dirty, 0);   // 此时该 CacheEntry 中的数据已经与后端一致
+            bool write_cleans = true;
+            if (atomic_read(&victim->dirty) && atomic_read(&victim->valid))
+            {
+                write_success = backend->write(victim->key, victim->data);
+                write_cleans = backend->write_cleans_entry(victim->key);
+            }
+            if (write_success && write_cleans) clean_entry_locked(victim);   // 此时该 CacheEntry 中的数据已经与后端一致
             rwmutex_unlock(&victim->rw_mtx);
 
             spin_lock_np(&shard_lock); // 重新获取全局大锁，保证没有新线程能从 hashmap 中查找到这个 cache entry
-            if (write_success && atomic_read(&victim->ref_count) == 1 && atomic_read(&victim->dirty) == 0)  // 该 CacheEntry 此时没有被访问 且在释放全局锁期间没有被修改
+            if (write_success && write_cleans && atomic_read(&victim->ref_count) == 1 && atomic_read(&victim->dirty) == 0)  // 该 CacheEntry 此时没有被访问 且在释放全局锁期间没有被修改
             {
                 hashmap->remove(victim->key);
                 policy->remove(victim);
@@ -156,7 +166,7 @@ public:
             bool success = backend->read(key, entry->data); // 从后端读取数据到 CacheEntry 中
             if (success) 
             {
-                atomic_write(&entry->dirty, 0); 
+                clean_entry_locked(entry);
                 atomic_write(&entry->valid, 1);
                 return entryHandle;
             }
@@ -203,7 +213,10 @@ public:
         auto acc = entryHandle.read_access();   // 读锁即可：只是读数据写到后端，不修改 entry 的 data
         if (atomic_read(&entry->dirty) && atomic_read(&entry->valid))
         {
-            if (backend->write(entry->key, entry->data)) atomic_write(&entry->dirty, 0);
+            if (backend->write(entry->key, entry->data))
+            {
+                if (backend->write_cleans_entry(entry->key)) clean_entry_locked(entry);
+            }
             else return false;
         }
         return true;
@@ -238,7 +251,10 @@ public:
             auto acc = h.read_access();
             if (atomic_read(&entry->dirty) && atomic_read(&entry->valid))
             {
-                if (backend->write(entry->key, entry->data)) atomic_write(&entry->dirty, 0);
+                if (backend->write(entry->key, entry->data))
+                {
+                    if (backend->write_cleans_entry(entry->key)) clean_entry_locked(entry);
+                }
                 else log_err("Flush failed for a key");
             }
         }
@@ -255,7 +271,7 @@ public:
 
         {
             auto acc = entryHandle.write_access();  // 阻塞等待当前所有正在持有 ReadAccessor/WriteAccessor 的线程完成操作
-            atomic_write(&victim->dirty, 0);
+            clean_entry_locked(victim);
             atomic_write(&victim->valid, 0);  // 强制清空脏标记并设为无效。这样不仅不会写回后端，而且等待在锁上的其他 get() 线程被唤醒后，会发现 valid == 0，从而乖乖去后端拉取最新数据。
         }
 

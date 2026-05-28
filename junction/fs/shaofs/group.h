@@ -8,11 +8,12 @@ struct alignas(64) GroupDescExt {
     uint32_t   next_free_hint;      // 记录上次分配到的位置
     uint32_t   flags;               // 状态标志位
     uint32_t   owner_count;         // 记录当前有多少个 core 在使用此 group
+    uint32_t   runtime_flags;       // 仅内存态分配策略标记，不写入磁盘
 
     BlockID    bitmap_lba;                   // 该 group 的 bitmap 起始块
     BlockID    data_start_lba;               // 该 group 的第一个数据块
     uint32_t   group_id;                     // group 编号，便于调试
-    GroupDescExt() : free_blocks_count(0), next_free_hint(0), flags(0), owner_count(0), bitmap_lba(0), data_start_lba(0), group_id(0) { spin_lock_init(&lock); }  // 初始值
+    GroupDescExt() : free_blocks_count(0), next_free_hint(0), flags(0), owner_count(0), runtime_flags(0), bitmap_lba(0), data_start_lba(0), group_id(0) { spin_lock_init(&lock); }  // 初始值
 };
 extern GroupDescExt* group_info;
 

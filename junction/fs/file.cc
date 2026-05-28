@@ -230,6 +230,7 @@ ssize_t usys_read(int fd, void *buf, size_t len) {
 
   if (f->get_inode() && f->get_inode()->get_mode() == SHAOFS)
   {
+    if (f->get_type() == FileType::kDirectory) return -EISDIR;
     bool direct = f->get_flags() & kFlagDirect;
     if (direct && f->get_shaofs_direct_read_hint()->valid)
     {
@@ -252,8 +253,9 @@ ssize_t usys_readv(int fd, struct iovec *iov, int iovcnt) {
   if (unlikely(iovcnt < 0)) return -EINVAL;
   if (iovcnt == 0) return 0;
 
-  if (f->get_inode() && f->get_inode()->get_mode() == SHAOFS) 
+  if (f->get_inode() && f->get_inode()->get_mode() == SHAOFS)
   {
+    if (f->get_type() == FileType::kDirectory) return -EISDIR;
     bool direct = f->get_flags() & kFlagDirect;
     if (direct) 
     {
@@ -287,6 +289,7 @@ ssize_t usys_write(int fd, const void *buf, size_t len) {
 
   if (f->get_inode() && f->get_inode()->get_mode() == SHAOFS)
   {
+    if (f->get_type() == FileType::kDirectory) return -EISDIR;
     int inum = f->get_inode()->get_inum();
     bool direct = f->get_flags() & kFlagDirect;
     f->get_shaofs_direct_read_hint()->valid = false;
@@ -307,6 +310,7 @@ ssize_t usys_pread64(int fd, void *buf, size_t len, off_t offset) {
 
   if (f->get_inode() && f->get_inode()->get_mode() == SHAOFS)
   {
+    if (f->get_type() == FileType::kDirectory) return -EISDIR;
     bool direct = f->get_flags() & kFlagDirect;
     if (direct && f->get_shaofs_direct_read_hint()->valid) return file_read_direct_hint(f->get_shaofs_direct_read_hint(), (char*)buf, offset, len);
     return my_read(f->get_inode()->get_inum(), buf, &offset, len, direct);
@@ -325,6 +329,7 @@ ssize_t usys_preadv(int fd, struct iovec *iov, int iovcnt, off_t offset) {
   if (iovcnt == 0) return 0;
 
   if (f->get_inode() && f->get_inode()->get_mode() == SHAOFS) {
+    if (f->get_type() == FileType::kDirectory) return -EISDIR;
     bool direct = f->get_flags() & kFlagDirect;
     if (direct) return file_readv_direct(f->get_inode()->get_inum(), iov, iovcnt, offset);
 
@@ -610,6 +615,7 @@ ssize_t usys_pwrite64(int fd, const void *buf, size_t len, off_t offset) {
 
   if (f->get_inode() && f->get_inode()->get_mode() == SHAOFS)
   {
+    if (f->get_type() == FileType::kDirectory) return -EISDIR;
     bool direct = f->get_flags() & kFlagDirect;
     f->get_shaofs_direct_read_hint()->valid = false;
     return my_write(f->get_inode()->get_inum(), buf, &offset, len, direct, false);
@@ -645,6 +651,7 @@ off_t usys_lseek(int fd, off_t offset, int whence) {
   if (unlikely(!f)) return -EBADF;
   if (f->get_inode() && f->get_inode()->get_mode() == SHAOFS)
   {
+    if (f->get_type() == FileType::kDirectory) return -EINVAL;
     off_t new_off = my_lseek(f->get_inode()->get_inum(), offset, whence, f->get_off_ref());
     f->get_off_ref() = new_off;
     return new_off;
