@@ -6,7 +6,6 @@
 #include <cstring>
 #include "inodeCache.h"
 #include "journal.h"
-#include "profile.h"
 
 extern "C" {
 #include "../runtime/defs.h"
@@ -899,13 +898,11 @@ static bool flush_metadata_block_cb(BlockID block, void*)
 
 bool inode_flush_extent_metadata(const MInode* inode)
 {
-    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_EXTENT_METADATA_FLUSH);
     return inode_for_each_extent_metadata_block(inode, flush_metadata_block_cb, nullptr);
 }
 
 bool inode_free_extent_metadata(MInode* inode)
 {
-    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_EXTENT_METADATA_FREE);
     if (!inode || !uses_extent_tree(inode)) return true;
 
     BlockHandle root_bh = bc_get_handle(inode->indirect_extent_block);
@@ -940,7 +937,6 @@ bool inode_free_extent_metadata(MInode* inode)
 // 约定：调用此函数前，caller 必须持有该 inode 的读锁（无需allocate）或写锁（需要allocate）
 BlockID inode_bmap_locked(MInode* inode_ptr, BlockID logical_blk, bool allocate, bool* is_new)
 {
-    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_INODE_BMAP_LOCKED);
     if (is_new) *is_new = false;
 
     BlockID phys_blk = bmap_lookup(inode_ptr, logical_blk);  // 查找 inode 中是否有该逻辑块号，若有则返回相应的物理块号

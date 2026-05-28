@@ -8,7 +8,6 @@
 #include "group.h"
 #include "dsa.h"
 #include "journal.h"
-#include "profile.h"
 #include <cstdint>
 #include <cstdlib>
 #include <algorithm>
@@ -146,8 +145,6 @@ static inline bool direct_clean_read_allowed(uint64_t aligned_clean_len, BlockID
 
 static ssize_t file_read_direct_clean(int inum, char* buf, off_t offset, size_t len)
 {
-    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_FILE_READ_DIRECT_CLEAN);
-    shaofs_profile_record_bytes(SHAOFS_PROF_FILE_READ_DIRECT_CLEAN, len);
 
     if (len == 0) return 0;
     if (unlikely(offset < 0 || (static_cast<uint64_t>(offset) & (BLOCK_SIZE - 1)) != 0)) return 0;
@@ -226,8 +223,6 @@ static ssize_t file_read_direct_clean(int inum, char* buf, off_t offset, size_t 
         }
         bytes_read += run_bytes;
     }
-
-    shaofs_profile_record_blocks(SHAOFS_PROF_FILE_READ_DIRECT_CLEAN, bytes_read / BLOCK_SIZE);
     return bytes_read;
 }
 
@@ -300,8 +295,6 @@ void final_flush()
 
     RuntimeFSBaseGuard g;
     flush_all_dirty_state(true);
-    dsa_dump_stats();
-    shaofs_profile_dump();
     journal_mark_clean();
 }
 
@@ -377,8 +370,6 @@ static ssize_t file_read_blockwise(int inum, char* buf, off_t offset, size_t len
 
 static ssize_t file_read_batch(int inum, char* buf, off_t offset, size_t len)
 {
-    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_FILE_READ_BATCH);
-    shaofs_profile_record_bytes(SHAOFS_PROF_FILE_READ_BATCH, len);
     if (len == 0) return 0;
 
     InodeHandle ih = ic_get_inode(inum);
@@ -632,8 +623,6 @@ static ssize_t file_write_scalar_locked(MInode* inode, const char* buf, uint64_t
 
 static ssize_t file_write_batch_new_blocks_locked(MInode* inode, const char* buf, uint64_t offset, size_t len)
 {
-    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_FILE_WRITE_NEW_BLOCK_BATCH);
-    shaofs_profile_record_bytes(SHAOFS_PROF_FILE_WRITE_NEW_BLOCK_BATCH, len);
     if (inode->type != REGULAR || offset != inode->file_size || (offset & (BLOCK_SIZE - 1)) != 0) return 0;
 
     size_t full_blocks = len / BLOCK_SIZE;
@@ -692,14 +681,11 @@ static ssize_t file_write_batch_new_blocks_locked(MInode* inode, const char* buf
     mark_inode_data_cache_dirty(inode, offset, offset + batch_len);
     inode->file_size = offset + batch_len;
     mark_inode_metadata_dirty(inode);
-    shaofs_profile_record_blocks(SHAOFS_PROF_FILE_WRITE_NEW_BLOCK_BATCH, batch_blocks);
     return batch_len;
 }
 
 ssize_t file_write_append(int inum, const char* buf, size_t len, off_t* new_off)
 {
-    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_FILE_WRITE_APPEND);
-    shaofs_profile_record_bytes(SHAOFS_PROF_FILE_WRITE_APPEND, len);
     if (len == 0) return 0;
 
     InodeHandle ih = ic_get_inode(inum);
@@ -738,8 +724,6 @@ ssize_t file_write_append(int inum, const char* buf, size_t len, off_t* new_off)
 
 static ssize_t file_write_eof_extension(int inum, const char* buf, off_t offset, size_t len)
 {
-    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_FILE_WRITE_EOF_EXTENSION);
-    shaofs_profile_record_bytes(SHAOFS_PROF_FILE_WRITE_EOF_EXTENSION, len);
     if (len == 0) return 0;
 
     InodeHandle ih = ic_get_inode(inum);
@@ -778,8 +762,6 @@ static ssize_t file_write_eof_extension(int inum, const char* buf, off_t offset,
 
 static ssize_t file_write_batch_existing(int inum, const char* buf, off_t offset, size_t len)
 {
-    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_FILE_WRITE_BATCH_EXISTING);
-    shaofs_profile_record_bytes(SHAOFS_PROF_FILE_WRITE_BATCH_EXISTING, len);
     if (len == 0) return 0;
 
     InodeHandle ih = ic_get_inode(inum);

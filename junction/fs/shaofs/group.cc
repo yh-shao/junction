@@ -2,7 +2,6 @@
 #include "fs.h"
 #include "blockCache.h"
 #include "journal.h"
-#include "profile.h"
 
 int core_to_group[NCPU];   // 每个 core 从哪个 group 中分配空闲块
 GroupDescExt* group_info;
@@ -183,7 +182,6 @@ static inline uint32_t bitmap_clear_range_count_locked(unsigned long* bmap, uint
 // 尽可能在同一个 Block Group 中分配 count 个物理连续的数据块；如果当前组空间不足或存在碎片，它会跨越多次循环（甚至跨越多个 Block Group），拼凑出总计 count 个块，并将它们的 BlockID 记录在 out 数组中。
 int alloc_blocks(BlockID* out, int count)
 {
-    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_EXTENT_ALLOC);
     if (unlikely(count <= 0)) return 0;
 
     int total_allocated = 0;
@@ -276,17 +274,12 @@ int alloc_blocks(BlockID* out, int count)
                 out[total_allocated++] = gdesc->data_start_lba + (uint32_t)(start_offset + i);
         }
     }
-
-    shaofs_profile_record_blocks(SHAOFS_PROF_EXTENT_ALLOC, total_allocated);
-    if (total_allocated != count) shaofs_profile_record_failure(SHAOFS_PROF_EXTENT_ALLOC);
     return total_allocated;
 }
 
 void free_extent(const iExtent* ext)
 {
-    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_EXTENT_FREE);
     if (unlikely(ext == nullptr || ext->block_count == 0)) return;
-    shaofs_profile_record_blocks(SHAOFS_PROF_EXTENT_FREE, ext->block_count);
 
     BlockID  current_lba     = ext->physical_start;
     uint64_t remaining_count = ext->block_count;

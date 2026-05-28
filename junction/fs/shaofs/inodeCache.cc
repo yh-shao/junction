@@ -5,7 +5,6 @@
 #include "extent.h"
 #include "group.h"
 #include "syscall.h"
-#include "profile.h"
 #include <cstring>
 
 static GlobalInodeCache* g_inode_cache_ptr = nullptr;
@@ -41,7 +40,6 @@ InodeHandle ic_get_inode(int inum) { return get_inode_cache().getHandle(inum); }
 
 InodeHandle ic_alloc_inode(file_type_t type, int inum)    // 如果 inum != -1 则尝试分配指定的 inum，否则分配一个新的 inum
 {
-    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_IC_ALLOC_INODE);
     bool new_alloc_inum = false;
     if (inum == -1) 
     {
@@ -92,7 +90,6 @@ InodeHandle ic_alloc_inode(file_type_t type, int inum)    // 如果 inum != -1 �
 
 bool ic_free_inode(int inum)   // 释放该 inode 持有的所有资源，inum 可被再次使用
 {
-    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_IC_FREE_INODE);
     InodeHandle ih = ic_get_inode(inum);
     if (!ih) 
     {
@@ -144,7 +141,6 @@ bool ic_free_inode(int inum)   // 释放该 inode 持有的所有资源，inum �
 
 bool ic_flush_inode(int inum)
 {
-    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_IC_FLUSH_INODE);
     if (!get_inode_cache().flush_entry(inum)) return false;
 
     BlockID itable_blk = sb.itable_blockstart + inum / INODENUM_PER_BLOCK;

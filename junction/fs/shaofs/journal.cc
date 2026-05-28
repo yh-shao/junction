@@ -4,7 +4,6 @@
 
 #include "dir.h"
 #include "blockCache.h"
-#include "profile.h"
 #include "utili.h"
 #include <cstring>
 #include <cstdlib>
@@ -214,7 +213,6 @@ static uint64_t journal_next_seq_locked()
 
 static bool checkpoint_home_blocks(BlockID header_lba, const BlockID* blocks, const void* const* images, uint32_t count)
 {
-    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_CHECKPOINT_HOME_BLOCKS);
     for (uint32_t i = 0; i < count; ++i)
         if (storage_write(images[i], blocks[i], 1) != 0) return false;
 
@@ -223,7 +221,6 @@ static bool checkpoint_home_blocks(BlockID header_lba, const BlockID* blocks, co
 
 static bool checkpoint_task_home_blocks(const CheckpointTask* task)
 {
-    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_CHECKPOINT_HOME_BLOCKS);
     for (uint32_t i = 0; i < task->count; i++)
     {
         if (storage_write(task->images[i], task->blocks[i], 1) != 0) return false;
@@ -914,8 +911,6 @@ void journal_register_metadata_extent(BlockID start, uint64_t count)
 
 static bool journal_commit_blocks_impl(const BlockID* blocks, const void* const* images, uint32_t count, bool checkpoint_async)
 {
-    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_JOURNAL_COMMIT_BLOCKS);
-    shaofs_profile_record_blocks(SHAOFS_PROF_JOURNAL_COMMIT_BLOCKS, count);
 
     if (count == 0) return true;
     if (!journal_layout_valid()) return false;
@@ -944,13 +939,11 @@ static bool journal_commit_blocks_impl(const BlockID* blocks, const void* const*
 
     uint64_t seq = journal_next_seq_locked();
     uint32_t slot = journal_slot_from_seq(seq);
-    uint64_t wait_start = shaofs_profile_enabled() ? shaofs_profile_now_us() : 0;
     if (checkpoint_async && checkpoint_active && !checkpoint_wait_slot_free(slot))
     {
         mutex_unlock(&journal_commit_lock);
         return false;
     }
-    if (wait_start) shaofs_profile_record(SHAOFS_PROF_CHECKPOINT_WAIT_IDLE, shaofs_profile_now_us() - wait_start);
 
     BlockID header_lba = journal_slot_base(slot);
     for (uint32_t i = 0; i < count; ++i) 
@@ -958,16 +951,13 @@ static bool journal_commit_blocks_impl(const BlockID* blocks, const void* const*
         entries[i].home_block = blocks[i];
         entries[i].image_block = header_lba + 2 + i;
         entries[i].checksum = fnv1a64(images[i], BLOCK_SIZE);
-        uint64_t image_start = shaofs_profile_enabled() ? shaofs_profile_now_us() : 0;
         if (storage_write(images[i], entries[i].image_block, 1) != 0)
         {
             mutex_unlock(&journal_commit_lock);
             return false;
         }
-        if (image_start) shaofs_profile_record(SHAOFS_PROF_JOURNAL_IMAGE_WRITE, shaofs_profile_now_us() - image_start);
     }
 
-    uint64_t header_start = shaofs_profile_enabled() ? shaofs_profile_now_us() : 0;
     if (!write_entry_table(header_lba + 1, entries, count))
     {
         mutex_unlock(&journal_commit_lock);
@@ -1002,7 +992,6 @@ static bool journal_commit_blocks_impl(const BlockID* blocks, const void* const*
     }
     mutex_unlock(&journal_commit_lock);
 
-    if (header_start) shaofs_profile_record(SHAOFS_PROF_JOURNAL_HEADER_WRITE, shaofs_profile_now_us() - header_start);
     return ok;
 }
 
@@ -1092,8 +1081,6 @@ static void journal_batch_complete_locked(const JournalBatch& batch, bool ok)
 
 static bool journal_commit_single_grouped(BlockID block, const void* image)
 {
-    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_JOURNAL_COMMIT_SINGLE_GROUPED);
-    shaofs_profile_record_blocks(SHAOFS_PROF_JOURNAL_COMMIT_SINGLE_GROUPED, 1);
 
     JournalGroupReq req = {
         .block = block,
@@ -1133,8 +1120,6 @@ static bool journal_commit_single_grouped(BlockID block, const void* image)
 
 bool journal_commit_single(BlockID block, const void* image)
 {
-    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_JOURNAL_COMMIT_SINGLE);
-    shaofs_profile_record_blocks(SHAOFS_PROF_JOURNAL_COMMIT_SINGLE, 1);
     BlockID blocks[1] = {block};
     const void* images[1] = {image};
     return journal_commit_blocks(blocks, images, 1);
@@ -1142,8 +1127,6 @@ bool journal_commit_single(BlockID block, const void* image)
 
 bool journal_commit_single_batched(BlockID block, const void* image)
 {
-    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_JOURNAL_COMMIT_SINGLE);
-    shaofs_profile_record_blocks(SHAOFS_PROF_JOURNAL_COMMIT_SINGLE, 1);
     return journal_commit_single_grouped(block, image);
 }
 

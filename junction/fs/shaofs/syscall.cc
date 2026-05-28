@@ -7,7 +7,6 @@
 #include "inodeCache.h"
 #include "blockCache.h"
 #include "extent.h"
-#include "profile.h"
 #include "junction/fs/file.h"
 
 struct InodeLifecycle {
@@ -68,7 +67,6 @@ void shaofs_pin_open_inode(int inum)
 void my_close(int inum)
 {
     RuntimeFSBaseGuard g;
-    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_MY_CLOSE);
 
     InodeLifecycle* state = get_inode_lifecycle(inum);
     if (unlikely(!state)) return;
@@ -146,7 +144,6 @@ int my_open(const char* pathname, int flags, mode_t mode, file_type_t* type_out)
     // log_info("open(%s)", pathname);
 
     RuntimeFSBaseGuard g;
-    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_MY_OPEN);
 
     int inum = -1;
     file_type_t opened_type = REGULAR;
@@ -275,8 +272,6 @@ int my_open(const char* pathname, int flags, mode_t mode, file_type_t* type_out)
 ssize_t my_read(int inum, void *buf, off_t* off, size_t len, bool direct)
 {
     RuntimeFSBaseGuard g;
-    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_MY_READ);
-    shaofs_profile_record_bytes(SHAOFS_PROF_MY_READ, len);
 
     ssize_t ret = direct ? file_read_direct(inum, (char*)buf, *off, len)
                          : file_read(inum, (char*)buf, *off, len);
@@ -287,8 +282,6 @@ ssize_t my_read(int inum, void *buf, off_t* off, size_t len, bool direct)
 ssize_t my_write(int inum, const void *buf, off_t* off, size_t len, bool direct, bool append)
 {
     RuntimeFSBaseGuard g;
-    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_MY_WRITE);
-    shaofs_profile_record_bytes(SHAOFS_PROF_MY_WRITE, len);
 
     ssize_t ret;
     if (append && !direct)
@@ -405,7 +398,6 @@ int my_mkdir(const char *pathname, mode_t mode)
 int my_unlink(const char *pathname)
 {
     RuntimeFSBaseGuard g;
-    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_MY_UNLINK);
 
     char name[NAMESIZ];
     int parent_inum = nameiparent(pathname, name);
@@ -513,7 +505,6 @@ int my_newfstatat(const char *pathname, struct stat *statbuf)
 int my_fsync(int inum)
 {
     RuntimeFSBaseGuard g;
-    SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_MY_FSYNC);
 
     InodeHandle ih = ic_get_inode(inum);
     if (unlikely(!ih)) return -ENOENT;
@@ -547,7 +538,6 @@ int my_fsync(int inum)
 
         if (has_dirty_data && dirty_start < dirty_end)
         {
-            SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_MY_FSYNC_DATA_FLUSH);
             BlockID first_logical = dirty_start / BLOCK_SIZE;
             BlockID last_logical = (dirty_end - 1) / BLOCK_SIZE;
             BlockID run_start = INVALID_BLOCK_ID;
@@ -586,7 +576,6 @@ int my_fsync(int inum)
 
         if (need_inode_flush)
         {
-            SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_MY_FSYNC_EXTENT_FLUSH);
             if (!inode_flush_extent_metadata(&(*read_acc))) return -EIO;
         }
     }
@@ -608,7 +597,6 @@ int my_fsync(int inum)
 
     if (need_inode_flush)
     {
-        SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_MY_FSYNC_INODE_FLUSH);
         if (!ic_flush_inode(inum)) return -EIO;
 
         auto write_acc = ih.write_access();

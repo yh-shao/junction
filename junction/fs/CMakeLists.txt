@@ -1,7 +1,6 @@
 message(STATUS "Building junction filesystem")
 
 option(SHAOFS_CRASH_CONSISTENCY "Enable ShaOFS metadata journal" ON)
-option(SHAOFS_PROFILE_COMPILED "Compile ShaOFS profiling instrumentation" OFF)
 
 find_library(DML_LIB   # 查找 libdml 静态库，避免运行时依赖 libdml.so
     NAMES libdml.a
@@ -48,7 +47,6 @@ add_library(fs
   shaofs/dentryCache.cc
   shaofs/extent.cc
   shaofs/dsa.cc
-  shaofs/profile.cc
   shaofs/journal.cc
   shaofs/syscall.cc
   shaofs/namei.cc
@@ -58,10 +56,6 @@ add_library(fs
 target_compile_definitions(fs PRIVATE
   CRASH_CONSISTENCY=$<IF:$<BOOL:${SHAOFS_CRASH_CONSISTENCY}>,1,0>
 )
-
-if (SHAOFS_PROFILE_COMPILED)
-  target_compile_definitions(fs PRIVATE SHAOFS_PROFILE_COMPILED=1)
-endif()
 
 target_include_directories(fs PRIVATE ${DML_INCLUDE_DIR})   # 添加头文件包含路径
 

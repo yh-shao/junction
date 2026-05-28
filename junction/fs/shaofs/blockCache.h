@@ -1,7 +1,6 @@
 #pragma once
 #include "fs.h"
 #include "journal.h"
-#include "profile.h"
 #include "generic_cache/objpool.h"
 #include "generic_cache/backend.h"
 #include "generic_cache/replace_policy.h"
@@ -134,8 +133,6 @@ class NVMeSSD : public Backend<BlockID, BlockData> {
 public:
     bool read(const BlockID& key, BlockData& value)
     {
-        SHAOFS_PROFILE_SCOPE(SHAOFS_PROF_BC_BACKEND_READ);
-        shaofs_profile_record_blocks(SHAOFS_PROF_BC_BACKEND_READ, 1);
         return DMA_read_block(static_cast<void*>(value.data), key);
     }
     bool write(const BlockID& key, BlockData const& value)
