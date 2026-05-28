@@ -13,6 +13,7 @@ bool journal_recover();
 void journal_mark_dirty();
 void journal_mark_clean();
 void journal_build_metadata_map();
+void journal_drain_checkpoint();
 bool journal_commit_blocks(const BlockID* blocks, const void* const* images, uint32_t count);
 bool journal_commit_single(BlockID block, const void* image);
 bool journal_commit_single_batched(BlockID block, const void* image);
@@ -29,6 +30,7 @@ static inline bool journal_recover() { return true; }
 static inline void journal_mark_dirty() {}
 static inline void journal_mark_clean() {}
 static inline void journal_build_metadata_map() {}
+static inline void journal_drain_checkpoint() {}
 static inline bool journal_commit_blocks(const BlockID*, const void* const*, uint32_t) { return true; }
 static inline bool journal_commit_single(BlockID, const void*) { return true; }
 static inline bool journal_commit_single_batched(BlockID, const void*) { return true; }

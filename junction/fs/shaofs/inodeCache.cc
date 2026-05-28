@@ -106,6 +106,13 @@ bool ic_free_inode(int inum)   // 释放该 inode 持有的所有资源，inum �
         write_acc->drop_dir_index();
         write_acc->used = false;             // 逻辑删除（新的读写请求拿到锁后看到 used == false 会直接退出）
 
+        auto invalidate_data_extent = [](const iExtent& ext, void*) -> bool {
+            for (uint64_t i = 0; i < ext.block_count; i++)
+                bc_invalidate_block(ext.physical_start + i);
+            return true;
+        };
+        if (!inode_for_each_extent(&(*write_acc), true, invalidate_data_extent, nullptr)) log_err("[ic_free_inode] failed to invalidate cached extents for inode %d", inum);
+
         auto free_data_extent = [](const iExtent& ext, void*) -> bool {
             free_extent(&ext);
             return true;

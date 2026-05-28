@@ -4,6 +4,7 @@
 #include "group.h"
 #include "journal.h"
 #include "file.h"
+#include "blockCache.h"
 extern "C" {
 #include "runtime/runtime.h"
 }
@@ -65,6 +66,7 @@ void init_meta()
 
     init_group();
     init_file_io();
+    bc_start_writeback();
 
 #if IO_PREEMPT
     barrier();

@@ -234,6 +234,13 @@ static ssize_t file_read_direct_clean(int inum, char* buf, off_t offset, size_t 
 // 释放 inode 持有的所有数据块（direct + indirect extents）。调用前必须持有 inode 写锁。
 static void free_inode_data_blocks(MInode* inode_ptr)
 {
+    auto invalidate_data_extent = [](const iExtent& ext, void*) -> bool {
+        for (uint64_t i = 0; i < ext.block_count; i++)
+            bc_invalidate_block(ext.physical_start + i);
+        return true;
+    };
+    if (!inode_for_each_extent(inode_ptr, true, invalidate_data_extent, nullptr)) log_err("[free_inode_data_blocks] failed to invalidate cached extents for inode %d", inode_ptr->idx);
+
     auto free_data_extent = [](const iExtent& ext, void*) -> bool {
         free_extent(&ext);
         return true;
@@ -266,18 +273,22 @@ void truncate_inode(int inum)
     write_acc.mark_dirty();
 }
 
-static void flush_all_dirty_state()
+static void flush_all_dirty_state(bool stop_writeback)
 {
+    if (stop_writeback) bc_stop_writeback_and_drain();
+    else bc_drain_writeback();
+    journal_drain_checkpoint();
     journal_write_metadata(imap, BITMAP_LONG_SIZE(sb.inode_num) * sizeof(unsigned long), sb.imap_blockstart, 0);
 	sync_all_gdt();
 	ic_flush_all();
-	bc_flush_all();
+    bc_flush_all();
+    journal_drain_checkpoint();
 }
 
 void shaofs_sync_all()
 {
     RuntimeFSBaseGuard g;
-    flush_all_dirty_state();
+    flush_all_dirty_state(false);
 }
 
 void final_flush()
@@ -288,7 +299,7 @@ void final_flush()
 #endif
 
     RuntimeFSBaseGuard g;
-    flush_all_dirty_state();
+    flush_all_dirty_state(true);
     dsa_dump_stats();
     shaofs_profile_dump();
     journal_mark_clean();
@@ -631,13 +642,10 @@ static ssize_t file_write_batch_new_blocks_locked(MInode* inode, const char* buf
     size_t batch_len = batch_blocks * BLOCK_SIZE;
     if (batch_len < kFileBatchCopyMin) return 0;
 
-    struct StorageBlockEntryCompat { uint64_t lba; char* data; };
     BlockID blocks[dsa_batch_task_num];
     BlockHandle handles[dsa_batch_task_num];
     CacheEntry<BlockID, BlockData>* entries[dsa_batch_task_num];
     Segment vecs[dsa_batch_task_num];
-    StorageBlockEntryCompat sgl_entries[dsa_batch_task_num];
-    void* sgl_ptrs[dsa_batch_task_num];
     size_t handle_nr = 0;
     size_t lock_nr = 0;
     size_t vec_nr = 0;
@@ -675,37 +683,13 @@ static ssize_t file_write_batch_new_blocks_locked(MInode* inode, const char* buf
 
     dsa_copyv_ex(vecs, vec_nr, SHAOFS_DSA_WRITE_FROM_USER);
 
-    bool clean_on_return = false;
-    if (batch_blocks > 0)
-    {
-        clean_on_return = true;
-        for (size_t i = 1; i < batch_blocks; i++)
-        {
-            if (blocks[i] != blocks[0] + i)
-            {
-                clean_on_return = false;
-                break;
-            }
-        }
-        if (clean_on_return)
-        {
-            for (size_t i = 0; i < batch_blocks; i++)
-            {
-                sgl_entries[i] = {blocks[i], entries[i]->data.data};
-                sgl_ptrs[i] = &sgl_entries[i];
-            }
-            clean_on_return = write_blocks_to_disk(blocks[0], batch_blocks, sgl_ptrs) == 0;
-        }
-    }
-
     for (size_t i = 0; i < handle_nr; i++)
     {
         atomic_write(&handles[i].get_entry()->valid, 1);
-        if (clean_on_return) atomic_write(&handles[i].get_entry()->dirty, 0);
-        else atomic_write(&handles[i].get_entry()->dirty, 1);
+        bc_mark_data_block_dirty(handles[i]);
     }
     release_locked_blocks();
-    if (!clean_on_return) mark_inode_data_cache_dirty(inode, offset, offset + batch_len);
+    mark_inode_data_cache_dirty(inode, offset, offset + batch_len);
     inode->file_size = offset + batch_len;
     mark_inode_metadata_dirty(inode);
     shaofs_profile_record_blocks(SHAOFS_PROF_FILE_WRITE_NEW_BLOCK_BATCH, batch_blocks);
@@ -877,7 +861,7 @@ static ssize_t file_write_batch_existing(int inum, const char* buf, off_t offset
             {
                 dsa_copyv_ex(vecs, vec_nr, SHAOFS_DSA_WRITE_FROM_USER);
                 for (size_t i = 0; i < handle_nr; i++)
-                    atomic_write(&entries[i]->dirty, 1);
+                    bc_mark_data_block_dirty(handles[i]);
                 mark_inode_data_cache_dirty(const_cast<MInode*>(&(*read_acc)), offset + bytes_written, offset + bytes_written + batch_bytes);
             }
             release_locked_blocks();

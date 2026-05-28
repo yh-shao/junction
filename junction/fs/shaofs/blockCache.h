@@ -173,8 +173,13 @@ BlockHandle bc_get_handle(BlockID id);          // 获取 Block 的 handle，用
 BlockHandle bc_get_handle(BlockID id, bool fetch_on_miss);
 
 bool bc_mark_block_dirty(BlockHandle& h);       // 标记 block 脏
+bool bc_mark_data_block_dirty(BlockHandle& h);  // 标记 data block 脏并加入后台写回队列
+bool bc_clean_block_if_unchanged(BlockID id, const void* image); // checkpoint 完成后，仅当缓存内容仍等于已落盘镜像时清脏
 bool bc_is_cached_valid(BlockID id);            // 只探测缓存中是否已有有效副本，不触发 miss 分配或后端读
 void bc_flush_all();                            // 将 cache 中所有脏数据刷回后端存储
+void bc_start_writeback();                      // 启动后台 data block 写回线程
+void bc_drain_writeback();                      // 尽力清空后台写回队列但不停止后台线程
+void bc_stop_writeback_and_drain();             // 停止后台写回并刷净所有脏块
 bool bc_flush_block(BlockID id);                // 将指定 block 刷写到后端（如果在缓存中且为脏）
 bool bc_flush_block_batched(BlockID id);        // fsync 前台路径使用：metadata block 进入 journal batch lane
 bool bc_flush_blocks_contiguous(BlockID start, uint32_t count);  // 批量刷写连续 block 中已经缓存且为脏的条目

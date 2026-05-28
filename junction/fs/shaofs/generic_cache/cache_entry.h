@@ -20,8 +20,10 @@ struct alignas(CACHELINE_SIZE) CacheEntry {
     volatile int valid;       // 该 CacheEntry 中的 data 是否有效（能否被 get() 返回给用户使用）
     volatile int dirty;       // 表明是否需要写回 backend
     volatile int ref_count;   // 引用计数（Pin），表示当前有多少个线程正在访问该 CacheEntry 的数据（无论读写）。ref_count > 0 表示该 CacheEntry 正在被使用，不能被驱逐。
+    volatile uint64_t dirty_gen;
+    volatile int writeback_queued;
 
-    CacheEntry() : _freelist_hook(nullptr), hash_next(nullptr), policy_meta(0), valid(false), dirty(false), ref_count(0) { rwmutex_init(&rw_mtx); }
+    CacheEntry() : _freelist_hook(nullptr), hash_next(nullptr), policy_meta(0), valid(false), dirty(false), ref_count(0), dirty_gen(0), writeback_queued(0) { rwmutex_init(&rw_mtx); }
 
     void reset(const Key& k) 
     {
@@ -31,6 +33,8 @@ struct alignas(CACHELINE_SIZE) CacheEntry {
         atomic_write(&valid, 0);
         atomic_write(&dirty, 0);
         atomic_write(&ref_count, 0);
+        __atomic_store_n(&dirty_gen, 0, __ATOMIC_SEQ_CST);
+        atomic_write(&writeback_queued, 0);
     }
 };
 
