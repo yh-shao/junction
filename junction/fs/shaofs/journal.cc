@@ -861,14 +861,19 @@ bool journal_is_metadata_block(BlockID block)
 
     bool is_meta = false;
     SpinGuard guard(&metadata_lock);
-    for (uint32_t i = 0; i < metadata_range_count; i++)
+    uint32_t left = 0;
+    uint32_t right = metadata_range_count;
+    while (left < right)
     {
-        const BlockRange& r = metadata_ranges[i];
+        uint32_t mid = left + (right - left) / 2;
+        const BlockRange& r = metadata_ranges[mid];
         if (block >= r.start && block < r.start + r.count)
         {
             is_meta = true;
             break;
         }
+        if (block < r.start) right = mid;
+        else left = mid + 1;
     }
     return is_meta;
 }
@@ -882,31 +887,61 @@ void journal_register_metadata_extent(BlockID start, uint64_t count)
 {
     if (count == 0 || start == 0 || start >= sb.total_blocknum) return;
     if (start >= sb.journal_blockstart) return;
+    if (count > sb.journal_blockstart - start) count = sb.journal_blockstart - start;
 
     SpinGuard guard(&metadata_lock);
+    BlockID end = start + count;
 
-    for (uint32_t i = 0; i < metadata_range_count; i++)
+    uint32_t pos = 0;
+    while (pos < metadata_range_count && metadata_ranges[pos].start + metadata_ranges[pos].count < start)
+        pos++;
+
+    if (pos < metadata_range_count && end < metadata_ranges[pos].start)
     {
-        BlockRange& r = metadata_ranges[i];
-        if (start >= r.start && start + count <= r.start + r.count) return;
-        if (r.start + r.count == start) 
+        if (metadata_range_count >= kMaxMetadataRanges)
         {
-            r.count += count;
+            log_err("[journal] metadata range table full, block=%lu count=%lu", start, count);
             return;
         }
-        if (start + count == r.start) 
-        {
-            r.start = start;
-            r.count += count;
-            return;
-        }
-    }
-    if (metadata_range_count >= kMaxMetadataRanges)
-    {
-        log_err("[journal] metadata range table full, block=%lu count=%lu", start, count);
+        for (uint32_t i = metadata_range_count; i > pos; i--)
+            metadata_ranges[i] = metadata_ranges[i - 1];
+        metadata_ranges[pos] = {start, count};
+        metadata_range_count++;
         return;
     }
-    metadata_ranges[metadata_range_count++] = {start, count};
+
+    if (pos == metadata_range_count)
+    {
+        if (metadata_range_count >= kMaxMetadataRanges)
+        {
+            log_err("[journal] metadata range table full, block=%lu count=%lu", start, count);
+            return;
+        }
+        metadata_ranges[metadata_range_count++] = {start, count};
+        return;
+    }
+
+    BlockRange& first = metadata_ranges[pos];
+    if (start < first.start) first.start = start;
+    if (end > first.start + first.count) first.count = end - first.start;
+
+    uint32_t write = pos + 1;
+    for (uint32_t read = pos + 1; read < metadata_range_count; read++)
+    {
+        BlockRange& cur = metadata_ranges[read];
+        BlockID first_end = first.start + first.count;
+        if (cur.start <= first_end)
+        {
+            BlockID cur_end = cur.start + cur.count;
+            if (cur_end > first_end) first.count = cur_end - first.start;
+        }
+        else
+        {
+            if (write != read) metadata_ranges[write] = cur;
+            write++;
+        }
+    }
+    metadata_range_count = write;
 }
 
 static bool journal_commit_blocks_impl(const BlockID* blocks, const void* const* images, uint32_t count, bool checkpoint_async)

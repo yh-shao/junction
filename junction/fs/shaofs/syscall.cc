@@ -119,26 +119,6 @@ static int shaofs_unlink_inode(int inum)
     return freed ? 0 : -EIO;
 }
 
-
-int my_open2(const char* pathname, int flags, mode_t mode)
-{
-    // log_info("BlockSize: %lu", storage_block_size());
-    // log_info("BlockNum: %lu", storage_num_blocks());
-
-    RuntimeFSBaseGuard g;
-    // storage_read_obj(&sb, sizeof(SuperBlock), SUPERBLOCK_LOCATION, 0);
-    // log_info("magic num: %x", sb.magic_number);
-    
-    // char buffer[BLOCK_SIZE];
-    // storage_read(buffer, 0, 1);
-
-    // bc_read(SUPERBLOCK_LOCATION, buffer);
-    // SuperBlock* sb = (SuperBlock*)buffer;
-    // log_info("magic num: %x", sb->magic_number);
-
-    return 1;
-}
-
 int my_open(const char* pathname, int flags, mode_t mode, file_type_t* type_out)
 {
     // log_info("open(%s)", pathname);

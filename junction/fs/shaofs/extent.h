@@ -12,6 +12,7 @@ bool inode_for_each_extent(const MInode* inode, bool include_direct, bool (*cb)(
 bool inode_for_each_extent_metadata_block(const MInode* inode, bool (*cb)(BlockID, void*), void* arg);
 bool inode_flush_extent_metadata(const MInode* inode);
 bool inode_free_extent_metadata(MInode* inode);
+bool inode_drain_deferred_extent_frees();
 
 static inline bool block_in_extent(BlockID logical_blk, const iExtent& ext)
 {

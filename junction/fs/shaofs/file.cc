@@ -272,12 +272,19 @@ static void flush_all_dirty_state(bool stop_writeback)
 {
     if (stop_writeback) bc_stop_writeback_and_drain();
     else bc_drain_writeback();
-    journal_drain_checkpoint();
+
     journal_write_metadata(imap, BITMAP_LONG_SIZE(sb.inode_num) * sizeof(unsigned long), sb.imap_blockstart, 0);
 	sync_all_gdt();
 	ic_flush_all();
     bc_flush_all();
     journal_drain_checkpoint();
+
+    if (inode_drain_deferred_extent_frees())
+    {
+        sync_all_gdt();
+        bc_flush_all();
+        journal_drain_checkpoint();
+    }
 }
 
 void shaofs_sync_all()
@@ -311,6 +318,50 @@ static inline void append_segment(Segment* vecs, size_t* vec_nr, size_t vec_cap,
     if (unlikely(*vec_nr >= vec_cap)) return;
     vecs[(*vec_nr)++] = seg;
 }
+
+template <size_t N>
+class LockedBlockBatch {
+    BlockHandle handles_[N];
+    CacheEntry<BlockID, BlockData>* entries_[N];
+    size_t handle_nr_;
+    size_t lock_nr_;
+
+public:
+    LockedBlockBatch() : entries_{}, handle_nr_(0), lock_nr_(0) {}
+    ~LockedBlockBatch() { release(); }
+
+    LockedBlockBatch(const LockedBlockBatch&) = delete;
+    LockedBlockBatch& operator=(const LockedBlockBatch&) = delete;
+
+    bool add(BlockHandle&& h, bool write_lock, CacheEntry<BlockID, BlockData>** out_entry)
+    {
+        if (unlikely(handle_nr_ >= N)) return false;
+
+        handles_[handle_nr_] = std::move(h);
+        CacheEntry<BlockID, BlockData>* entry = handles_[handle_nr_].get_entry();
+        entries_[handle_nr_] = entry;
+        if (write_lock) rwmutex_wrlock(&entry->rw_mtx);
+        else rwmutex_rdlock(&entry->rw_mtx);
+        handle_nr_++;
+        lock_nr_++;
+        if (out_entry) *out_entry = entry;
+        return true;
+    }
+
+    BlockHandle& handle(size_t idx) { return handles_[idx]; }
+    size_t size() const { return handle_nr_; }
+
+    void release()
+    {
+        for (size_t i = lock_nr_; i > 0; i--)
+            rwmutex_unlock(&entries_[i - 1]->rw_mtx);
+        lock_nr_ = 0;
+
+        for (size_t i = 0; i < handle_nr_; i++)
+            handles_[i] = BlockHandle();
+        handle_nr_ = 0;
+    }
+};
 
 static ssize_t file_read_blockwise(int inum, char* buf, off_t offset, size_t len)
 {   
@@ -380,26 +431,14 @@ static ssize_t file_read_batch(int inum, char* buf, off_t offset, size_t len)
     }
 
     const size_t max_blocks = dsa_batch_task_num;
-    BlockHandle handles[dsa_batch_task_num];
-    CacheEntry<BlockID, BlockData>* entries[dsa_batch_task_num];
     Segment vecs[dsa_batch_task_num];
     
     uint64_t bytes_read = 0;
     while (bytes_read < len)
     {
         uint64_t batch_bytes = 0;
-        size_t handle_nr = 0;
-        size_t lock_nr = 0;
         size_t vec_nr = 0;
-
-        auto release_locked_blocks = [&]() {
-            for (size_t i = lock_nr; i > 0; i--)
-                rwmutex_unlock(&entries[i - 1]->rw_mtx);
-            for (size_t i = 0; i < handle_nr; i++)
-                handles[i] = BlockHandle();
-            lock_nr = 0;
-            handle_nr = 0;
-        };
+        LockedBlockBatch<dsa_batch_task_num> batch;
 
         {
             auto read_acc = ih.read_access();
@@ -428,21 +467,16 @@ static ssize_t file_read_batch(int inum, char* buf, off_t offset, size_t len)
                 if (unlikely(!bh))
                 {
                     log_err("[file_read] Failed to read physical block %lu", phys_blk);
-                    release_locked_blocks();
                     return bytes_read;
                 }
 
-                handles[handle_nr] = std::move(bh);
-                entries[handle_nr] = handles[handle_nr].get_entry();
-                rwmutex_rdlock(&entries[handle_nr]->rw_mtx);
-                lock_nr++;
-                append_segment(vecs, &vec_nr, dsa_batch_task_num, {buf + bytes_read + batch_bytes, entries[handle_nr]->data.data + blk_offset, copy_len});
-                handle_nr++;
+                CacheEntry<BlockID, BlockData>* entry = nullptr;
+                if (unlikely(!batch.add(std::move(bh), false, &entry))) return bytes_read;
+                append_segment(vecs, &vec_nr, dsa_batch_task_num, {buf + bytes_read + batch_bytes, entry->data.data + blk_offset, copy_len});
                 batch_bytes += copy_len;
             }
 
             if (vec_nr != 0) dsa_copyv_ex(vecs, vec_nr, SHAOFS_DSA_READ_TO_USER);
-            release_locked_blocks();
         }
 
         if (batch_bytes == 0) break;
@@ -632,21 +666,9 @@ static ssize_t file_write_batch_new_blocks_locked(MInode* inode, const char* buf
     if (batch_len < kFileBatchCopyMin) return 0;
 
     BlockID blocks[dsa_batch_task_num];
-    BlockHandle handles[dsa_batch_task_num];
-    CacheEntry<BlockID, BlockData>* entries[dsa_batch_task_num];
     Segment vecs[dsa_batch_task_num];
-    size_t handle_nr = 0;
-    size_t lock_nr = 0;
     size_t vec_nr = 0;
-
-    auto release_locked_blocks = [&]() {
-        for (size_t i = lock_nr; i > 0; i--)
-            rwmutex_unlock(&entries[i - 1]->rw_mtx);
-        for (size_t i = 0; i < handle_nr; i++)
-            handles[i] = BlockHandle();
-        lock_nr = 0;
-        handle_nr = 0;
-    };
+    LockedBlockBatch<dsa_batch_task_num> batch;
 
     int mapped_blocks = inode_append_run_locked(inode, offset / BLOCK_SIZE, (int)batch_blocks, blocks);
     if (mapped_blocks <= 0) return 0;
@@ -657,27 +679,20 @@ static ssize_t file_write_batch_new_blocks_locked(MInode* inode, const char* buf
     {
         BlockHandle bh = bc_get_handle(blocks[i], false);
         if (unlikely(!bh))
-        {
-            release_locked_blocks();
             return 0;
-        }
 
-        handles[handle_nr] = std::move(bh);
-        entries[handle_nr] = handles[handle_nr].get_entry();
-        rwmutex_wrlock(&entries[handle_nr]->rw_mtx);
-        lock_nr++;
-        vecs[vec_nr++] = {entries[handle_nr]->data.data, buf + i * BLOCK_SIZE, BLOCK_SIZE};
-        handle_nr++;
+        CacheEntry<BlockID, BlockData>* entry = nullptr;
+        if (unlikely(!batch.add(std::move(bh), true, &entry))) return 0;
+        vecs[vec_nr++] = {entry->data.data, buf + i * BLOCK_SIZE, BLOCK_SIZE};
     }
 
     dsa_copyv_ex(vecs, vec_nr, SHAOFS_DSA_WRITE_FROM_USER);
 
-    for (size_t i = 0; i < handle_nr; i++)
+    for (size_t i = 0; i < batch.size(); i++)
     {
-        atomic_write(&handles[i].get_entry()->valid, 1);
-        bc_mark_data_block_dirty(handles[i]);
+        atomic_write(&batch.handle(i).get_entry()->valid, 1);
+        bc_mark_data_block_dirty(batch.handle(i));
     }
-    release_locked_blocks();
     mark_inode_data_cache_dirty(inode, offset, offset + batch_len);
     inode->file_size = offset + batch_len;
     mark_inode_metadata_dirty(inode);
@@ -772,8 +787,6 @@ static ssize_t file_write_batch_existing(int inum, const char* buf, off_t offset
     }
 
     const size_t max_blocks = dsa_batch_task_num;
-    BlockHandle handles[dsa_batch_task_num];
-    CacheEntry<BlockID, BlockData>* entries[dsa_batch_task_num];
     Segment vecs[dsa_batch_task_num];
 
     uint64_t bytes_written = 0;
@@ -781,18 +794,8 @@ static ssize_t file_write_batch_existing(int inum, const char* buf, off_t offset
     {
         uint64_t batch_bytes = 0;
         bool stop_batching = false;
-        size_t handle_nr = 0;
-        size_t lock_nr = 0;
         size_t vec_nr = 0;
-
-        auto release_locked_blocks = [&]() {
-            for (size_t i = lock_nr; i > 0; i--)
-                rwmutex_unlock(&entries[i - 1]->rw_mtx);
-            for (size_t i = 0; i < handle_nr; i++)
-                handles[i] = BlockHandle();
-            lock_nr = 0;
-            handle_nr = 0;
-        };
+        LockedBlockBatch<dsa_batch_task_num> batch;
 
         {
             auto read_acc = ih.read_access();
@@ -826,27 +829,22 @@ static ssize_t file_write_batch_existing(int inum, const char* buf, off_t offset
                 if (unlikely(!bh))
                 {
                     log_err("[file_write] Fast path failed to get cache handle");
-                    release_locked_blocks();
                     return bytes_written;
                 }
 
-                handles[handle_nr] = std::move(bh);
-                entries[handle_nr] = handles[handle_nr].get_entry();
-                rwmutex_wrlock(&entries[handle_nr]->rw_mtx);
-                lock_nr++;
-                append_segment(vecs, &vec_nr, dsa_batch_task_num, {entries[handle_nr]->data.data + blk_offset, buf + bytes_written + batch_bytes, copy_len});
-                handle_nr++;
+                CacheEntry<BlockID, BlockData>* entry = nullptr;
+                if (unlikely(!batch.add(std::move(bh), true, &entry))) return bytes_written;
+                append_segment(vecs, &vec_nr, dsa_batch_task_num, {entry->data.data + blk_offset, buf + bytes_written + batch_bytes, copy_len});
                 batch_bytes += copy_len;
             }
 
             if (vec_nr != 0)
             {
                 dsa_copyv_ex(vecs, vec_nr, SHAOFS_DSA_WRITE_FROM_USER);
-                for (size_t i = 0; i < handle_nr; i++)
-                    bc_mark_data_block_dirty(handles[i]);
+                for (size_t i = 0; i < batch.size(); i++)
+                    bc_mark_data_block_dirty(batch.handle(i));
                 mark_inode_data_cache_dirty(const_cast<MInode*>(&(*read_acc)), offset + bytes_written, offset + bytes_written + batch_bytes);
             }
-            release_locked_blocks();
         }
 
         bytes_written += batch_bytes;
@@ -933,9 +931,10 @@ bool file_prepare_direct_read_hint(int inum, DirectReadHint* hint)
     RuntimeFSBaseGuard g;
 
     hint->valid = false;
+    hint->inum = inum;
     hint->extent_count = 0;
     hint->file_size = 0;
-    hint->has_dirty_data_cache = nullptr;
+    hint->inode_dirty_seq = 0;
 
     InodeHandle ih = ic_get_inode(inum);
     if (unlikely(!ih)) return false;
@@ -965,20 +964,53 @@ bool file_prepare_direct_read_hint(int inum, DirectReadHint* hint)
     if (hint_count != read_acc->valid_extent_count) return false;
 
     hint->file_size = read_acc->file_size;
+    hint->inode_dirty_seq = read_acc->inode_dirty_seq;
     hint->extent_count = hint_count;
-    hint->has_dirty_data_cache = &ih.get_entry()->data.has_dirty_data_cache;
     hint->valid = true;
     return true;
 }
 
-ssize_t file_read_direct_hint(const DirectReadHint* hint, char* buf, off_t offset, size_t len)
+ssize_t file_read_direct_hint(DirectReadHint* hint, char* buf, off_t offset, size_t len)
 {
     if (!hint || !hint->valid) return -1;
     if (len == 0) return 0;
     if (!user_dma_request_ok(buf, offset, len)) return -EINVAL;
-    if (static_cast<uint64_t>(offset) >= hint->file_size) return 0;
 
     RuntimeFSBaseGuard g;
+
+    InodeHandle ih = ic_get_inode(hint->inum);
+    if (unlikely(!ih))
+    {
+        hint->valid = false;
+        return file_read_direct(hint->inum, buf, offset, len);
+    }
+
+    bool metadata_stale = false;
+    bool has_dirty_data = false;
+    {
+        auto read_acc = ih.read_access();
+        if (!read_acc->used)
+        {
+            metadata_stale = true;
+        }
+        else if (read_acc->inode_dirty_seq != hint->inode_dirty_seq ||
+                 read_acc->file_size != hint->file_size)
+        {
+            metadata_stale = true;
+        }
+        else if (atomic_read(&ih.get_entry()->data.has_dirty_data_cache))
+        {
+            has_dirty_data = true;
+        }
+    }
+    if (metadata_stale)
+    {
+        hint->valid = false;
+        return file_read_direct(hint->inum, buf, offset, len);
+    }
+    if (has_dirty_data) return file_read_direct(hint->inum, buf, offset, len);
+
+    if (static_cast<uint64_t>(offset) >= hint->file_size) return 0;
 
     uint64_t bytes_read = 0;
     while (bytes_read < len)
@@ -1016,20 +1048,6 @@ ssize_t file_read_direct_hint(const DirectReadHint* hint, char* buf, off_t offse
         phys_blk = ext.physical_start + (logical_blk - ext.logical_start);
 
         char* dst = buf + bytes_read;
-        if (atomic_read(hint->has_dirty_data_cache))
-        {
-            bool flush_ok = true;
-            for (uint64_t i = 0; i < max_blocks; i++)
-            {
-                if (!bc_flush_block(phys_blk + i))
-                {
-                    flush_ok = false;
-                    break;
-                }
-            }
-            if (!flush_ok) break;
-        }
-
         if (storage_read_aligned(dst, phys_blk, copy_len / BLOCK_SIZE) != 0) break;
         bytes_read += copy_len;
     }

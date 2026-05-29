@@ -13,11 +13,10 @@ extern "C" {
 
 static constexpr int kLegacyMaxExtents = static_cast<int>(LEGACY_MAX_EXTENT_NUM);
 
-static constexpr int kAppendPreallocSmallBlocks = 16;
-static constexpr int kAppendPreallocMediumBlocks = 64;
 static constexpr int kAppendPreallocMaxBlocks = 128;
 static constexpr int kMaxInodeExtents = DIRECT_EXTENT_NUM + EXTENT_TREE_ROOT_REFS * EXTENT_TREE_LEAF_EXTENTS;
 static constexpr int kExtentScratchSlots = 8;
+static constexpr int kDeferredExtentFreeCap = 4096;
 
 struct ExtentScratch {
     volatile int busy;
@@ -26,6 +25,11 @@ struct ExtentScratch {
 
 static ExtentScratch extent_scratch[kExtentScratchSlots];
 static bool extent_scratch_ready;
+static spinlock_t deferred_extent_free_lock = SPINLOCK_INITIALIZER;
+static iExtent deferred_extent_frees[kDeferredExtentFreeCap];
+static iExtent deferred_extent_drain[kDeferredExtentFreeCap];
+static uint32_t deferred_extent_free_count;
+static volatile int deferred_extent_drain_busy;
 
 static void init_extent_scratch_once()
 {
@@ -80,20 +84,6 @@ public:
 static inline BlockID first_block_after_eof(const MInode* inode)
 {
     return (inode->file_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
-}
-
-static inline bool should_prealloc_append(const MInode* inode, BlockID logical_blk)
-{
-    (void)inode;
-    (void)logical_blk;
-    return false;
-}
-
-static inline int append_prealloc_blocks(const MInode* inode)
-{
-    if (inode->file_size < 64ull * 1024)   return kAppendPreallocSmallBlocks;
-    if (inode->file_size < 1024ull * 1024) return kAppendPreallocMediumBlocks;
-    return kAppendPreallocMaxBlocks;
 }
 
 BlockID lookup_extent(const iExtent* extents, int valid_count, BlockID logical_blk, iExtent* out_extent)   // 在有序的 Extent 数组中进行二分查找，若找到，则直接返回物理块号
@@ -328,9 +318,120 @@ static bool write_tree_leaf(BlockID leaf_block, const iExtent* exts, uint32_t co
     return true;
 }
 
+static bool collect_tree_leaf_blocks(const MInode* inode, BlockID* leaves, uint32_t* leaf_count)
+{
+    if (!inode || !leaves || !leaf_count) return false;
+    *leaf_count = 0;
+    if (!uses_extent_tree(inode)) return true;
+
+    BlockHandle root_bh = bc_get_handle(inode->indirect_extent_block);
+    if (unlikely(!root_bh)) return false;
+
+    auto root_acc = root_bh.read_access();
+    const ExtentTreeHeader* hdr = tree_header(root_acc->data);
+    if (!root_valid(hdr)) return false;
+
+    const ExtentLeafRef* refs = tree_refs(root_acc->data);
+    *leaf_count = hdr->leaf_count;
+    for (uint32_t i = 0; i < hdr->leaf_count; i++)
+        leaves[i] = refs[i].leaf_block;
+    return true;
+}
+
+static void free_tree_leaf_blocks(const BlockID* leaves, uint32_t leaf_count)
+{
+    if (!leaves || leaf_count == 0) return;
+
+    for (uint32_t i = 0; i < leaf_count; i++)
+    {
+        bc_invalidate_block(leaves[i]);
+        free_block(leaves[i]);
+    }
+}
+
+static bool defer_tree_leaf_frees(const BlockID* leaves, uint32_t leaf_count)
+{
+    if (!leaves || leaf_count == 0) return true;
+
+    SpinGuardNP g(&deferred_extent_free_lock);
+    uint32_t needed = 1;
+    for (uint32_t i = 1; i < leaf_count; i++)
+    {
+        if (leaves[i] != leaves[i - 1] + 1)
+            needed++;
+    }
+
+    if (deferred_extent_free_count + needed > kDeferredExtentFreeCap)
+    {
+        log_err("[extent] deferred extent free queue overflow: pending=%u add=%u", deferred_extent_free_count, needed);
+        return false;
+    }
+
+    BlockID run_start = leaves[0];
+    uint64_t run_count = 1;
+    for (uint32_t i = 1; i < leaf_count; i++)
+    {
+        if (leaves[i] == run_start + run_count)
+        {
+            run_count++;
+            continue;
+        }
+
+        deferred_extent_frees[deferred_extent_free_count++] = { .logical_start = 0, .physical_start = run_start, .block_count = run_count };
+        run_start = leaves[i];
+        run_count = 1;
+    }
+    deferred_extent_frees[deferred_extent_free_count++] = { .logical_start = 0, .physical_start = run_start, .block_count = run_count };
+    return true;
+}
+
+bool inode_drain_deferred_extent_frees()
+{
+    int expected = 0;
+    while (!__atomic_compare_exchange_n(&deferred_extent_drain_busy, &expected, 1, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+    {
+        expected = 0;
+        thread_yield();
+    }
+
+    uint32_t count = 0;
+
+    {
+        SpinGuardNP g(&deferred_extent_free_lock);
+        count = deferred_extent_free_count;
+        if (count != 0)
+            memcpy(deferred_extent_drain, deferred_extent_frees, sizeof(iExtent) * count);
+        deferred_extent_free_count = 0;
+    }
+
+    if (count == 0)
+    {
+        __atomic_store_n(&deferred_extent_drain_busy, 0, __ATOMIC_RELEASE);
+        return false;
+    }
+
+    journal_drain_checkpoint();
+    for (uint32_t i = 0; i < count; i++)
+    {
+        bc_invalidate_block(deferred_extent_drain[i].physical_start);
+        free_extent(&deferred_extent_drain[i]);
+    }
+    __atomic_store_n(&deferred_extent_drain_busy, 0, __ATOMIC_RELEASE);
+    return true;
+}
+
 static bool write_tree_from_sorted(MInode* inode, const iExtent* all_extents, int ext_count)
 {
-    if (ext_count <= kLegacyMaxExtents) return write_legacy_extents(inode, all_extents, ext_count);
+    BlockID old_leaf_blocks[EXTENT_TREE_ROOT_REFS];
+    uint32_t old_leaf_count = 0;
+    if (uses_extent_tree(inode) && !collect_tree_leaf_blocks(inode, old_leaf_blocks, &old_leaf_count)) return false;
+
+    if (ext_count <= kLegacyMaxExtents)
+    {
+        bool ok = write_legacy_extents(inode, all_extents, ext_count);
+        if (ok) defer_tree_leaf_frees(old_leaf_blocks, old_leaf_count);
+        return ok;
+    }
 
     uint32_t indirect_count = ext_count - DIRECT_EXTENT_NUM;
     uint32_t leaf_count = (indirect_count + EXTENT_TREE_LEAF_EXTENTS - 1) / EXTENT_TREE_LEAF_EXTENTS;
@@ -362,11 +463,7 @@ static bool write_tree_from_sorted(MInode* inode, const iExtent* all_extents, in
         uint32_t cnt = MIN((uint32_t)EXTENT_TREE_LEAF_EXTENTS, indirect_count - (pos - DIRECT_EXTENT_NUM));
         if (!write_tree_leaf(leaf_blocks[i], all_extents + pos, cnt))
         {
-            for (uint32_t j = 0; j < leaf_count; j++)
-            {
-                bc_invalidate_block(leaf_blocks[j]);
-                free_block(leaf_blocks[j]);
-            }
+            free_tree_leaf_blocks(leaf_blocks, leaf_count);
             return false;
         }
         pos += cnt;
@@ -397,6 +494,7 @@ static bool write_tree_from_sorted(MInode* inode, const iExtent* all_extents, in
     for (int i = 0; i < DIRECT_EXTENT_NUM; i++) inode->direct_extents[i] = all_extents[i];
     inode->valid_extent_count = ext_count;
     mark_inode_metadata_dirty(inode);
+    defer_tree_leaf_frees(old_leaf_blocks, old_leaf_count);
     return true;
 }
 
@@ -806,28 +904,6 @@ int inode_append_run_locked(MInode* inode, BlockID logical_start, int max_blocks
     return mapped + got;
 }
 
-static BlockID bmap_prealloc_append(MInode* inode, BlockID logical_blk)
-{
-    BlockID blocks[kAppendPreallocMaxBlocks];
-    iExtent runs[kAppendPreallocMaxBlocks];
-
-    int want = append_prealloc_blocks(inode);
-    int got = alloc_blocks(blocks, want);
-    if (got <= 0) return INVALID_BLOCK_ID;
-
-    int run_count = build_physical_runs(logical_blk, blocks, got, runs);
-    if (run_count != 1 || !bmap_try_append_extent(inode, runs[0]))
-    {
-        if (!bmap_insert_compact_extents(inode, runs, run_count, logical_blk, false))
-        {
-            discard_preallocated_blocks(blocks, got, runs, run_count);
-            return INVALID_BLOCK_ID;
-        }
-    }
-
-    return blocks[0];
-}
-
 bool inode_for_each_extent(const MInode* inode, bool include_direct, bool (*cb)(const iExtent&, void*), void* arg)
 {
     if (!inode || !cb) return false;
@@ -947,16 +1023,6 @@ BlockID inode_bmap_locked(MInode* inode_ptr, BlockID logical_blk, bool allocate,
     }
 
     if (!allocate) return INVALID_BLOCK_ID;    // 该 inode 中没有该逻辑块号
-
-    if (should_prealloc_append(inode_ptr, logical_blk))
-    {
-        BlockID new_phys_blk = bmap_prealloc_append(inode_ptr, logical_blk);
-        if (new_phys_blk != INVALID_BLOCK_ID)
-        {
-            if (is_new) *is_new = true;
-            return new_phys_blk;
-        }
-    }
 
     // 新分配一个块
     BlockID new_phys_blk = alloc_block();

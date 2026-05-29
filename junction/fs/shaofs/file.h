@@ -18,11 +18,12 @@ void final_flush();
 #define DIRECT_READ_HINT_MAX_EXTENTS 64
 struct DirectReadHint {
     bool valid;
+    int inum;
     uint32_t extent_count;
     uint64_t file_size;
+    uint64_t inode_dirty_seq;
     iExtent extents[DIRECT_READ_HINT_MAX_EXTENTS];
-    volatile int* has_dirty_data_cache;
 };
 bool file_prepare_direct_read_hint(int inum, DirectReadHint* hint);
-ssize_t file_read_direct_hint(const DirectReadHint* hint, char* buf, off_t offset, size_t len);
+ssize_t file_read_direct_hint(DirectReadHint* hint, char* buf, off_t offset, size_t len);
 void init_file_io();
