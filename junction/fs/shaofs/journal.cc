@@ -211,10 +211,57 @@ static uint64_t journal_next_seq_locked()
     return journal_seq++;
 }
 
-static bool checkpoint_home_blocks(BlockID header_lba, const BlockID* blocks, const void* const* images, uint32_t count)
+struct StorageBlockEntryCompat {
+    uint64_t lba;
+    char* data;
+};
+
+static constexpr uint32_t kJournalVectorWriteMax = 16;
+
+static bool journal_write_contiguous_blocks(BlockID start_lba, const void* const* images, uint32_t count, bool direct_dma)
 {
-    for (uint32_t i = 0; i < count; ++i)
-        if (storage_write(images[i], blocks[i], 1) != 0) return false;
+    uint32_t done = 0;
+
+    while (done < count)
+    {
+        uint32_t nr = std::min<uint32_t>(count - done, kJournalVectorWriteMax);
+
+        if (!direct_dma || nr == 1)
+        {
+            for (uint32_t i = 0; i < nr; i++)
+                if (storage_write(images[done + i], start_lba + done + i, 1) != 0) return false;
+            done += nr;
+            continue;
+        }
+
+        StorageBlockEntryCompat entries[kJournalVectorWriteMax];
+        void* ptrs[kJournalVectorWriteMax];
+        for (uint32_t i = 0; i < nr; i++)
+        {
+            entries[i].lba = start_lba + done + i;
+            entries[i].data = const_cast<char*>(static_cast<const char*>(images[done + i]));
+            ptrs[i] = &entries[i];
+        }
+
+        if (write_blocks_to_disk(start_lba + done, nr, ptrs) != 0) return false;
+        done += nr;
+    }
+
+    return true;
+}
+
+static bool checkpoint_home_blocks(BlockID header_lba, const BlockID* blocks, const void* const* images, uint32_t count, bool direct_dma)
+{
+    uint32_t i = 0;
+    while (i < count)
+    {
+        uint32_t run = 1;
+        while (i + run < count && blocks[i + run] == blocks[i] + run)
+            run++;
+
+        if (!journal_write_contiguous_blocks(blocks[i], images + i, run, direct_dma)) return false;
+        i += run;
+    }
 
     return write_zero_block(header_lba);
 }
@@ -944,7 +991,7 @@ void journal_register_metadata_extent(BlockID start, uint64_t count)
     metadata_range_count = write;
 }
 
-static bool journal_commit_blocks_impl(const BlockID* blocks, const void* const* images, uint32_t count, bool checkpoint_async)
+static bool journal_commit_blocks_impl(const BlockID* blocks, const void* const* images, uint32_t count, bool checkpoint_async, bool direct_dma)
 {
 
     if (count == 0) return true;
@@ -986,11 +1033,12 @@ static bool journal_commit_blocks_impl(const BlockID* blocks, const void* const*
         entries[i].home_block = blocks[i];
         entries[i].image_block = header_lba + 2 + i;
         entries[i].checksum = fnv1a64(images[i], BLOCK_SIZE);
-        if (storage_write(images[i], entries[i].image_block, 1) != 0)
-        {
-            mutex_unlock(&journal_commit_lock);
-            return false;
-        }
+    }
+
+    if (!journal_write_contiguous_blocks(header_lba + 2, images, count, direct_dma))
+    {
+        mutex_unlock(&journal_commit_lock);
+        return false;
     }
 
     if (!write_entry_table(header_lba + 1, entries, count))
@@ -1017,12 +1065,12 @@ static bool journal_commit_blocks_impl(const BlockID* blocks, const void* const*
             if (!ok)
             {
                 journal_drain_checkpoint();
-                ok = checkpoint_home_blocks(header_lba, blocks, images, count);
+                ok = checkpoint_home_blocks(header_lba, blocks, images, count, direct_dma);
             }
         }
         else
         {
-            ok = checkpoint_home_blocks(header_lba, blocks, images, count);
+            ok = checkpoint_home_blocks(header_lba, blocks, images, count, direct_dma);
         }
     }
     mutex_unlock(&journal_commit_lock);
@@ -1032,12 +1080,12 @@ static bool journal_commit_blocks_impl(const BlockID* blocks, const void* const*
 
 bool journal_commit_blocks(const BlockID* blocks, const void* const* images, uint32_t count)
 {
-    return journal_commit_blocks_impl(blocks, images, count, false);
+    return journal_commit_blocks_impl(blocks, images, count, false, false);
 }
 
 static bool journal_commit_blocks_async_checkpoint(const BlockID* blocks, const void* const* images, uint32_t count)
 {
-    return journal_commit_blocks_impl(blocks, images, count, true);
+    return journal_commit_blocks_impl(blocks, images, count, true, true);
 }
 
 bool journal_commit_returns_after_checkpoint(BlockID block)
