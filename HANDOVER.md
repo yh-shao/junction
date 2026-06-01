@@ -30,7 +30,7 @@ shaoFS 是一个构建在 **Junction LibOS + Caladan uthread runtime** 之上的
 | **构建系统** | CMake + Make，封装脚本 `scripts/build.sh` |
 | **磁盘格式化** | 自定义 mkfs 工具（`/home/syh/mkfs/mkfs.sh`） |
 
-### 1.4 2026-05-28 当前交接快照
+### 1.4 2026-06-01 当前交接快照
 
 - 当前阶段：ShaoFS 的 Filebench 导向机制优化、debug 清理和四项 Filebench 自动化对比已经完成一轮。核心目标已经从“跑通”推进到“在 fileserver/webserver/varmail/webproxy 四项中对 ext4 形成稳定领先”的状态。
 - 当前 `build/CMakeCache.txt` 中 `SHAOFS_IO_PREEMPT=ON`、`SHAOFS_CRASH_CONSISTENCY=ON`。CMake 默认值仍分别是 `IO_PREEMPT=OFF`、`CRASH_CONSISTENCY=ON`，正式实验前必须显式记录 cache 状态。
@@ -38,6 +38,9 @@ shaoFS 是一个构建在 **Junction LibOS + Caladan uthread runtime** 之上的
 - 最新一次四项 Filebench 自动化结果位于 `junction/fs/mytest/scripts/results/filebench_compare_20260528_130532`，8 个子测试退出码均为 0。ShaoFS 相对 ext4 的 ops/s：fileserver +14.6%、webserver +55.9%、varmail +36.6%、webproxy +148.6%。详见 `8.10`。
 - 当前新增的统一脚本为 `junction/fs/mytest/scripts/run_filebench_compare.sh`：参数 `0` 只测 shaoFS，`1` 只测 ext4，`2` 先测 shaoFS 后测 ext4，默认 `2`。
 - 最近一次 cleanup 已删除临时 shaoFS profiling 模块和相关热路径统计输出；当前源码树中不再存在 `junction/fs/shaofs/profile.h` / `profile.cc`，`junction/fs/CMakeLists.txt` 也不再包含 `SHAOFS_PROFILE_COMPILED` 或 `shaofs/profile.cc`。
+- 2026-06-01 本轮重点转向 4KB random read/write IOPS 上限与 core/QD 扩展性诊断。已新增 Caladan raw storage fixed-QD benchmark：`lib/caladan/tests/test_storage_async_iops.c` 和 `lib/caladan/tests/run_storage_async_iops.sh`，用于绕过 shaoFS/FIO 层直接验证 Caladan runtime + SPDK storage API 的上限。
+- 本轮诊断确认：PM9A3 4KB randread 对小随机工作集很敏感。64GiB random range 会明显低估 IOPS；使用全盘 namespace 或至少约 512GiB 工作集时，Caladan raw async benchmark 可接近 `/home/syh/MyProj1/junction/lib/caladan/spdk/build/bin/spdk_nvme_perf` 的硬件口径结果。2 个 core、每 core QD64 没有达到约 1.03M IOPS 的主要原因是总 outstanding=128 不足；2 个 core、每 core QD128 或 1 个 core QD256 可接近硬件上限。详见 `8.11`。
+- 本轮 cleanup 已删除探索阶段临时接口 `storage_read2/storage_write2`、回退 `test_storage_iops.c` 到原始写 IOPS 测试，并移除早期 `test_storage_randread_iops` 探索测试及其生成物。保留的 storage async API 是最终 raw benchmark 所需，不属于 debug 代码。
 
 ---
 
@@ -327,10 +330,12 @@ junction/fs/shaofs/                    ← 我们的项目代码
 | `junction/fs/mytest/benchmark/patch/fxmark_changes.patch` | FxMark Junction 适配补丁；当前覆盖 `Makefile`、`src/bench.c`、`src/DRBL.c`、`src/util.c` |
 | `junction/fs/mytest/benchmark/fio_test/directio.fio` | shaoFS FIO direct I/O 配置：`FSHAO/`、16 jobs、4KB O_DIRECT random read、60s |
 | `junction/fs/mytest/benchmark/fio_test/psync_{64,128,256,512}job_randread_sweep.fio` | shaoFS FIO 高并发 O_DIRECT psync random read 扫描配置；用于更突出单 runtime kthread + 多 uthread 的调度优势 |
+| `junction/fs/mytest/benchmark/fio_test/psync_128job_randread_large.fio` | shaoFS FIO 大工作集 O_DIRECT random read 配置：128 jobs × 4GiB private files，避免 64GiB 小随机范围低估 PM9A3 randread IOPS |
 | `junction/fs/mytest/scripts/cg_run.sh` | 通用 cgroup v2 runner：创建 cpuset/memory cgroup，运行目标命令，收集 `cpu.stat` / `memory.events` / `memory.peak` 并清理 |
 | `junction/fs/mytest/scripts/run_ext4_fio.sh` | ext4 FIO 主脚本：revert FIO patch、reset ext4、drop cache、通过 `cg_run.sh` 跑 FIO 并保存 log/cgroup stats |
 | `junction/fs/mytest/scripts/fio_test/ext4_directio.fio` | ext4 版 16-job direct I/O FIO 配置，和 shaoFS `directio.fio` 对应 |
 | `junction/fs/mytest/scripts/fio_test/psync_128job_randread.fio` | ext4 版 128-job psync random read 配置，和 shaoFS `psync_128job_randread_sweep.fio` 形态对应 |
+| `junction/fs/mytest/scripts/fio_test/psync_128job_randread_large.fio` | ext4 版大工作集 128-job psync random read 配置，目录为 `/mnt/nvme/ext4_bench` |
 | `junction/fs/mytest/benchmark/filebench_wml/fileserver.f` | 当前用于 shaoFS 的 Filebench fileserver workload：`FSHAO:`、10000 files、50 threads、60s runtime |
 | `junction/fs/mytest/benchmark/filebench_wml/webserver.f` | 当前用于 shaoFS 的 Filebench webserver workload：`FSHAO:`、10000 files、100 threads、60s runtime |
 | `junction/fs/mytest/benchmark/filebench_wml/varmail.f` | 当前用于 shaoFS 的 Filebench varmail workload：`FSHAO:`、5000 files、16 threads、60s runtime；用于 fsync/journal 优化验证 |
@@ -343,6 +348,21 @@ junction/fs/shaofs/                    ← 我们的项目代码
 | `/home/syh/fs_test/scripts/run_ext4_filebench_randomread_cgroup.sh` | repo 外部 ext4 对比脚本；会 reset ext4、设置 cgroup v2 CPU/内存限制并运行 Filebench randomread |
 | `/home/syh/fs_test/scripts/run_ext4_filebench_fileserver_cgroup.sh` | repo 外部 ext4 `fileserver.f` 对比脚本；会 reset ext4、生成只替换 `$dir` 的临时 WML、设置 cgroup v2 CPU/内存限制并运行 Filebench |
 | `/home/syh/fs_test/results/` | repo 外部 ext4 benchmark 输出目录 |
+
+### 3.5 Caladan raw storage benchmark 文件
+
+本轮新增的 Caladan raw storage benchmark 位于 `lib/caladan/tests/`，目的是绕过 shaoFS、Junction syscall dispatch 和 FIO 适配层，直接测 Caladan runtime + SPDK storage API 是否能把 PM9A3 压到硬件上限。
+
+| Path | Purpose |
+|------|---------|
+| `lib/caladan/inc/runtime/storage.h` | 新增 `struct storage_async_req`、`storage_async_read()`、`storage_async_write()`、`storage_async_poll()`；这是 fixed-QD benchmark 的最小 async storage API |
+| `lib/caladan/runtime/storage.c` | 实现 async read/write/poll；同时把 `SAMSUNG MZQL2960HCJR` 加入 `known_devices[]`，使当前 PM9A3 被识别为低延迟 NVMe |
+| `lib/caladan/tests/test_storage_async_iops.c` | fixed-QD raw benchmark；每个 poller 维护固定 outstanding depth，completion callback 只把完成 slot 放入本 poller CQ，由 poll loop 继续重提交 |
+| `lib/caladan/tests/run_storage_async_iops.sh` | 自动启动/清理 iokernel、运行 `test_storage_async_iops`、收集 `test.log`/`iokernel.log`/`summary.txt`；默认 `RANGE_MB=0` 表示使用全 namespace |
+| `lib/caladan/tests/storage_{1c,2c,4c,8c}_q0.config` | raw benchmark 专用 runtime config：`runtime_kthreads` 与 `runtime_spinning_kthreads` 分别为 1/2/4/8，`runtime_quantum_us=0`，`enable_storage=1`，`storage_quota_enabled=false` |
+| `lib/caladan/tests/storage.config` | 用户此前创建的手动 storage config，当前为 untracked；包含 `runtime_kthreads 10`、`runtime_spinning_kthreads 10`、`enable_storage 1`、`quota_enabled false` |
+
+注意：`test_storage_iops.c` 当前已恢复为 Caladan 原始写 IOPS smoke benchmark，不再承载本轮 randread/QD 诊断。早期探索用 `test_storage_randread_iops` 已删除，后续不要基于它继续分析。
 
 ---
 
@@ -1359,7 +1379,36 @@ printf 'syh2syh\n' | sudo -S junction/fs/mytest/scripts/run_ext4_fio.sh \
 
 注意：对 ext4 运行前应确保没有 IOKernel 持有 NVMe 设备。`run_ext4_fio.sh` 会重建 FIO 为普通版；回到 shaoFS/Junction FIO 测试前，必须重新执行 `toggle_fio.sh apply`，让 FIO 回到 `--disable-shm` + shaoFS O_DIRECT buffer 适配状态。
 
-### 6.10 在 Junction 中运行 Filebench
+### 6.10 运行 Caladan raw storage fixed-QD benchmark
+
+这个 benchmark 不经过 shaoFS/Junction/FIO，只用于确认 Caladan runtime + SPDK storage API 自身能达到的 4KB IOPS 上限。Caladan 顶层 `Makefile` 会把 `tests/*.c` 自动纳入 test targets，因此新增 `test_storage_async_iops.c` 后可直接按目标名构建：
+
+```bash
+cd /home/syh/MyProj1/junction/lib/caladan
+make -j 64 tests/test_storage_async_iops
+```
+
+推荐通过脚本运行，脚本会启动并清理 iokernel：
+
+```bash
+cd /home/syh/MyProj1/junction/lib/caladan/tests
+SUDO_PASSWORD=syh2syh CONFIG=storage_2c_q0.config POLLERS=2 QD=128 RUN_SECS=20 \
+  OP=read PATTERN=rand RANGE_MB=0 BASE_LBA=1048576 \
+  ./run_storage_async_iops.sh
+```
+
+关键参数：
+
+- `CONFIG`：选择 `storage_1c_q0.config`、`storage_2c_q0.config`、`storage_4c_q0.config` 或 `storage_8c_q0.config`，控制 runtime kthread/core 数。
+- `POLLERS`：benchmark 内 poller uthread 数，通常应与 runtime kthread 数一致，用于让每个 kthread/core 有独立 qpair outstanding。
+- `QD`：每个 poller 维持的 outstanding I/O 数。总 outstanding 约为 `POLLERS * QD`。
+- `RANGE_MB=0`：使用 `BASE_LBA` 之后的全 namespace。对 PM9A3 randread 很重要；64GiB 左右小随机范围会明显低估 IOPS。
+- `BASE_LBA=1048576`：跳过盘前部约 512MiB，避免覆盖文件系统元数据区域；raw benchmark 会直接读写 LBA，写测试尤其要先确认可覆盖范围。
+- `POLL_BATCH=0`：传给 `spdk_nvme_qpair_process_completions()` 的 `max_completions=0`，即 SPDK 默认尽可能处理可用 completion。
+
+不要把 `lib/caladan/tests/storage.config` 当成唯一标准配置。它是用户手动创建的旧配置，当前包含 `runtime_kthreads 10`、`runtime_spinning_kthreads 10`、`quota_enabled false`，可用于手工实验，但正式 core-sweep 建议使用 `storage_{1c,2c,4c,8c}_q0.config` 并记录参数。
+
+### 6.11 在 Junction 中运行 Filebench
 
 Filebench 源码位于 `junction/fs/mytest/benchmark/filebench`。当前策略是只修改 Filebench 内部并用 patch 管理，不修改 Junction 源码。
 
@@ -1531,7 +1580,7 @@ printf 'syh2syh\n' | sudo -S junction/fs/mytest/scripts/run_ext4_filebench.sh \
 
 `run_ext4_filebench.sh` 会先 revert Filebench Junction patch 并重建原生 Filebench，再调用 `/home/syh/mkfs/reset_ext4.sh` 重置并挂载 ext4，最后通过 `cg_run.sh` 在 cgroup v2 CPU/memory 限制下运行指定 WML。跑完 ext4 后，如果要回到 shaoFS/Junction Filebench 测试，必须重新执行 `junction/fs/mytest/benchmark/patch/toggle_filebench.sh apply`。
 
-### 6.11 在 Junction 中运行 FxMark
+### 6.12 在 Junction 中运行 FxMark
 
 FxMark 源码位于：
 
@@ -1782,6 +1831,17 @@ Caladan 的 `spin_lock()` 只是 raw busy-wait，不会自动禁止 uthread 抢�
 - `lib/caladan/runtime/storage.c` 的 `q->lock` 多数路径在 `getk()` 后运行，而 `getk()` 已经 `preempt_disable()`；`thread_park_and_unlock_np()` 也要求进入时 preemption 已关闭。这类 runtime 锁需要按 Caladan 约定审计，不能按 shaoFS 元数据锁简单处理。
 
 判断原则：只有在确认临界区不会执行 `rwmutex`/`mutex` 等可能阻塞的等待、不会访问磁盘/提交或等待 I/O、不会调用可能 yield 的函数时，才使用 `spin_lock_np()` 或 `SpinGuardNP`。
+
+### 7.20 GOTCHA 19：PM9A3 randread IOPS 对工作集大小和总 outstanding 很敏感
+
+2026-06-01 的 raw storage 诊断表明，当前 Samsung PM9A3 在 4KB random read 下不能只用“小随机范围 + 增加 core 数”解释硬件上限：
+
+- 同样是 SPDK/Caladan 路径，小随机范围（例如 64GiB）会明显低估 4KB randread IOPS；`test_storage_async_iops` 已在 `effective_range_mb < 512GiB` 时打印 warning。
+- 2 个 core、每 core QD64 的总 outstanding 只有 128，尚不足以稳定达到约 1.03M IOPS；2 个 core、每 core QD128（总 outstanding 256）或 1 个 core QD256 才接近本轮观测到的硬件 randread 上限。
+- 因此“1 个 core QD64 已约 80 万 IOPS，所以 2 个 core QD64 必然线性到硬件上限”这个推断在当前盘上不成立。扩展性实验必须同时记录 core 数、每 core QD、总 outstanding、random range 和使用的 `spdk_nvme_perf` 二进制路径。
+- 系统中至少存在三个 `spdk_nvme_perf`：`/usr/local/bin/spdk_nvme_perf`、`/home/syh/spdk/build/bin/spdk_nvme_perf`、`/home/syh/MyProj1/junction/lib/caladan/spdk/build/bin/spdk_nvme_perf`。本轮发现 `/home/syh/spdk/build/bin/spdk_nvme_perf` 曾给出异常低的 4-core randread 结果约 22K IOPS；后续硬件口径应优先使用 `/home/syh/MyProj1/junction/lib/caladan/spdk/build/bin/spdk_nvme_perf`，并在实验日志中写明完整路径。
+
+对 ShaoFS/FIO IOPS 实验的直接影响：旧的 128-job × 128MiB 配置总数据集约 16GiB，不能作为“超过硬件/cache 并能代表全盘 random read”的正式证据；新加的 128-job × 4GiB large jobfile 才更适合作为后续 ShaoFS/ext4 random-read 对比起点。
 
 ---
 
@@ -2110,6 +2170,50 @@ ext4 webproxy:     14817833 ops 246596.963 ops/s 64894/12979 rd/wr 613.3mb/s 0.3
 - webserver/webproxy：目录索引、inode/dentry/cache 命中、Junction syscall bypass 和 uthread 调度优势是主要贡献；小写路径未强行进入 data writeback 队列，避免读主导场景被后台写回干扰。
 - varmail：fsync dirty range、metadata group commit、async home-block checkpoint 和 data writeback 解耦降低了 append+fsync 的前台延迟。
 
+### 8.11 2026-06-01 Caladan raw storage IOPS 诊断结果
+
+本轮目标是解释为什么提高 `runtime_kthreads` 后 randread IOPS 没有线性扩展，以及确认 Caladan runtime + storage API 是否能接近 PM9A3 硬件上限。当前保留的正式诊断工具是 `lib/caladan/tests/test_storage_async_iops.c`。
+
+**硬件口径参考**：
+
+- 用户手动使用 `/home/syh/MyProj1/junction/lib/caladan/spdk/build/bin/spdk_nvme_perf -q 64 -o 4096 -w randread -t 60 -c 0xF` 测得约 `1,028,269 IOPS`。
+- 用户手动使用同一路径 `spdk_nvme_perf -q 64 -o 4096 -w randwrite -t 60 -c 0xF` 测得约 `364,374 IOPS`。
+- `/usr/local/bin/spdk_nvme_perf` 与 `lib/caladan/spdk/build/bin/spdk_nvme_perf` 在 4-core randread 下均可达到约 1.1M IOPS 量级；`/home/syh/spdk/build/bin/spdk_nvme_perf` 曾在同命令下只输出约 22K IOPS，不应混用为硬件基准。
+
+**Caladan raw async benchmark 关键结论**：
+
+- 使用全 namespace random range（`RANGE_MB=0`）时，Caladan raw async benchmark 可以接近硬件口径：
+  - 1c QD64：约 `809K IOPS`
+  - 2c QD64：约 `960K IOPS`
+  - 4c QD64：约 `1.03M IOPS`
+  - 8c QD64：约 `1.03M IOPS`
+- 使用 64GiB random range 时 IOPS 明显偏低，曾观测约 1c `497K IOPS`、4c `614K IOPS`。这不是 runtime core 扩展性的主要问题，而是当前 PM9A3 在小随机工作集下的设备/FTL 行为会低估全盘 random read 上限。
+- “2 个 core QD64 未达到约 1.03M”主要是总 outstanding 不足。2c QD64 的总 outstanding 只有 128；提高到 2c QD128（总 outstanding 256）后可达到约 `1.029M IOPS`。1c QD256 也可达到约 `1.014M IOPS`。SPDK perf 在相同 QD 变化下表现一致，因此该现象不是 Caladan runtime 调度 bug。
+- 当前未发现 `runtime_kthreads` 本身导致未达硬件上限的线性扩展 bug；真正需要控制的是每 core QD、总 outstanding、random range 和 benchmark 是否真的绕过了文件系统额外开销。
+
+**已清理的探索代码**：
+
+- 临时 `storage_read2()` / `storage_write2()` 声明和实现已删除。
+- `test_storage_iops.c` 已恢复为 Caladan 原始写 IOPS smoke benchmark。
+- 早期探索用 `test_storage_randread_iops.c` 及生成物已删除。
+
+**保留的代码/文件**：
+
+- `storage_async_read()` / `storage_async_write()` / `storage_async_poll()`：`test_storage_async_iops.c` 需要 fixed-QD async API 来维持可控 outstanding；这些接口不改变 shaoFS 正常 hot path。
+- `SAMSUNG MZQL2960HCJR` known device 条目：让当前 PM9A3 被 Caladan 识别为低延迟 NVMe，不是 debug 代码。
+- `storage_{1c,2c,4c,8c}_q0.config` 和 `run_storage_async_iops.sh`：用于复现 core/QD sweep。
+- `psync_128job_randread_large.fio`：用于后续 ShaoFS/ext4 FIO random-read 对比时避免小数据集误导。
+
+**本轮清理后的验证**：
+
+```bash
+cd /home/syh/MyProj1/junction/lib/caladan
+make -j 64 tests/test_storage_async_iops tests/test_storage_iops
+git -C /home/syh/MyProj1/junction/lib/caladan diff --check
+```
+
+构建通过，`diff --check` 通过。构建期间 `runtime/storage.c` 仍有若干既有 style warning（例如 misleading indentation、const discard），但不是本轮 cleanup 新增的错误。清理后已确认没有残留 `iokerneld`、`test_storage_async_iops`、`timeout` 或 `sudo` 进程。
+
 ---
 
 ## 第九章：已知缺陷与待办事项
@@ -2141,6 +2245,7 @@ ext4 webproxy:     14817833 ops 246596.963 ops/s 64894/12979 rd/wr 613.3mb/s 0.3
 23. **Journal checkpoint 正确性约束不能破坏**：当前 `journal_commit_blocks()` 仍是同步 home-block checkpoint；但 `journal_commit_single_batched()` / `bc_flush_block_batched()` 已使用 async checkpoint lane。维护时必须保留 slot-busy 等待、checkpoint task 的 image copy、`bc_clean_block_if_unchanged()` 和 final/sync 中的 `journal_drain_checkpoint()`，保证同一 metadata block 不会被旧事务镜像乱序覆盖新事务镜像，也不能在 home checkpoint 完成前把 cache entry 误当作 clean。
 24. **`fsync` dirty range 依赖所有元数据变更正确递增 `inode_dirty_seq`**：新增会影响 inode 盘上元数据的路径时必须调用 `mark_inode_metadata_dirty()`；否则 clean fsync 快路径可能误判 inode 不需要刷写。
 25. **后台 data writeback 只应覆盖适合的 data path**：当前 large EOF/batch write path 会调用 `bc_mark_data_block_dirty()` 入队，小块标量写主要只调用 `bc_mark_block_dirty()`。不要为了“统一接口”把所有小写都强制入队；这会增加队列锁、后台 I/O 和读主导 Filebench 场景的干扰。
+26. **FIO random-read 小数据集会误导 PM9A3 上限判断**：旧 `psync_128job_randread_sweep.fio` 的 128-job × 128MiB 规模只有约 16GiB，不适合证明全盘 4KB random read 硬件上限。后续 random-read IOPS 对比应优先使用 `psync_128job_randread_large.fio` 或明确记录每轮 `size/numjobs/range`。
 
 ### 9.2 优先待办任务
 
@@ -2163,6 +2268,17 @@ ext4 webproxy:     14817833 ops 246596.963 ops/s 64894/12979 rd/wr 613.3mb/s 0.3
 - 用 `toggle_fio.sh apply` 确认 FIO 处于 `CONFIG_NO_SHM` 状态。
 - 在重新 `mkfs` 后运行目标 FIO 命令，至少记录完整 stdout、退出码、IOKernel 日志和 `timeout` 是否触发。
 - 对比 `FSHAO/` 与转义后的 `FSHAO\:/` 两种路径写法，确认哪一种应作为论文脚本标准写法。
+- 对 4KB O_DIRECT random read，优先使用 `psync_128job_randread_large.fio` 这类大工作集 jobfile，并同时记录 core 数、Junction config、numjobs、每 job size、总 outstanding 和是否触发 O_DIRECT user-buffer DMA fast path。
+
+**Task 4A: 固化 Caladan raw storage core/QD sweep**
+- 使用 `lib/caladan/tests/run_storage_async_iops.sh` 跑 1/2/4/8 core 与 QD64/QD128/QD256 组合，`RANGE_MB=0`，保存每轮 `summary.txt`、`test.log`、`iokernel.log`。
+- 同时用 `/home/syh/MyProj1/junction/lib/caladan/spdk/build/bin/spdk_nvme_perf` 跑相同 core mask/QD/op，记录完整命令和输出，避免混用另一个异常低性能的 SPDK perf 二进制。
+- 把 raw storage 结果作为 ShaoFS/FIO 优化的下界诊断工具：如果 raw path 达上限而 ShaoFS/FIO 达不到，再分析文件系统路径；如果 raw path 自身受限，先检查 QD、工作集、设备绑定和 runtime config。
+
+**Task 4B: uFS 对比尚未完成**
+- `/home/syh/uFS/README.md` 已确认 uFS 是 SOSP'21 filesystem semi-microkernel，源码位于 `/home/syh/uFS`，但本轮尚未完成构建、运行和 FIO/uFS 对比。
+- 下一位接手者需要先按 `/home/syh/uFS/README.md` 和其 artifact 文档确认依赖、SPDK/pinned memory 初始化、benchmark 入口和是否可使用当前 PM9A3 设备，再设计与 ShaoFS/ext4 对齐的 4KB random read/write 实验。
+- 不要把 uFS 结果写入报告，除非已有完整 stdout/stderr、退出码、配置、设备绑定状态和重复实验记录。
 
 **Task 5: 前缀语义统一**
 - 当前 `fs.h` 的 `MYPREFIX` 是 `"FSHAO"`，历史文档曾写 `"FSHAO:"`。
@@ -2326,14 +2442,22 @@ ext4 webproxy:     14817833 ops 246596.963 ops/s 64894/12979 rd/wr 613.3mb/s 0.3
 | `junction/fs/mytest/scripts/run_ext4_filebench.sh` | Benchmark tooling | ext4 Filebench 主脚本：revert 原生 Filebench、reset ext4、drop cache、通过 `cg_run.sh` 跑指定 WML 并保存 log/cgroup stats |
 | `junction/fs/mytest/scripts/run_filebench_compare.sh` | Benchmark tooling | ShaoFS/ext4 四项 Filebench 统一脚本；支持 mode `0/1/2`，自动处理 patch、mkfs、IOKernel、timeout、ext4 cgroup memory 和结果汇总 |
 | `junction/fs/mytest/benchmark/fio_test/psync_128job_randread_sweep.fio` | Benchmark config | shaoFS 128-job 4KB O_DIRECT psync random read 配置，不启用 `group_reporting` |
+| `junction/fs/mytest/benchmark/fio_test/psync_128job_randread_large.fio` | Benchmark config | shaoFS 128-job × 4GiB 大工作集 4KB O_DIRECT psync random read 配置，用于避免小随机范围低估 PM9A3 randread IOPS |
 | `junction/fs/mytest/scripts/fio_test/psync_128job_randread.fio` | Benchmark config | ext4 对应 128-job 4KB O_DIRECT psync random read 配置 |
+| `junction/fs/mytest/scripts/fio_test/psync_128job_randread_large.fio` | Benchmark config | ext4 对应 128-job × 4GiB 大工作集 psync random read 配置 |
 | `/home/syh/fs_test/scripts/run_ext4_filebench_randomread_cgroup.sh` | Benchmark tooling | repo 外部 ext4 randomread 对比脚本，包含 ext4 reset、cgroup v2 CPU/memory 限制和 Filebench 运行 |
 | `/home/syh/fs_test/scripts/run_ext4_filebench_fileserver_cgroup.sh` | Benchmark tooling | repo 外部 ext4 fileserver 对比脚本，包含 ext4 reset、临时 WML `$dir` 替换、cgroup v2 CPU/memory 限制、log/CSV 输出 |
 | `lib/caladan/inc/base/syscall.h` / `lib/caladan/base/syscall.S` | User DMA support | Caladan wrapper 当前包含 `syscall_mlock()`，供 `storage_prepare_user_dma()` pin 用户页 |
 | `junction/syscall/seccomp.cc` | User DMA support | seccomp allowlist 当前包含 Caladan `mlock`，并按 request 放行 VFIO DMA map/unmap ioctl |
 | `lib/caladan/runtime/storage.c` | User DMA support + concurrency | 新增 user DMA registration cache、`storage_prepare_user_dma()`、`storage_read_aligned()`、`storage_write_user_dma()`；当前按用户 4KB 子区间计算覆盖 2MB 注册范围，`user_dma_lock` 使用 `spin_lock_np()` |
 | `lib/caladan/runtime/storage.c` | Explicit batch read | 新增 `storage_read_aligned_batch()`：校验/注册每个 user DMA buffer，在同一 qpair 上提交多个 `spdk_nvme_ns_cmd_read()`，completion 计数归零后唤醒等待 uthread；当前不是透明底层 doorbell batching |
+| `lib/caladan/runtime/storage.c` | Raw benchmark support | 新增 `storage_async_read()` / `storage_async_write()` / `storage_async_poll()`，供 fixed-QD raw benchmark 维持可控 outstanding；同时加入 `SAMSUNG MZQL2960HCJR` known device 条目 |
 | `lib/caladan/inc/runtime/storage.h` | User DMA support + batch read | 声明 user-buffer DMA 相关 storage API、`struct storage_batch_read` 和 `storage_read_aligned_batch()`；注释说明用户传入 4KB 对齐子区间，底层按覆盖的 2MB 区间注册 |
+| `lib/caladan/inc/runtime/storage.h` | Raw benchmark support | 声明 `struct storage_async_req` 和 async storage API；临时 `storage_read2/storage_write2` 已删除 |
+| `lib/caladan/tests/test_storage_async_iops.c` | New benchmark | Caladan raw storage fixed-QD 4KB read/write benchmark，可扫 pollers、QD、op、pattern、range、base LBA、request size 和 completion batch |
+| `lib/caladan/tests/run_storage_async_iops.sh` | Benchmark tooling | 自动启动/清理 iokernel 并运行 `test_storage_async_iops`，保存 summary/test/iokernel log；默认 `RANGE_MB=0` 使用全 namespace |
+| `lib/caladan/tests/storage_{1c,2c,4c,8c}_q0.config` | Benchmark config | raw storage core-sweep runtime config，`runtime_quantum_us=0`、`enable_storage=1`、`storage_quota_enabled=false` |
+| `lib/caladan/tests/.gitignore` | Build hygiene | 忽略新增测试二进制 `test_storage_async_iops` |
 | `junction/fs/file.h` | User DMA support | `File` 内嵌 `DirectReadHint`，供 shaoFS O_DIRECT read fast path 使用 |
 | `junction/fs/core.cc` | User DMA support | shaoFS O_DIRECT open 时调用 `file_prepare_direct_read_hint()` |
 | `junction/fs/file.cc` | User DMA support | shaoFS O_DIRECT read/pread 优先使用 `file_read_direct_hint()`；write 时使 hint invalid |
