@@ -41,16 +41,15 @@ __always_inline void *do_new(size_t size) {
 
 __always_inline void *do_new_aligned(size_t size, std::align_val_t a) {
   auto align = static_cast<size_t>(a);
+  size_t aligned = AlignUp(size, align);
 
   // Handle the case where the runtime is not initialized
-  if (unlikely(!runtime.ready)) return std::aligned_alloc(size, align);
-
-  size_t aligned = AlignUp(size, align);
+  if (unlikely(!runtime.ready)) return std::aligned_alloc(align, aligned);
 
   // Handle the case where the object being allocated is large
   if (unlikely(aligned >= kMaxAllocSize)) {
     rt::RuntimeLibcGuard guard;
-    return std::aligned_alloc(size, align);
+    return std::aligned_alloc(align, aligned);
   }
 
   // Hot path: Handle typical allocations using the runtime

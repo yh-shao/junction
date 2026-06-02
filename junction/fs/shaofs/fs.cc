@@ -55,8 +55,6 @@ void init_meta()
         log_err("invalid group number!");
         exit(1);
     }
-    if (sb.group_num > 2979) sb.group_num = 2979;    // group 太多时会导致 group_info 内存占用过大
-
     imap = new unsigned long[BITMAP_LONG_SIZE(sb.inode_num)]();
     storage_read_obj(imap, BITMAP_LONG_SIZE(sb.inode_num) * sizeof(unsigned long), sb.imap_blockstart, 0);
 

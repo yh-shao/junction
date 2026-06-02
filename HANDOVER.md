@@ -30,7 +30,7 @@ shaoFS 是一个构建在 **Junction LibOS + Caladan uthread runtime** 之上的
 | **构建系统** | CMake + Make，封装脚本 `scripts/build.sh` |
 | **磁盘格式化** | 自定义 mkfs 工具（`/home/syh/mkfs/mkfs.sh`） |
 
-### 1.4 2026-06-01 当前交接快照
+### 1.4 2026-06-02 当前交接快照
 
 - 当前阶段：ShaoFS 的 Filebench 导向机制优化、debug 清理和四项 Filebench 自动化对比已经完成一轮。核心目标已经从“跑通”推进到“在 fileserver/webserver/varmail/webproxy 四项中对 ext4 形成稳定领先”的状态。
 - 当前 `build/CMakeCache.txt` 中 `SHAOFS_IO_PREEMPT=ON`、`SHAOFS_CRASH_CONSISTENCY=ON`。CMake 默认值仍分别是 `IO_PREEMPT=OFF`、`CRASH_CONSISTENCY=ON`，正式实验前必须显式记录 cache 状态。
@@ -39,8 +39,10 @@ shaoFS 是一个构建在 **Junction LibOS + Caladan uthread runtime** 之上的
 - 当前新增的统一脚本为 `junction/fs/mytest/scripts/run_filebench_compare.sh`：参数 `0` 只测 shaoFS，`1` 只测 ext4，`2` 先测 shaoFS 后测 ext4，默认 `2`。
 - 最近一次 cleanup 已删除临时 shaoFS profiling 模块和相关热路径统计输出；当前源码树中不再存在 `junction/fs/shaofs/profile.h` / `profile.cc`，`junction/fs/CMakeLists.txt` 也不再包含 `SHAOFS_PROFILE_COMPILED` 或 `shaofs/profile.cc`。
 - 2026-06-01 本轮重点转向 4KB random read/write IOPS 上限与 core/QD 扩展性诊断。已新增 Caladan raw storage fixed-QD benchmark：`lib/caladan/tests/test_storage_async_iops.c` 和 `lib/caladan/tests/run_storage_async_iops.sh`，用于绕过 shaoFS/FIO 层直接验证 Caladan runtime + SPDK storage API 的上限。
-- 本轮诊断确认：PM9A3 4KB randread 对小随机工作集很敏感。64GiB random range 会明显低估 IOPS；使用全盘 namespace 或至少约 512GiB 工作集时，Caladan raw async benchmark 可接近 `/home/syh/MyProj1/junction/lib/caladan/spdk/build/bin/spdk_nvme_perf` 的硬件口径结果。2 个 core、每 core QD64 没有达到约 1.03M IOPS 的主要原因是总 outstanding=128 不足；2 个 core、每 core QD128 或 1 个 core QD256 可接近硬件上限。详见 `8.11`。
+- 本轮诊断确认：PM9A3 4KB randread 同时受 random range、总 outstanding 和 LBA 状态影响。`blkdiscard` 后读取 deallocated/unwritten LBA 可达到约 1.16M-1.17M IOPS；读真实写过的数据 LBA 或全盘顺序写满后，raw randread 会降到约 583K IOPS。2 个 core、每 core QD64 未达到约 1.03M 的旧现象主要是总 outstanding=128 不足；但后续 ShaoFS/ext4 FIO 结果必须以“数据准备后、同一盘状态下”的 raw baseline 为准。详见 `8.11` 和 `8.12`。
 - 本轮 cleanup 已删除探索阶段临时接口 `storage_read2/storage_write2`、回退 `test_storage_iops.c` 到原始写 IOPS 测试，并移除早期 `test_storage_randread_iops` 探索测试及其生成物。保留的 storage async API 是最终 raw benchmark 所需，不属于 debug 代码。
+- 2026-06-01/02 已完成 `numjobs=256` 的 ShaoFS/ext4 4KB random read `O_DIRECT` 对比。ShaoFS 通过 `runtime_kthreads` 控 core，ext4 通过 `taskset` 控 Linux CPU affinity。当前近满写入/全盘已写状态下 raw 上限约 583K IOPS；ShaoFS 1 core 即达到约 583K，ext4 约需 4 cores 达到同水平。详见 `8.12`。
+- 最近一次裸盘状态复现实验结束后，目标盘 PCI `0000:5b:00.0` 已恢复到 Linux `nvme` 驱动，`/dev/nvme2n1` 当前没有文件系统签名，并且已经被 SPDK 顺序写满过。继续跑 ShaoFS 前需要重新执行 `/home/syh/mkfs/mkfs.sh`；继续跑 ext4 前需要重新 `mkfs.ext4`/挂载。不要假设盘仍保留上一轮 ShaoFS 或 ext4 数据。
 
 ---
 
@@ -316,6 +318,8 @@ junction/fs/shaofs/                    ← 我们的项目代码
 | `test_shaofs_mt_full_extents.c` | 压力回归测试 | 多 pthread 分别写私有文件，可默认写满当前 extent tree 上限，验证每文件大量 extents、并发写、fsync、读回和可选 unlink |
 | `test_shaofs_varmail_bottleneck.c` | 诊断 benchmark | 构造 varmail 类 append+fsync/open/read/delete 混合负载，用于定位 fsync/journal 开销 |
 | `test_shaofs_fsync_direct_verify.c` | 回归测试 | 验证 `fsync` 后 direct read 能看到 buffered write 的持久化数据 |
+| `shaofs_prepare_large_files.c` | 数据准备工具 | 在 ShaoFS 中顺序创建 `FSHAO:/fio128_large.<id>` 大文件；2026-06-01 用于准备 256 × 3575MiB near-full random-read 数据集 |
+| `shaofs_async_randread_iops.c` | 历史诊断 benchmark | 曾通过 `SHAOFS_IOC_ASYNC_RANDREAD` ioctl 直接进入 ShaoFS 内部 fixed-QD async randread benchmark；2026-06-02 清理后核心 ioctl dispatch 和实现已删除，当前该未跟踪测试源文件仅作为参考保留，不能直接代表现有功能 |
 
 ### 3.4 Benchmark 与补丁工作区文件
 
@@ -331,6 +335,9 @@ junction/fs/shaofs/                    ← 我们的项目代码
 | `junction/fs/mytest/benchmark/fio_test/directio.fio` | shaoFS FIO direct I/O 配置：`FSHAO/`、16 jobs、4KB O_DIRECT random read、60s |
 | `junction/fs/mytest/benchmark/fio_test/psync_{64,128,256,512}job_randread_sweep.fio` | shaoFS FIO 高并发 O_DIRECT psync random read 扫描配置；用于更突出单 runtime kthread + 多 uthread 的调度优势 |
 | `junction/fs/mytest/benchmark/fio_test/psync_128job_randread_large.fio` | shaoFS FIO 大工作集 O_DIRECT random read 配置：128 jobs × 4GiB private files，避免 64GiB 小随机范围低估 PM9A3 randread IOPS |
+| `junction/fs/mytest/benchmark/fio_test/psync_256job_randread_full_direct.fio` | shaoFS FIO near-full O_DIRECT random read 配置：256 jobs × 3575MiB private files，`psync`/`iodepth=1`/`direct=1`，用于 2026-06-01 core sweep |
+| `junction/fs/mytest/benchmark/fio_test/ext4_prepare_256x3500m.fio` | ext4 对比数据准备配置：在 `/mnt/ext4_cmp` 创建 256 × 3500MiB private files；3575MiB 在 ext4 上因 metadata/journal 开销曾触发 ENOSPC |
+| `junction/fs/mytest/benchmark/fio_test/ext4_psync_256job_randread_3500m_direct.fio` | ext4 对比 O_DIRECT random read 配置：256 jobs × 3500MiB private files，`psync`/`iodepth=1`/`direct=1`，与 ShaoFS near-full jobfile 形态对应 |
 | `junction/fs/mytest/scripts/cg_run.sh` | 通用 cgroup v2 runner：创建 cpuset/memory cgroup，运行目标命令，收集 `cpu.stat` / `memory.events` / `memory.peak` 并清理 |
 | `junction/fs/mytest/scripts/run_ext4_fio.sh` | ext4 FIO 主脚本：revert FIO patch、reset ext4、drop cache、通过 `cg_run.sh` 跑 FIO 并保存 log/cgroup stats |
 | `junction/fs/mytest/scripts/fio_test/ext4_directio.fio` | ext4 版 16-job direct I/O FIO 配置，和 shaoFS `directio.fio` 对应 |
@@ -1843,6 +1850,27 @@ Caladan 的 `spin_lock()` 只是 raw busy-wait，不会自动禁止 uthread 抢�
 
 对 ShaoFS/FIO IOPS 实验的直接影响：旧的 128-job × 128MiB 配置总数据集约 16GiB，不能作为“超过硬件/cache 并能代表全盘 random read”的正式证据；新加的 128-job × 4GiB large jobfile 才更适合作为后续 ShaoFS/ext4 random-read 对比起点。
 
+### 7.21 GOTCHA 20：PM9A3 deallocated/unwritten LBA 与已写 LBA 的 randread IOPS 不同
+
+2026-06-01/02 的裸盘复现实验进一步确认：这块 PM9A3 的 4KB random read IOPS 会被 LBA 状态显著影响，不能把 `blkdiscard` 后的全盘 randread 结果直接当成“读真实文件数据”的上限。
+
+关键现象：
+
+- `blkdiscard` 后，读取 deallocated/unwritten LBA 时，控制器可按 NVMe deallocate 语义返回零或走较轻路径；本机 `spdk_nvme_perf -q64 -o4096 -w randread -t20 -c0xF` 观测到约 `1.17M IOPS`。
+- `blkdiscard` 后只顺序写前 256GiB，再用 SPDK 全盘 randread，仍约 `1.16M IOPS`，因为随机请求大部分落在未写区域，这个结果会被 unwritten LBA 稀释。
+- 同一状态下，用 Linux raw block FIO 只读已写 `0-256GiB` 区间约 `583K IOPS`；只读未写 `512-768GiB` 区间约 `1.166M IOPS`。
+- 用 SPDK 顺序写满整个 namespace 后，再测 SPDK 全盘 randread，结果降到约 `583.5K IOPS`。
+
+正式 ShaoFS/ext4 random-read 实验必须在数据准备之后重新测 raw baseline，且说明 baseline 对应的是“已写数据 LBA”还是“discard 后 unwritten LBA”。如果目标是证明文件系统读真实文件数据能打满硬件，应使用全盘/近满写入后的 raw baseline；如果目标是展示厂商标称或最优 raw 能力，应单独说明这是 deallocated/unwritten 状态或经过 sanitize/format/discard 后的状态。
+
+本轮可复现日志位于：
+
+```text
+/tmp/ssd_state_repro_20260601_163852
+```
+
+实验结束现场状态：目标盘已恢复 Linux `nvme` 驱动，`/dev/nvme2n1` 没有文件系统签名，并已被 SPDK 顺序写满过。后续文件系统实验必须重新格式化。
+
 ---
 
 ## 第八章：当前代码状态与测试结果
@@ -2214,6 +2242,116 @@ git -C /home/syh/MyProj1/junction/lib/caladan diff --check
 
 构建通过，`diff --check` 通过。构建期间 `runtime/storage.c` 仍有若干既有 style warning（例如 misleading indentation、const discard），但不是本轮 cleanup 新增的错误。清理后已确认没有残留 `iokerneld`、`test_storage_async_iops`、`timeout` 或 `sudo` 进程。
 
+### 8.12 2026-06-01/02 ShaoFS/ext4 FIO 256-job O_DIRECT 对比与 SSD 状态复现
+
+本轮用户要求把 FIO `numjobs` 提高到 256，并确认 ShaoFS 是否能在少量 core 下接近 NVMe 4KB random read 上限。实验只完成了 `O_DIRECT` 场景；buffered I/O 尚未重跑。
+
+**核心控制方式**：
+
+- ShaoFS：通过 Junction runtime config 中的 `runtime_kthreads` 控制 core budget；FIO `numjobs=256` 不变。配置文件位于 `/tmp/shaofs_full_20260601_124815/configs/shaofs_{1,2,4,8,16,32}c.config`。
+- ext4：通过 Linux `taskset` 限制 FIO 进程 CPU affinity；FIO `numjobs=256` 不变。
+- 两者均使用 `psync`、`iodepth=1`、`bs=4k`、`direct=1`。虽然单 job iodepth 为 1，但 256 个 job 合计可形成约 256 outstanding I/O。
+
+**数据准备**：
+
+- ShaoFS：先执行 `/home/syh/mkfs/mkfs.sh`，再用 `shaofs_prepare_large_files` 创建 256 个 private file，每个 3575MiB，总计约 915200MiB。日志：`/tmp/shaofs_full_20260601_124815/logs/prepare_256x3575m.log`。
+- ext4：测试盘曾被格式化为 ext4 并挂载 `/mnt/ext4_cmp`，mount options 为 `rw,noatime,nodiratime,stripe=32`。3575MiB/file 因 ext4 metadata/journal 开销触发 ENOSPC，正式使用 3500MiB/file，总计约 875GiB。日志：`/tmp/shaofs_full_20260601_124815/logs/fio_ext4_prepare_256x3500m.log`。
+
+**FIO jobfiles**：
+
+- ShaoFS：`junction/fs/mytest/benchmark/fio_test/psync_256job_randread_full_direct.fio`
+- ext4 prepare：`junction/fs/mytest/benchmark/fio_test/ext4_prepare_256x3500m.fio`
+- ext4 read：`junction/fs/mytest/benchmark/fio_test/ext4_psync_256job_randread_3500m_direct.fio`
+
+**ShaoFS/ext4 core sweep 结果**：
+
+| cores | ShaoFS MiB/s | ShaoFS IOPS | ext4 MiB/s | ext4 IOPS |
+|------:|-------------:|------------:|-----------:|----------:|
+| 1 | 2278 | 583168 | 965 | 247040 |
+| 2 | 2278 | 583168 | 1501 | 384256 |
+| 4 | 2277 | 582912 | 2278 | 583168 |
+| 8 | 2277 | 582912 | 2278 | 583168 |
+| 16 | 2277 | 582912 | 2279 | 583424 |
+| 32 | 2277 | 582912 | 2279 | 583424 |
+
+对应日志：
+
+```text
+/tmp/shaofs_full_20260601_124815/logs/fio_shaofs_{1,2,4,8,16,32}c_256job_full_direct.log
+/tmp/shaofs_full_20260601_124815/logs/fio_ext4_{1,2,4,8,16,32}c_256job_3500m_direct.log
+```
+
+解释：在本轮“near-full/已写数据”盘状态下，ShaoFS 1 core 已达到当前 raw device baseline；ext4 约需 4 cores 达到同水平。因此这轮数据支持 ShaoFS 的 CPU efficiency 优势，但不能用来声称达到 `1M+ IOPS`，因为此时读真实写过数据 LBA 的 raw baseline 自身约为 583K IOPS。
+
+**SSD 状态复现实验**：
+
+为确认“盘状态影响 IOPS”不是 ShaoFS/FIO 引入的假象，本轮只使用裸盘工具复现。日志目录：
+
+```text
+/tmp/ssd_state_repro_20260601_163852
+```
+
+关键结果：
+
+| 状态 | 工具 | 范围 | 结果 |
+|------|------|------|------|
+| `blkdiscard` 后 | SPDK `spdk_nvme_perf randread` | 全盘 | `1,173,943 IOPS` |
+| 只顺序写 256GiB 后 | SPDK `spdk_nvme_perf randread` | 全盘 | `1,159,557 IOPS` |
+| 只顺序写 256GiB 后 | Linux raw FIO randread | 已写 `0-256GiB` | `583K IOPS` |
+| 只顺序写 256GiB 后 | Linux raw FIO randread | 未写 `512-768GiB` | `1,166K IOPS` |
+| SPDK 顺序写满全盘后 | SPDK `spdk_nvme_perf randread` | 全盘 | `583,542 IOPS` |
+
+可复现命令骨架：
+
+```bash
+# 清空签名并 discard
+sudo umount /mnt/ext4_cmp 2>/dev/null || true
+sudo wipefs -a /dev/nvme2n1
+sudo blkdiscard -f /dev/nvme2n1
+
+# 绑定给 SPDK，测 discard 后全盘 randread
+sudo PCI_ALLOWED="0000:5b:00.0" /home/syh/MyProj1/junction/lib/caladan/spdk/scripts/setup.sh
+sudo /home/syh/MyProj1/junction/lib/caladan/spdk/build/bin/spdk_nvme_perf \
+  -q 64 -o 4096 -w randread -t 20 -c 0xF \
+  -r 'trtype:PCIe traddr:0000:5b:00.0'
+
+# 顺序写 256GiB：67108864 * 4KiB
+sudo /home/syh/MyProj1/junction/lib/caladan/spdk/build/bin/spdk_nvme_perf \
+  -q 64 -o 4096 -w write -d 67108864 -t 3600 -c 0x1 \
+  -r 'trtype:PCIe traddr:0000:5b:00.0'
+
+# 绑回 Linux 后用 raw block FIO 分别读已写/未写区间
+sudo PCI_ALLOWED="0000:5b:00.0" /home/syh/MyProj1/junction/lib/caladan/spdk/scripts/setup.sh reset
+FIO=/home/syh/MyProj1/junction/junction/fs/mytest/benchmark/fio/fio
+
+sudo $FIO --name=written_0_256g --filename=/dev/nvme2n1 \
+  --offset=0 --size=256G --rw=randread --bs=4k --direct=1 \
+  --ioengine=libaio --iodepth=64 --numjobs=4 --runtime=20 \
+  --time_based=1 --group_reporting=1 --norandommap=1 --randrepeat=0
+
+sudo $FIO --name=dealloc_512_768g --filename=/dev/nvme2n1 \
+  --offset=512G --size=256G --rw=randread --bs=4k --direct=1 \
+  --ioengine=libaio --iodepth=64 --numjobs=4 --runtime=20 \
+  --time_based=1 --group_reporting=1 --norandommap=1 --randrepeat=0
+```
+
+SPDK-only 写满复现：
+
+```bash
+sudo PCI_ALLOWED="0000:5b:00.0" /home/syh/MyProj1/junction/lib/caladan/spdk/scripts/setup.sh
+
+# 234441648 * 4KiB ~= 894.3GiB
+sudo /home/syh/MyProj1/junction/lib/caladan/spdk/build/bin/spdk_nvme_perf \
+  -q 64 -o 4096 -w write -d 234441648 -t 7200 -c 0x1 \
+  -r 'trtype:PCIe traddr:0000:5b:00.0'
+
+sudo /home/syh/MyProj1/junction/lib/caladan/spdk/build/bin/spdk_nvme_perf \
+  -q 64 -o 4096 -w randread -t 20 -c 0xF \
+  -r 'trtype:PCIe traddr:0000:5b:00.0'
+```
+
+现场状态：本复现实验结束后已执行 SPDK setup reset，`/dev/nvme2n1` 在 Linux `nvme` 驱动下，无文件系统签名，且全盘已写过。后续 ShaoFS/ext4 实验必须重新格式化。
+
 ---
 
 ## 第九章：已知缺陷与待办事项
@@ -2246,6 +2384,9 @@ git -C /home/syh/MyProj1/junction/lib/caladan diff --check
 24. **`fsync` dirty range 依赖所有元数据变更正确递增 `inode_dirty_seq`**：新增会影响 inode 盘上元数据的路径时必须调用 `mark_inode_metadata_dirty()`；否则 clean fsync 快路径可能误判 inode 不需要刷写。
 25. **后台 data writeback 只应覆盖适合的 data path**：当前 large EOF/batch write path 会调用 `bc_mark_data_block_dirty()` 入队，小块标量写主要只调用 `bc_mark_block_dirty()`。不要为了“统一接口”把所有小写都强制入队；这会增加队列锁、后台 I/O 和读主导 Filebench 场景的干扰。
 26. **FIO random-read 小数据集会误导 PM9A3 上限判断**：旧 `psync_128job_randread_sweep.fio` 的 128-job × 128MiB 规模只有约 16GiB，不适合证明全盘 4KB random read 硬件上限。后续 random-read IOPS 对比应优先使用 `psync_128job_randread_large.fio` 或明确记录每轮 `size/numjobs/range`。
+27. **PM9A3 raw baseline 必须匹配 LBA 状态**：2026-06-01/02 已确认 discard/unwritten LBA 可测到约 1.17M IOPS，而已写数据 LBA 约 583K IOPS。ShaoFS/ext4 读文件数据时应和“已写数据 LBA”baseline 对比；不要拿 discard 后全盘 randread 的 1.17M 直接判断文件系统没有打满硬件。
+28. **2026-06-01/02 只完成了 O_DIRECT 256-job 对比，buffered I/O 尚未重跑**：当前 `8.12` 表格不能代表 buffered read 场景，也不能代表 page cache/block cache 命中场景。
+29. **当前目标盘现场状态不是文件系统可用状态**：最后一次裸盘复现实验后，`/dev/nvme2n1` 无文件系统签名并已被 SPDK 写满；下一轮 ShaoFS 或 ext4 实验必须显式重新格式化，不能直接复用当前盘。
 
 ### 9.2 优先待办任务
 
@@ -2269,11 +2410,14 @@ git -C /home/syh/MyProj1/junction/lib/caladan diff --check
 - 在重新 `mkfs` 后运行目标 FIO 命令，至少记录完整 stdout、退出码、IOKernel 日志和 `timeout` 是否触发。
 - 对比 `FSHAO/` 与转义后的 `FSHAO\:/` 两种路径写法，确认哪一种应作为论文脚本标准写法。
 - 对 4KB O_DIRECT random read，优先使用 `psync_128job_randread_large.fio` 这类大工作集 jobfile，并同时记录 core 数、Junction config、numjobs、每 job size、总 outstanding 和是否触发 O_DIRECT user-buffer DMA fast path。
+- 对 near-full 256-job 对比，参考 `8.12` 的 `psync_256job_randread_full_direct.fio` / `ext4_psync_256job_randread_3500m_direct.fio`。每轮都应在数据准备后重新测 SPDK raw baseline，并说明 baseline 是 discard/unwritten 状态还是已写数据状态。
+- buffered I/O 对比尚未完成。下一轮若补 buffered，需要分别说明 ShaoFS BlockCache、Linux page cache、drop_caches、工作集大小和 warm/cold cache 状态，不能和 O_DIRECT 表格混报。
 
 **Task 4A: 固化 Caladan raw storage core/QD sweep**
 - 使用 `lib/caladan/tests/run_storage_async_iops.sh` 跑 1/2/4/8 core 与 QD64/QD128/QD256 组合，`RANGE_MB=0`，保存每轮 `summary.txt`、`test.log`、`iokernel.log`。
 - 同时用 `/home/syh/MyProj1/junction/lib/caladan/spdk/build/bin/spdk_nvme_perf` 跑相同 core mask/QD/op，记录完整命令和输出，避免混用另一个异常低性能的 SPDK perf 二进制。
 - 把 raw storage 结果作为 ShaoFS/FIO 优化的下界诊断工具：如果 raw path 达上限而 ShaoFS/FIO 达不到，再分析文件系统路径；如果 raw path 自身受限，先检查 QD、工作集、设备绑定和 runtime config。
+- 增加 LBA 状态维度：至少保留 `blkdiscard` 后、部分顺序写后已写 range、部分顺序写后未写 range、全盘顺序写后四种状态的 raw baseline。已有复现实验日志在 `/tmp/ssd_state_repro_20260601_163852`。
 
 **Task 4B: uFS 对比尚未完成**
 - `/home/syh/uFS/README.md` 已确认 uFS 是 SOSP'21 filesystem semi-microkernel，源码位于 `/home/syh/uFS`，但本轮尚未完成构建、运行和 FIO/uFS 对比。
@@ -2403,6 +2547,12 @@ git -C /home/syh/MyProj1/junction/lib/caladan diff --check
 | `shaofs/journal.cc` | New + perf | metadata-only redo journal、dirty mount marker、transaction replay、dirty repair；当前包含同步 commit API、batched metadata group commit、async home-block checkpoint worker 和固定 metadata range 表 |
 | `shaofs/file.cc` | Crash consistency + perf | final_flush 通过 journal 写 imap，clean shutdown 清 dirty marker；目录块分配后登记为 metadata block；`flush_all_dirty_state()` 会 drain/stop data writeback 并等待 journal checkpoint |
 | `shaofs/file.cc` / `shaofs/file.h` | Feature | 新增 `shaofs_sync_all()`；与 `final_flush()` 共用 `flush_all_dirty_state()`，但 runtime `sync()` 不清 dirty marker；`sync` drain writeback/checkpoint，`final_flush` stop writeback 后 clean shutdown |
+| `shaofs/file.cc` / `shaofs/file.h` / `junction/fs/file.cc` | Cleanup | 2026-06-02 清理：移除此前用于探索的 `SHAOFS_IOC_ASYNC_RANDREAD` dispatch、`shaofs_direct_randread_async_bench()` 和 `SHAOFS_DIRECT_READ_STATS` direct-read 统计，避免把内部 benchmark/诊断计数留在最终热路径；未跟踪测试源 `shaofs_async_randread_iops.c` 仍保留为参考 |
+| `junction/fs/mytest/shaofs_prepare_large_files.c` | New benchmark tool | 顺序准备 256 个 `FSHAO:/fio128_large.<id>` 大文件；2026-06-01 用于 near-full FIO random-read 数据集 |
+| `junction/fs/mytest/shaofs_async_randread_iops.c` | Historical benchmark tool | 曾通过 ioctl 触发 shaoFS 内部 async randread benchmark；2026-06-02 已移除核心 ioctl dispatch 和实现，当前该未跟踪源文件仅作为历史参考，不能直接运行代表当前功能 |
+| `junction/fs/mytest/benchmark/fio_test/psync_256job_randread_full_direct.fio` | Benchmark config | ShaoFS 256-job near-full 4KB O_DIRECT random read 配置，`psync`/`iodepth=1`/`size=3575M` |
+| `junction/fs/mytest/benchmark/fio_test/ext4_prepare_256x3500m.fio` | Benchmark config | ext4 256-file 数据准备配置，`size=3500M`，用于避免 3575MiB/file 在 ext4 上 ENOSPC |
+| `junction/fs/mytest/benchmark/fio_test/ext4_psync_256job_randread_3500m_direct.fio` | Benchmark config | ext4 256-job 4KB O_DIRECT random read 配置，`psync`/`iodepth=1`/`size=3500M` |
 | `shaofs/group.cc` | Crash consistency + concurrency | GDT sync 改为 `journal_write_metadata()`；group bitmap/free counter 短临界区使用 `SpinGuardNP` |
 | `/home/syh/mkfs/fs.h` | Crash consistency | mkfs 侧 SuperBlock 同步新增 journal 字段和 `DEFAULT_JOURNAL_BLOCKS` |
 | `/home/syh/mkfs/mkfs.c` | Crash consistency | mkfs 在盘尾预留并清空 journal 区，data group 只使用 journal 前空间 |
