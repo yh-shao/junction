@@ -132,6 +132,47 @@ static inline void mark_inode_data_cache_dirty(MInode* inode, uint64_t start, ui
     atomic_write(&inode->has_dirty_data_cache, 1);
 }
 
+enum class CachedWriteDirtyMode {
+    kNormal,
+    kDataWriteback,
+};
+
+struct CachedWriteOp {
+    uint64_t block_offset;
+    const char* src;
+    size_t len;
+    uint64_t file_offset;
+    bool zero_full_block;
+    bool mark_valid;
+    CachedWriteDirtyMode dirty_mode;
+};
+
+static inline CachedWriteDirtyMode cached_write_dirty_mode(const MInode* inode, bool prefer_data_writeback)
+{
+    return prefer_data_writeback && inode->type == REGULAR ? CachedWriteDirtyMode::kDataWriteback : CachedWriteDirtyMode::kNormal;
+}
+
+static inline void register_directory_data_block(const MInode* inode, BlockID phys_blk)
+{
+    if (inode->type == DIRECTORY) journal_register_metadata_block(phys_blk);
+}
+
+static inline void mark_cached_block_written(BlockHandle& bh, bool mark_valid, CachedWriteDirtyMode mode)
+{
+    if (mark_valid) atomic_write(&bh.get_entry()->valid, 1);
+    if (mode == CachedWriteDirtyMode::kDataWriteback) (void)bc_mark_data_block_dirty(bh);
+    else (void)bc_mark_block_dirty(bh);
+}
+
+static inline void copy_to_cached_block(MInode* inode, BlockHandle& bh, const CachedWriteOp& op)
+{
+    auto block_write_acc = bh.write_access();
+    if (op.zero_full_block) memset(block_write_acc->data, 0, BLOCK_SIZE);
+    dsa_copy_ex(block_write_acc->data + op.block_offset, op.src, op.len, SHAOFS_DSA_WRITE_FROM_USER);
+    mark_cached_block_written(bh, op.mark_valid, op.dirty_mode);
+    mark_inode_data_cache_dirty(inode, op.file_offset, op.file_offset + op.len);
+}
+
 static inline bool direct_clean_read_worthwhile(uint64_t aligned_clean_len)
 {
     return aligned_clean_len >= kDirectCleanReadMinBytes;
@@ -152,20 +193,21 @@ static ssize_t file_read_direct_clean(int inum, char* buf, off_t offset, size_t 
     InodeHandle ih = ic_get_inode(inum);
     if (unlikely(!ih)) return -1;
 
-    auto write_acc = ih.write_access();
-    if (unlikely(!write_acc->used)) return -1;
-    if (write_acc->type != REGULAR) return 0;
-    if (static_cast<uint64_t>(offset) >= write_acc->file_size) return 0;
+    auto read_acc = ih.read_access();
+    MInode* inode = const_cast<MInode*>(&(*read_acc));
+    if (unlikely(!read_acc->used)) return -1;
+    if (read_acc->type != REGULAR) return 0;
+    if (static_cast<uint64_t>(offset) >= read_acc->file_size) return 0;
 
-    uint64_t available = write_acc->file_size - static_cast<uint64_t>(offset);
+    uint64_t available = read_acc->file_size - static_cast<uint64_t>(offset);
     uint64_t target_len = MIN(static_cast<uint64_t>(len), available);
-    if (atomic_read(&write_acc->has_dirty_data_cache))
+    if (atomic_read(&inode->has_dirty_data_cache))
     {
-        SpinGuardNP dirty_g(&write_acc->dirty_lock);
-        if (atomic_read(&write_acc->has_dirty_data_cache))
+        SpinGuardNP dirty_g(&inode->dirty_lock);
+        if (atomic_read(&inode->has_dirty_data_cache))
         {
-            if (write_acc->dirty_data_start <= static_cast<uint64_t>(offset)) return 0;
-            target_len = MIN(target_len, write_acc->dirty_data_start - static_cast<uint64_t>(offset));
+            if (inode->dirty_data_start <= static_cast<uint64_t>(offset)) return 0;
+            target_len = MIN(target_len, inode->dirty_data_start - static_cast<uint64_t>(offset));
         }
     }
     target_len &= ~(static_cast<uint64_t>(BLOCK_SIZE) - 1);
@@ -174,7 +216,7 @@ static ssize_t file_read_direct_clean(int inum, char* buf, off_t offset, size_t 
     iExtent first_ext = {};
     BlockID first_phys_blk = INVALID_BLOCK_ID;
     uint64_t first_logical_blk = static_cast<uint64_t>(offset) / BLOCK_SIZE;
-    if (inode_lookup_extent_locked(&*write_acc, first_logical_blk, &first_ext))
+    if (inode_lookup_extent_locked(inode, first_logical_blk, &first_ext))
         first_phys_blk = first_ext.physical_start + (first_logical_blk - first_ext.logical_start);
     if (!direct_clean_read_allowed(target_len, first_phys_blk)) return 0;
 
@@ -190,7 +232,7 @@ static ssize_t file_read_direct_clean(int inum, char* buf, off_t offset, size_t 
         uint64_t request_blocks = (target_len - bytes_read) / BLOCK_SIZE;
 
         iExtent ext = {};
-        if (!inode_lookup_extent_locked(&*write_acc, logical_blk, &ext))
+        if (!inode_lookup_extent_locked(inode, logical_blk, &ext))
         {
             memset(buf + bytes_read, 0, BLOCK_SIZE);
             bytes_read += BLOCK_SIZE;
@@ -504,6 +546,56 @@ ssize_t file_read(int inum, char* buf, off_t offset, size_t len)
     return file_read_blockwise(inum, buf, offset, len);
 }
 
+static bool write_cached_existing_block(MInode* inode, BlockID phys_blk, const CachedWriteOp& op, const char* log_prefix)
+{
+    BlockHandle bh = bc_get_handle(phys_blk);
+    if (unlikely(!bh))
+    {
+        log_err("[%s] Failed to get cache handle for physical block %lu", log_prefix, phys_blk);
+        return false;
+    }
+
+    copy_to_cached_block(inode, bh, op);
+    return true;
+}
+
+static bool write_cached_allocated_block_locked(MInode* inode,
+                                                BlockID logical_blk,
+                                                const CachedWriteOp& op,
+                                                bool update_file_size,
+                                                const char* log_prefix)
+{
+    bool is_new_block = false;
+    BlockID phys_blk = inode_bmap_locked(inode, logical_blk, true, &is_new_block);
+    if (phys_blk == INVALID_BLOCK_ID)
+    {
+        log_err("[%s] Disk full or bmap failed at logical block %lu", log_prefix, logical_blk);
+        return false;
+    }
+
+    BlockHandle bh = is_new_block ? bc_get_handle(phys_blk, false) : bc_get_handle(phys_blk);
+    if (unlikely(!bh))
+    {
+        log_err("[%s] Failed to get cache handle for physical block %lu", log_prefix, phys_blk);
+        return false;
+    }
+
+    register_directory_data_block(inode, phys_blk);
+
+    CachedWriteOp mapped_op = op;
+    mapped_op.zero_full_block = is_new_block && op.len < BLOCK_SIZE;
+    mapped_op.mark_valid = true;
+    copy_to_cached_block(inode, bh, mapped_op);
+
+    uint64_t new_end_pos = op.file_offset + op.len;
+    if (update_file_size && new_end_pos > inode->file_size)
+    {
+        inode->file_size = new_end_pos;
+        mark_inode_metadata_dirty(inode);
+    }
+    return true;
+}
+
 static ssize_t file_write_blockwise(int inum, const char* buf, off_t offset, size_t len)
 {
     if (len == 0) return 0;
@@ -522,7 +614,6 @@ static ssize_t file_write_blockwise(int inum, const char* buf, off_t offset, siz
         uint64_t logical_blk = current_offset / BLOCK_SIZE, blk_offset = current_offset % BLOCK_SIZE;        
         uint64_t copy_len = MIN(BLOCK_SIZE - blk_offset, len - bytes_written);
 
-        BlockID phys_blk = INVALID_BLOCK_ID;
         bool fast_path_success = false;
 
         // 判断能否走 Fast Path
@@ -536,20 +627,19 @@ static ssize_t file_write_blockwise(int inum, const char* buf, off_t offset, siz
 
             if (current_offset + copy_len <= read_acc->file_size)  // 只有当写入范围完全在现有 file_size 内部时，才尝试 Fast Path
             {
-                phys_blk = inode_bmap_locked(const_cast<MInode*>(&(*read_acc)), logical_blk, false, nullptr);
+                BlockID phys_blk = inode_bmap_locked(const_cast<MInode*>(&(*read_acc)), logical_blk, false, nullptr);
                 if (phys_blk != INVALID_BLOCK_ID)  // 如果 phys_blk 有效，说明不是稀疏文件空洞，可以走 Fast Path
                 {
-                    BlockHandle bh = bc_get_handle(phys_blk);   
-                    if (unlikely(!bh)) 
-                    {
-                        log_err("[file_write] Fast path failed to get cache handle");
-                        break;
-                    }
-
-                    auto block_write_acc = bh.write_access(); // 获取 Block 独占写锁保证单块安全
-                    dsa_copy_ex(block_write_acc->data + blk_offset, buf + bytes_written, copy_len, SHAOFS_DSA_WRITE_FROM_USER);
-                    bc_mark_block_dirty(bh);
-                    mark_inode_data_cache_dirty(const_cast<MInode*>(&(*read_acc)), current_offset, current_offset + copy_len);
+                    CachedWriteOp op = {
+                        .block_offset = blk_offset,
+                        .src = buf + bytes_written,
+                        .len = copy_len,
+                        .file_offset = current_offset,
+                        .zero_full_block = false,
+                        .mark_valid = false,
+                        .dirty_mode = CachedWriteDirtyMode::kNormal,
+                    };
+                    if (!write_cached_existing_block(const_cast<MInode*>(&(*read_acc)), phys_blk, op, "file_write")) break;
 
                     bytes_written += copy_len;
                     fast_path_success = true;
@@ -559,8 +649,6 @@ static ssize_t file_write_blockwise(int inum, const char* buf, off_t offset, siz
         if (fast_path_success) continue;
 
         // Slow Path: 需要分配新块和更新 Inode 元数据，持有 Inode 写锁
-        bool is_new_block = false;
-
         {
             auto write_acc = ih.write_access();
             if (!write_acc->used) 
@@ -569,36 +657,16 @@ static ssize_t file_write_blockwise(int inum, const char* buf, off_t offset, siz
                 break;
             }
 
-            phys_blk = inode_bmap_locked(&*write_acc, logical_blk, true, &is_new_block);
-            if (phys_blk == INVALID_BLOCK_ID)
-            {
-                log_err("[file_write] Disk full or bmap failed at logical block %lu", logical_blk);
-                break;
-            }
-
-            BlockHandle bh = is_new_block ? bc_get_handle(phys_blk, false) : bc_get_handle(phys_blk);
-            if (unlikely(!bh))
-            {
-                log_err("[file_write] Failed to get cache handle for physical block %lu", phys_blk);
-                break;
-            }
-            if (write_acc->type == DIRECTORY) journal_register_metadata_block(phys_blk);
-
-            {
-                auto block_write_acc = bh.write_access();
-                if (is_new_block && copy_len < BLOCK_SIZE) memset(block_write_acc->data, 0, BLOCK_SIZE);   // 新分配的块若未写满，必须填 0
-                dsa_copy_ex(block_write_acc->data + blk_offset, buf + bytes_written, copy_len, SHAOFS_DSA_WRITE_FROM_USER);
-                atomic_write(&bh.get_entry()->valid, 1);
-                bc_mark_block_dirty(bh);
-                mark_inode_data_cache_dirty(&*write_acc, current_offset, current_offset + copy_len);
-            }
-
-            uint64_t new_end_pos = current_offset + copy_len;
-            if (new_end_pos > write_acc->file_size)
-            {
-                write_acc->file_size = new_end_pos;
-                mark_inode_metadata_dirty(&*write_acc);
-            }
+            CachedWriteOp op = {
+                .block_offset = blk_offset,
+                .src = buf + bytes_written,
+                .len = copy_len,
+                .file_offset = current_offset,
+                .zero_full_block = false,
+                .mark_valid = true,
+                .dirty_mode = CachedWriteDirtyMode::kNormal,
+            };
+            if (!write_cached_allocated_block_locked(&*write_acc, logical_blk, op, true, "file_write")) break;
             write_acc.mark_dirty();
         } // inode 写锁释放
 
@@ -617,38 +685,17 @@ static ssize_t file_write_scalar_locked(MInode* inode, const char* buf, uint64_t
         uint64_t logical_blk = current_offset / BLOCK_SIZE;
         uint64_t blk_offset = current_offset % BLOCK_SIZE;
         uint64_t copy_len = MIN(BLOCK_SIZE - blk_offset, len - bytes_written);
-        bool is_new_block = false;
 
-        BlockID phys_blk = inode_bmap_locked(inode, logical_blk, true, &is_new_block);
-        if (phys_blk == INVALID_BLOCK_ID)
-        {
-            log_err("[file_write] Disk full or bmap failed at logical block %lu", logical_blk);
-            break;
-        }
-
-        BlockHandle bh = is_new_block ? bc_get_handle(phys_blk, false) : bc_get_handle(phys_blk);
-        if (unlikely(!bh))
-        {
-            log_err("[file_write] Failed to get cache handle for physical block %lu", phys_blk);
-            break;
-        }
-        if (inode->type == DIRECTORY) journal_register_metadata_block(phys_blk);
-
-        {
-            auto block_write_acc = bh.write_access();
-            if (is_new_block && copy_len < BLOCK_SIZE) memset(block_write_acc->data, 0, BLOCK_SIZE);
-            dsa_copy_ex(block_write_acc->data + blk_offset, buf + bytes_written, copy_len, SHAOFS_DSA_WRITE_FROM_USER);
-            atomic_write(&bh.get_entry()->valid, 1);
-            bc_mark_block_dirty(bh);
-            mark_inode_data_cache_dirty(inode, current_offset, current_offset + copy_len);
-        }
-
-        uint64_t new_end_pos = current_offset + copy_len;
-        if (new_end_pos > inode->file_size)
-        {
-            inode->file_size = new_end_pos;
-            mark_inode_metadata_dirty(inode);
-        }
+        CachedWriteOp op = {
+            .block_offset = blk_offset,
+            .src = buf + bytes_written,
+            .len = copy_len,
+            .file_offset = current_offset,
+            .zero_full_block = false,
+            .mark_valid = true,
+            .dirty_mode = CachedWriteDirtyMode::kNormal,
+        };
+        if (!write_cached_allocated_block_locked(inode, logical_blk, op, true, "file_write")) break;
         bytes_written += copy_len;
     }
 
@@ -690,13 +737,34 @@ static ssize_t file_write_batch_new_blocks_locked(MInode* inode, const char* buf
 
     for (size_t i = 0; i < batch.size(); i++)
     {
-        atomic_write(&batch.handle(i).get_entry()->valid, 1);
-        bc_mark_data_block_dirty(batch.handle(i));
+        mark_cached_block_written(batch.handle(i), true, cached_write_dirty_mode(inode, true));
     }
     mark_inode_data_cache_dirty(inode, offset, offset + batch_len);
     inode->file_size = offset + batch_len;
     mark_inode_metadata_dirty(inode);
     return batch_len;
+}
+
+static ssize_t file_write_extend_locked(InodeHandle::WriteAccessor& write_acc, const char* buf, uint64_t offset, size_t len)
+{
+    MInode* inode = &*write_acc;
+    uint64_t bytes_written = 0;
+    while (bytes_written < len)
+    {
+        uint64_t current_offset = offset + bytes_written;
+        if (current_offset != inode->file_size) break;
+
+        ssize_t ret = 0;
+        if (inode->type == REGULAR && (current_offset & (BLOCK_SIZE - 1)) == 0 && len - bytes_written >= kFileBatchCopyMin)
+            ret = file_write_batch_new_blocks_locked(inode, buf + bytes_written, current_offset, len - bytes_written);
+
+        if (ret == 0) ret = file_write_scalar_locked(inode, buf + bytes_written, current_offset, len - bytes_written);
+        if (ret <= 0) break;
+
+        bytes_written += ret;
+        write_acc.mark_dirty();
+    }
+    return bytes_written;
 }
 
 ssize_t file_write_append(int inum, const char* buf, size_t len, off_t* new_off)
@@ -717,21 +785,8 @@ ssize_t file_write_append(int inum, const char* buf, size_t len, off_t* new_off)
         return -1;
     }
 
-    uint64_t bytes_written = 0;
     uint64_t start = write_acc->file_size;
-    while (bytes_written < len)
-    {
-        uint64_t current_offset = write_acc->file_size;
-        ssize_t ret = 0;
-
-        if (write_acc->type == REGULAR && (current_offset & (BLOCK_SIZE - 1)) == 0 && len - bytes_written >= kFileBatchCopyMin)
-            ret = file_write_batch_new_blocks_locked(&*write_acc, buf + bytes_written, current_offset, len - bytes_written);
-
-        if (ret == 0) ret = file_write_scalar_locked(&*write_acc, buf + bytes_written, current_offset, len - bytes_written);
-        if (ret <= 0) break;
-        bytes_written += ret;
-        write_acc.mark_dirty();
-    }
+    ssize_t bytes_written = file_write_extend_locked(write_acc, buf, start, len);
 
     if (new_off) *new_off = start + bytes_written;
     return (bytes_written == 0 && len > 0) ? -1 : bytes_written;
@@ -756,21 +811,7 @@ static ssize_t file_write_eof_extension(int inum, const char* buf, off_t offset,
     }
     if (write_acc->type != REGULAR) return 0;
 
-    uint64_t bytes_written = 0;
-    while (bytes_written < len)
-    {
-        uint64_t current_offset = static_cast<uint64_t>(offset) + bytes_written;
-        if (current_offset != write_acc->file_size) break;
-
-        ssize_t ret = 0;
-        if ((current_offset & (BLOCK_SIZE - 1)) == 0 && len - bytes_written >= kFileBatchCopyMin)
-            ret = file_write_batch_new_blocks_locked(&*write_acc, buf + bytes_written, current_offset, len - bytes_written);
-
-        if (ret == 0) ret = file_write_scalar_locked(&*write_acc, buf + bytes_written, current_offset, len - bytes_written);
-        if (ret <= 0) break;
-        bytes_written += ret;
-        write_acc.mark_dirty();
-    }
+    ssize_t bytes_written = file_write_extend_locked(write_acc, buf, static_cast<uint64_t>(offset), len);
 
     return bytes_written;
 }
@@ -824,6 +865,7 @@ static ssize_t file_write_batch_existing(int inum, const char* buf, off_t offset
                     stop_batching = true;
                     break;
                 }
+                register_directory_data_block(&*read_acc, phys_blk);
 
                 BlockHandle bh = bc_get_handle(phys_blk);
                 if (unlikely(!bh))
@@ -842,7 +884,7 @@ static ssize_t file_write_batch_existing(int inum, const char* buf, off_t offset
             {
                 dsa_copyv_ex(vecs, vec_nr, SHAOFS_DSA_WRITE_FROM_USER);
                 for (size_t i = 0; i < batch.size(); i++)
-                    bc_mark_data_block_dirty(batch.handle(i));
+                    mark_cached_block_written(batch.handle(i), false, cached_write_dirty_mode(&*read_acc, true));
                 mark_inode_data_cache_dirty(const_cast<MInode*>(&(*read_acc)), offset + bytes_written, offset + bytes_written + batch_bytes);
             }
         }
@@ -1133,6 +1175,19 @@ ssize_t file_readv_direct(int inum, const struct iovec* iov, int iovcnt, off_t o
     return total_len;
 }
 
+static bool direct_write_one_block_locked(const char* src, BlockID phys_blk, uint32_t block_count, const char* log_prefix)
+{
+    (void)bc_flush_block(phys_blk);
+    if (storage_write_user_dma(src, phys_blk, block_count) != 0)
+    {
+        log_err("[%s] Failed to write to physical block %lu", log_prefix, phys_blk);
+        return false;
+    }
+
+    bc_invalidate_block(phys_blk);
+    return true;
+}
+
 ssize_t file_write_direct(int inum, const char* buf, off_t offset, size_t len)
 {
     if (len == 0) return 0;
@@ -1170,14 +1225,7 @@ ssize_t file_write_direct(int inum, const char* buf, off_t offset, size_t len)
                 phys_blk = inode_bmap_locked(const_cast<MInode*>(&(*read_acc)), logical_blk, false, nullptr);
                 if (phys_blk != INVALID_BLOCK_ID) 
                 {
-                    bc_flush_block(phys_blk);
-
-                    if (storage_write_user_dma(buf + bytes_written, phys_blk, copy_len / BLOCK_SIZE) != 0) 
-                    {
-                        log_err("[file_write_direct] Failed to write to physical block %lu", phys_blk);
-                        break;
-                    }
-                    bc_invalidate_block(phys_blk);
+                    if (!direct_write_one_block_locked(buf + bytes_written, phys_blk, copy_len / BLOCK_SIZE, "file_write_direct")) break;
                     use_fast_path = true;
                 }
             }
@@ -1189,8 +1237,6 @@ ssize_t file_write_direct(int inum, const char* buf, off_t offset, size_t len)
         }
 
         // Slow Path: 需要分配新块和更新 Inode 元数据，持有 Inode 写锁
-        bool is_new_block = false;
-
         {
             auto write_acc = ih.write_access();
             if (!write_acc->used) 
@@ -1199,14 +1245,11 @@ ssize_t file_write_direct(int inum, const char* buf, off_t offset, size_t len)
                 break;
             }
 
-            phys_blk = inode_bmap_locked(&*write_acc, logical_blk, true, &is_new_block);
+            phys_blk = inode_bmap_locked(&*write_acc, logical_blk, true, nullptr);
             if (phys_blk == INVALID_BLOCK_ID) break;
             if (write_acc->type == DIRECTORY) journal_register_metadata_block(phys_blk);
 
-            bc_flush_block(phys_blk);
-
-            if (storage_write_user_dma(buf + bytes_written, phys_blk, copy_len / BLOCK_SIZE) != 0) break;
-            bc_invalidate_block(phys_blk);
+            if (!direct_write_one_block_locked(buf + bytes_written, phys_blk, copy_len / BLOCK_SIZE, "file_write_direct")) break;
 
             uint64_t new_end_pos = current_offset + copy_len;
             if (new_end_pos > write_acc->file_size)
@@ -1220,5 +1263,54 @@ ssize_t file_write_direct(int inum, const char* buf, off_t offset, size_t len)
         bytes_written += copy_len;
     }
 
+    return (bytes_written == 0 && len > 0) ? -1 : bytes_written;
+}
+
+ssize_t file_write_direct_append(int inum, const char* buf, size_t len, off_t* new_off)
+{
+    if (len == 0) return 0;
+
+    InodeHandle ih = ic_get_inode(inum);
+    if (unlikely(!ih))
+    {
+        log_err("[file_write_direct_append] Failed to get inode %d from cache", inum);
+        return -1;
+    }
+
+    auto write_acc = ih.write_access();
+    if (!write_acc->used)
+    {
+        log_err("[file_write_direct_append] Inode %d is not in use", inum);
+        return -1;
+    }
+    if (write_acc->type != REGULAR) return -EINVAL;
+
+    uint64_t start = write_acc->file_size;
+    if (!user_dma_request_ok(buf, static_cast<off_t>(start), len)) return -EINVAL;
+
+    uint64_t bytes_written = 0;
+    while (bytes_written < len)
+    {
+        uint64_t current_offset = start + bytes_written;
+        uint64_t logical_blk = current_offset / BLOCK_SIZE, blk_offset  = current_offset % BLOCK_SIZE;
+        uint64_t copy_len = MIN(BLOCK_SIZE - blk_offset, len - bytes_written);
+        if (blk_offset != 0 || (copy_len % BLOCK_SIZE) != 0) break;
+
+        BlockID phys_blk = inode_bmap_locked(&*write_acc, logical_blk, true, nullptr);
+        if (phys_blk == INVALID_BLOCK_ID) break;
+
+        if (!direct_write_one_block_locked(buf + bytes_written, phys_blk, copy_len / BLOCK_SIZE, "file_write_direct_append")) break;
+
+        bytes_written += copy_len;
+        uint64_t new_end_pos = start + bytes_written;
+        if (new_end_pos > write_acc->file_size)
+        {
+            write_acc->file_size = new_end_pos;
+            mark_inode_metadata_dirty(&*write_acc);
+        }
+    }
+
+    if (bytes_written > 0) write_acc.mark_dirty();
+    if (new_off) *new_off = start + bytes_written;
     return (bytes_written == 0 && len > 0) ? -1 : bytes_written;
 }

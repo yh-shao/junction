@@ -119,31 +119,44 @@ static int shaofs_unlink_inode(int inum)
     return freed ? 0 : -EIO;
 }
 
-int my_open(const char* pathname, int flags, mode_t mode, file_type_t* type_out)
+struct OpenResult {
+    int inum;
+    file_type_t type;
+};
+
+static int open_existing_or_root(const char* pathname, OpenResult* out)
 {
-    // log_info("open(%s)", pathname);
-
-    RuntimeFSBaseGuard g;
-
-    int inum = -1;
-    file_type_t opened_type = REGULAR;
-
-    if (flags & junction::kFlagCreate)
+    if (strcmp(pathname, "/") == 0)
     {
-        char name[NAMESIZ];
-        int parent_inum = nameiparent(pathname, name);  // 查找父目录 Inode，并提取最后一级的文件名
-        if (parent_inum == -1)
-        {
-            log_err("[fs_open] Invalid path or parent directory missing: %s", pathname);
-            return -ENOENT;
-        }
+        shaofs_pin_open_inode(ROOT_INO);
+        *out = {ROOT_INO, DIRECTORY};
+        return 0;
+    }
 
-        while (true)   // retry 循环
+    char name[NAMESIZ];
+    int parent_inum = nameiparent(pathname, name);
+    if (parent_inum == -1) return -ENOENT;
+
+    file_type_t type;
+    int inum = dir_lookup_pin(parent_inum, name, &type);
+    if (inum == -1) return -ENOENT;
+
+    *out = {inum, type};
+    return 0;
+}
+
+static int create_regular_file(const char* pathname, int flags, OpenResult* out)
+{
+    char name[NAMESIZ];
+    int parent_inum = nameiparent(pathname, name);
+    if (parent_inum == -1) return -ENOENT;
+
+    while (true)
+    {
+        file_type_t type;
+        int inum = dir_lookup_pin(parent_inum, name, &type);
+        if (inum != -1)
         {
-          file_type_t type;
-          inum = dir_lookup_pin(parent_inum, name, &type);
-          if (inum != -1) // 文件已经存在于该目录中
-          {
             if (flags & junction::kFlagExclusive)
             {
                 my_close(inum);
@@ -158,95 +171,79 @@ int my_open(const char* pathname, int flags, mode_t mode, file_type_t* type_out)
                 return -EISDIR;
             }
 
-            opened_type = type;
-            break;
-          }
-          else   // 文件不存在，执行真正的创建逻辑
-          {
-            InodeHandle new_ih = ic_alloc_inode(REGULAR);  // 分配一个新的 Inode
-            if (!new_ih) 
-            {
-                log_err("[fs_open] Inode space exhausted for %s", pathname);
-                return -ENOSPC;
-            }
-            int new_inum = new_ih.read_access()->idx;
-            shaofs_pin_open_inode(new_inum);
-
-            int ret = dir_add_entry(parent_inum, name, new_inum, REGULAR);  // 将新文件注册到父目录中
-            if (ret != 0)
-            {
-                my_close(new_inum);
-                ic_free_inode(new_inum); // 回滚刚分配的 Inode
-
-                if (ret == -EEXIST)
-                {
-                  if (flags & junction::kFlagExclusive)
-                  {
-                    log_err("[fs_open] Concurrent creation conflict (O_EXCL): %s", pathname);
-                    return -EEXIST;
-                  }
-                  continue;
-                }
-
-                log_err("Fail to add dentry");
-                return ret;
-            }
-
-            inum = new_inum; // 创建成功！
-            opened_type = REGULAR;
-            // log_info("created a new file: %s", pathname);
-            break;
-          }
+            *out = {inum, type};
+            return 0;
         }
-    }
-    else   // 普通打开，不带创建语义
-    {
-        if (strcmp(pathname, "/") == 0)
+
+        InodeHandle new_ih = ic_alloc_inode(REGULAR);
+        if (!new_ih)
         {
-            inum = ROOT_INO;
-            opened_type = DIRECTORY;
-            shaofs_pin_open_inode(inum);
+            log_err("[fs_open] Inode space exhausted for %s", pathname);
+            return -ENOSPC;
         }
-        else
+
+        int new_inum = new_ih.read_access()->idx;
+        shaofs_pin_open_inode(new_inum);
+
+        int ret = dir_add_entry(parent_inum, name, new_inum, REGULAR);
+        if (ret == 0)
         {
-            char name[NAMESIZ];
-            int parent_inum = nameiparent(pathname, name);
-            if (parent_inum == -1)
-            {
-                log_err("[fs_open] Invalid path or parent directory missing: %s", pathname);
-                return -ENOENT;
-            }
-
-            file_type_t type;
-            inum = dir_lookup_pin(parent_inum, name, &type);
-            if (inum == -1)
-            {
-                log_err("[fs_open] File not found: %s", pathname);
-                return -ENOENT;
-            }
-            opened_type = type;
+            *out = {new_inum, REGULAR};
+            return 0;
         }
-    }
 
-    if ((flags & junction::kFlagDirectory) && opened_type != DIRECTORY)
+        my_close(new_inum);
+        ic_free_inode(new_inum);
+
+        if (ret == -EEXIST)
+        {
+            if (flags & junction::kFlagExclusive)
+                return -EEXIST;
+            continue;
+        }
+
+        log_err("Fail to add dentry");
+        return ret;
+    }
+}
+
+static int validate_open_type(int inum, file_type_t type, int flags)
+{
+    if ((flags & junction::kFlagDirectory) && type != DIRECTORY)
     {
         my_close(inum);
         return -ENOTDIR;
     }
-    if (opened_type == DIRECTORY && ((flags & junction::kAccessModeMask) != O_RDONLY || (flags & (junction::kFlagTruncate | junction::kFlagDirect))))
+
+    if (type == DIRECTORY && ((flags & junction::kAccessModeMask) != O_RDONLY || (flags & (junction::kFlagTruncate | junction::kFlagDirect))))
     {
         my_close(inum);
         return -EISDIR;
     }
 
-    // 处理文件截断
-    if (inum != -1 && (flags & junction::kFlagTruncate))
+    return 0;
+}
+
+int my_open(const char* pathname, int flags, mode_t mode, file_type_t* type_out)
+{
+    RuntimeFSBaseGuard g;
+    (void)mode;
+
+    OpenResult opened = {-1, REGULAR};
+    int ret = (flags & junction::kFlagCreate) ? create_regular_file(pathname, flags, &opened)
+                                              : open_existing_or_root(pathname, &opened);
+    if (ret != 0) return ret;
+
+    ret = validate_open_type(opened.inum, opened.type, flags);
+    if (ret != 0) return ret;
+
+    if (flags & junction::kFlagTruncate)
     {
-        truncate_inode(inum);
+        truncate_inode(opened.inum);
     }
 
-    if (type_out) *type_out = opened_type;
-    return inum;
+    if (type_out) *type_out = opened.type;
+    return opened.inum;
 }
 
 ssize_t my_read(int inum, void *buf, off_t* off, size_t len, bool direct)
@@ -264,14 +261,46 @@ ssize_t my_write(int inum, const void *buf, off_t* off, size_t len, bool direct,
     RuntimeFSBaseGuard g;
 
     ssize_t ret;
-    if (append && !direct)
+    if (append && direct)
+        ret = file_write_direct_append(inum, (const char*)buf, len, off);
+    else if (append)
         ret = file_write_append(inum, (const char*)buf, len, off);
     else
         ret = direct ? file_write_direct(inum, (const char*)buf, *off, len)
                      : file_write(inum, (const char*)buf, *off, len);
 
-    if (ret >= 0 && !(append && !direct)) *off += ret;
+    if (ret >= 0 && !append) *off += ret;
     return ret;
+}
+
+static void init_directory_entries(Dirent* entries, int new_inum, int parent_inum)
+{
+    memset(entries, 0, sizeof(Dirent) * 2);
+    entries[0].inum = new_inum;
+    entries[0].filetype = DIRECTORY;
+    strncpy(entries[0].name, ".", NAMESIZ);
+    entries[1].inum = parent_inum;
+    entries[1].filetype = DIRECTORY;
+    strncpy(entries[1].name, "..", NAMESIZ);
+}
+
+static void link_new_directory(const InodeHandle& new_ih, int parent_inum)
+{
+    {
+        auto write_acc = new_ih.write_access();
+        write_acc->nlink++;
+        mark_inode_metadata_dirty(&*write_acc);
+        write_acc.mark_dirty();
+    }
+
+    InodeHandle parent_ih = ic_get_inode(parent_inum);
+    if (parent_ih)
+    {
+        auto write_acc = parent_ih.write_access();
+        write_acc->nlink++;
+        mark_inode_metadata_dirty(&*write_acc);
+        write_acc.mark_dirty();
+    }
 }
 
 int my_mkdir(const char *pathname, mode_t mode)
@@ -279,14 +308,11 @@ int my_mkdir(const char *pathname, mode_t mode)
     // log_info("mkdir(%s)", pathname);
 
     RuntimeFSBaseGuard g;
+    (void)mode;
 
     char name[NAMESIZ];
-    int parent_inum = nameiparent(pathname, name);  // 解析路径，获取父目录 Inode 和目标目录名
-    if (parent_inum == -1) 
-    {
-        log_err("[my_mkdir] Invalid path or parent directory missing: %s", pathname);
-        return -1; // ENOENT
-    }
+    int parent_inum = nameiparent(pathname, name);
+    if (parent_inum == -1) return -ENOENT;
 
     file_type_t type;
     int existing_inum = dir_lookup(parent_inum, name, &type);
@@ -317,61 +343,30 @@ int my_mkdir(const char *pathname, mode_t mode)
     if (!new_ih) 
     {
         log_err("[my_mkdir] Inode space exhausted for %s", pathname);
-        return -1; // ENOSPC
+        return -ENOSPC;
     }
-    int new_inum = new_ih.read_access()->idx; // 短暂获取只读指针以读取 idx
+    int new_inum = new_ih.read_access()->idx;
 
-    // 初始化新目录的 "." 和 ".." 目录项
     Dirent entries[2];
-    memset(entries, 0, sizeof(entries));
-    entries[0].inum = new_inum;
-    entries[0].filetype = DIRECTORY;
-    strncpy(entries[0].name, ".", NAMESIZ);
-    entries[1].inum = parent_inum;
-    entries[1].filetype = DIRECTORY;
-    strncpy(entries[1].name, "..", NAMESIZ);
+    init_directory_entries(entries, new_inum, parent_inum);
 
     ssize_t written = file_write(new_inum, (const char*)entries, 0, sizeof(entries));
     if (written != sizeof(entries)) 
     {
         log_err("[my_mkdir] Failed to init . and .. for %s", pathname);
-        ic_free_inode(new_inum); // I/O 失败，回滚并销毁刚分配的 Inode
-        return -1; // EIO
+        ic_free_inode(new_inum);
+        return -EIO;
     }
 
     // 将新目录注册到父目录中
     int ret = dir_add_entry(parent_inum, name, new_inum, DIRECTORY);
-    if (ret != 0) // 如果这里返回冲突 (-EEXIST)，说明刚才短暂的间隙有其他线程抢先创建了同名文件
+    if (ret != 0)
     {
-        ic_free_inode(new_inum); // 完美回滚：销毁新建的 Inode，回收占用的物理块
+        ic_free_inode(new_inum);
         return ret;
     }
 
-    // 成功注册后，更新两者的硬链接计数 (nlink)
-    {
-        auto write_acc = new_ih.write_access();
-        write_acc->nlink++;  // 新目录的 nlink 为 2，ic_alloc_inode 默认将 nlink 设为了 1，所以这里我们只需要加 1
-        mark_inode_metadata_dirty(&*write_acc);
-        write_acc.mark_dirty();
-    }
-
-    {
-        // 父目录的 nlink 增加 1 (因为新子目录内部多了一个指向它的 "..")
-        InodeHandle parent_ih = ic_get_inode(parent_inum);
-        if (parent_ih) 
-        {
-            auto write_acc = parent_ih.write_access();
-            write_acc->nlink++;
-            mark_inode_metadata_dirty(&*write_acc);
-            write_acc.mark_dirty();
-        }
-    }
-
-    // 如果你有 Dentry Cache，可以在此处将其加入内存缓存
-    // auto& dentrycache = DentryCacheManager::instance();
-    // dentrycache.put(pathname, new_inum);
-
-    // log_info("created a new directory: %s", pathname);
+    link_new_directory(new_ih, parent_inum);
     return 0;
 }
 
@@ -482,6 +477,103 @@ int my_newfstatat(const char *pathname, struct stat *statbuf)
     return 0;
 }
 
+struct FsyncSnapshot {
+    uint64_t dirty_start;
+    uint64_t dirty_end;
+    uint64_t dirty_seq;
+    uint64_t inode_dirty_seq;
+    uint64_t inode_fsync_seq;
+    bool has_dirty_data;
+    bool need_inode_flush;
+};
+
+static int snapshot_fsync_state_locked(MInode* inode, uint64_t file_size, FsyncSnapshot* snapshot)
+{
+    snapshot->dirty_start = 0;
+    snapshot->dirty_end = 0;
+    snapshot->dirty_seq = 0;
+    snapshot->inode_dirty_seq = inode->inode_dirty_seq;
+    snapshot->inode_fsync_seq = inode->inode_fsync_seq;
+    snapshot->need_inode_flush = snapshot->inode_dirty_seq != snapshot->inode_fsync_seq;
+    snapshot->has_dirty_data = false;
+
+    {
+        SpinGuardNP dirty_g(&inode->dirty_lock);
+        snapshot->has_dirty_data = atomic_read(&inode->has_dirty_data_cache);
+        if (snapshot->has_dirty_data)
+        {
+            snapshot->dirty_start = inode->dirty_data_start;
+            snapshot->dirty_end = MIN(inode->dirty_data_end, file_size);
+            snapshot->dirty_seq = inode->dirty_data_seq;
+        }
+    }
+
+    return 0;
+}
+
+static int flush_dirty_data_runs(MInode* inode, const FsyncSnapshot& snapshot)
+{
+    if (!snapshot.has_dirty_data || snapshot.dirty_start >= snapshot.dirty_end) return 0;
+
+    BlockID first_logical = snapshot.dirty_start / BLOCK_SIZE;
+    BlockID last_logical = (snapshot.dirty_end - 1) / BLOCK_SIZE;
+    BlockID run_start = INVALID_BLOCK_ID;
+    uint32_t run_count = 0;
+
+    auto flush_run = [&]() -> bool {
+        if (run_count == 0) return true;
+        bool ok = bc_flush_blocks_contiguous(run_start, run_count);
+        run_start = INVALID_BLOCK_ID;
+        run_count = 0;
+        return ok;
+    };
+
+    for (BlockID logical = first_logical; logical <= last_logical; logical++)
+    {
+        BlockID phys_blk = inode_bmap_locked(inode, logical, false, nullptr);
+        if (phys_blk == INVALID_BLOCK_ID)
+        {
+            if (!flush_run()) return -EIO;
+            continue;
+        }
+
+        if (run_count > 0 && phys_blk == run_start + run_count && run_count < 1024)
+        {
+            run_count++;
+            continue;
+        }
+
+        if (!flush_run()) return -EIO;
+        run_start = phys_blk;
+        run_count = 1;
+    }
+
+    return flush_run() ? 0 : -EIO;
+}
+
+static int clear_dirty_if_unchanged(const InodeHandle& ih, uint64_t dirty_seq)
+{
+    auto write_acc = ih.write_access();
+    if (!write_acc->used) return -ENOENT;
+
+    SpinGuardNP dirty_g(&write_acc->dirty_lock);
+    if (write_acc->dirty_data_seq == dirty_seq)
+    {
+        write_acc->clear_dirty_data_unlocked();
+        write_acc->dirty_data_seq++;
+    }
+    return 0;
+}
+
+static int update_inode_fsync_seq_if_unchanged(const InodeHandle& ih, const FsyncSnapshot& snapshot)
+{
+    auto write_acc = ih.write_access();
+    if (!write_acc->used) return -ENOENT;
+    if (write_acc->inode_dirty_seq == snapshot.inode_dirty_seq && write_acc->inode_fsync_seq == snapshot.inode_fsync_seq)
+        write_acc->inode_fsync_seq = snapshot.inode_dirty_seq;
+    return 0;
+}
+
 int my_fsync(int inum)
 {
     RuntimeFSBaseGuard g;
@@ -489,99 +581,39 @@ int my_fsync(int inum)
     InodeHandle ih = ic_get_inode(inum);
     if (unlikely(!ih)) return -ENOENT;
 
-    uint64_t dirty_start = 0;
-    uint64_t dirty_end = 0;
-    uint64_t dirty_seq = 0;
-    uint64_t inode_dirty_seq = 0;
-    uint64_t inode_fsync_seq = 0;
-    bool has_dirty_data = false;
-    bool need_inode_flush = false;
+    FsyncSnapshot snapshot;
 
     {
         auto read_acc = ih.read_access();
         if (!read_acc->used) return -ENOENT;
-        MInode* inode_ptr = const_cast<MInode*>(&(*read_acc));
-        inode_dirty_seq = read_acc->inode_dirty_seq;
-        inode_fsync_seq = read_acc->inode_fsync_seq;
-        need_inode_flush = inode_dirty_seq != inode_fsync_seq;
+        MInode* inode = const_cast<MInode*>(&(*read_acc));
 
+        int ret = snapshot_fsync_state_locked(inode, read_acc->file_size, &snapshot);
+        if (ret != 0) return ret;
+
+        ret = flush_dirty_data_runs(inode, snapshot);
+        if (ret != 0) return ret;
+
+        if (snapshot.need_inode_flush && !inode_flush_extent_metadata(&(*read_acc)))
         {
-            SpinGuardNP dirty_g(&inode_ptr->dirty_lock);
-            has_dirty_data = atomic_read(&inode_ptr->has_dirty_data_cache);
-            if (has_dirty_data)
-            {
-                dirty_start = inode_ptr->dirty_data_start;
-                dirty_end = MIN(inode_ptr->dirty_data_end, read_acc->file_size);
-                dirty_seq = inode_ptr->dirty_data_seq;
-            }
-        }
-
-        if (has_dirty_data && dirty_start < dirty_end)
-        {
-            BlockID first_logical = dirty_start / BLOCK_SIZE;
-            BlockID last_logical = (dirty_end - 1) / BLOCK_SIZE;
-            BlockID run_start = INVALID_BLOCK_ID;
-            uint32_t run_count = 0;
-
-            auto flush_run = [&]() -> bool {
-                if (run_count == 0) return true;
-                bool ok = bc_flush_blocks_contiguous(run_start, run_count);
-                run_start = INVALID_BLOCK_ID;
-                run_count = 0;
-                return ok;
-            };
-
-            for (BlockID logical = first_logical; logical <= last_logical; logical++)
-            {
-                BlockID phys_blk = inode_bmap_locked(inode_ptr, logical, false, nullptr);
-                if (phys_blk == INVALID_BLOCK_ID)
-                {
-                    if (!flush_run()) return -EIO;
-                    continue;
-                }
-
-                if (run_count > 0 && phys_blk == run_start + run_count && run_count < 1024)
-                {
-                    run_count++;
-                    continue;
-                }
-
-                if (!flush_run()) return -EIO;
-                run_start = phys_blk;
-                run_count = 1;
-            }
-
-            if (!flush_run()) return -EIO;
-        }
-
-        if (need_inode_flush)
-        {
-            if (!inode_flush_extent_metadata(&(*read_acc))) return -EIO;
+            return -EIO;
         }
     }
 
-    if (!has_dirty_data && !need_inode_flush) return 0;
+    if (!snapshot.has_dirty_data && !snapshot.need_inode_flush) return 0;
 
-    if (has_dirty_data)
+    if (snapshot.has_dirty_data)
     {
-        auto write_acc = ih.write_access();
-        if (!write_acc->used) return -ENOENT;
-
-        SpinGuardNP dirty_g(&write_acc->dirty_lock);
-        if (write_acc->dirty_data_seq == dirty_seq)
-        {
-            write_acc->clear_dirty_data_unlocked();
-            write_acc->dirty_data_seq++;
-        }
+        int ret = clear_dirty_if_unchanged(ih, snapshot.dirty_seq);
+        if (ret != 0) return ret;
     }
 
-    if (need_inode_flush)
+    if (snapshot.need_inode_flush)
     {
         if (!ic_flush_inode(inum)) return -EIO;
 
-        auto write_acc = ih.write_access();
-        if (!write_acc->used) return -ENOENT;
-        if (write_acc->inode_dirty_seq == inode_dirty_seq && write_acc->inode_fsync_seq == inode_fsync_seq) write_acc->inode_fsync_seq = inode_dirty_seq;
+        int ret = update_inode_fsync_seq_if_unchanged(ih, snapshot);
+        if (ret != 0) return ret;
     }
 
     return 0;

@@ -60,6 +60,70 @@ static inline uint64_t next_dirty_gen()
     return __atomic_fetch_add(&global_dirty_gen, 1, __ATOMIC_SEQ_CST);
 }
 
+enum class BlockFlushPolicy {
+    kSyncWriteback,
+    kFsyncMetadataBatch,
+    kBackgroundDataWriteback,
+};
+
+static inline bool block_entry_dirty_valid(CacheEntry<BlockID, BlockData>* entry)
+{
+    return atomic_read(&entry->dirty) && atomic_read(&entry->valid);
+}
+
+static bool write_block_image(BlockID id, const void* image, BlockFlushPolicy policy)
+{
+#if CRASH_CONSISTENCY
+    if (journal_is_metadata_block(id))
+    {
+        if (policy == BlockFlushPolicy::kFsyncMetadataBatch)
+            return journal_commit_single_batched(id, image);
+        return journal_commit_single(id, image);
+    }
+#endif
+
+    if (policy == BlockFlushPolicy::kBackgroundDataWriteback)
+        return storage_write(image, id, 1) == 0;
+    return DMA_write_block(image, id);
+}
+
+static inline bool flush_policy_cleans_entry(BlockID id, BlockFlushPolicy policy)
+{
+#if CRASH_CONSISTENCY
+    if (journal_is_metadata_block(id))
+        return policy != BlockFlushPolicy::kFsyncMetadataBatch && journal_commit_returns_after_checkpoint(id);
+#else
+    (void)id;
+#endif
+    (void)policy;
+    return true;
+}
+
+static bool flush_locked_block_entry(BlockID id, CacheEntry<BlockID, BlockData>* entry, BlockFlushPolicy policy, uint64_t expected_gen = 0, bool check_gen = false)
+{
+    if (!block_entry_dirty_valid(entry)) return true;
+
+    uint64_t gen = __atomic_load_n(&entry->dirty_gen, __ATOMIC_SEQ_CST);
+    if (check_gen && gen != expected_gen) return true;
+
+    if (!write_block_image(id, entry->data.data, policy)) return false;
+
+    if (flush_policy_cleans_entry(id, policy) &&
+        (!check_gen || __atomic_load_n(&entry->dirty_gen, __ATOMIC_SEQ_CST) == expected_gen))
+        atomic_write(&entry->dirty, 0);
+    return true;
+}
+
+static bool flush_cached_block(BlockID id, BlockFlushPolicy policy)
+{
+    BlockHandle h = get_block_cache().find_cached(id);
+    if (!h) return true;
+
+    auto* entry = h.get_entry();
+    auto acc = h.read_access();
+    return flush_locked_block_entry(id, entry, policy);
+}
+
 GlobalBlockCache& get_block_cache()
 {
     if (unlikely(g_block_cache_ptr == nullptr)) 
@@ -106,32 +170,12 @@ BlockHandle bc_get_handle(BlockID id) { return bc_get_handle(id, true); }
 
 bool bc_flush_block(BlockID id)
 {
-    return get_block_cache().flush_entry(id);
+    return flush_cached_block(id, BlockFlushPolicy::kSyncWriteback);
 }
 
 bool bc_flush_block_batched(BlockID id)
 {
-
-    BlockHandle h = get_block_cache().find_cached(id);
-    if (!h) return true;
-
-    auto* entry = h.get_entry();
-    if (!atomic_read(&entry->dirty) || !atomic_read(&entry->valid)) return true;
-
-    auto acc = h.read_access();
-    if (!atomic_read(&entry->dirty) || !atomic_read(&entry->valid)) return true;
-
-#if CRASH_CONSISTENCY
-    if (journal_is_metadata_block(id))
-    {
-        if (!journal_commit_single_batched(id, acc->data)) return false;
-        return true;
-    }
-#endif
-
-    if (!DMA_write_block(static_cast<const void*>(acc->data), id)) return false;
-    atomic_write(&entry->dirty, 0);
-    return true;
+    return flush_cached_block(id, BlockFlushPolicy::kFsyncMetadataBatch);
 }
 void bc_invalidate_block(BlockID id)  {        get_block_cache().invalidate(id);  }
 void bc_flush_all()                   {        get_block_cache().flush_all();     }
@@ -204,10 +248,10 @@ bool bc_clean_block_if_unchanged(BlockID id, const void* image)
     if (!h) return true;
 
     auto* entry = h.get_entry();
-    if (!atomic_read(&entry->dirty) || !atomic_read(&entry->valid)) return true;
+    if (!block_entry_dirty_valid(entry)) return true;
 
     auto acc = h.read_access();
-    if (atomic_read(&entry->dirty) && atomic_read(&entry->valid) && memcmp(acc->data, image, BLOCK_SIZE) == 0)
+    if (block_entry_dirty_valid(entry) && memcmp(acc->data, image, BLOCK_SIZE) == 0)
         atomic_write(&entry->dirty, 0);
     return true;
 }
@@ -224,14 +268,13 @@ static bool writeback_flush_item(BlockID id, uint64_t queued_gen)
     if (!h) return true;
 
     auto* entry = h.get_entry();
-    if (!atomic_read(&entry->dirty) || !atomic_read(&entry->valid))
+    if (!block_entry_dirty_valid(entry))
     {
         atomic_write(&entry->writeback_queued, 0);
         return true;
     }
 
-    uint64_t current_gen = __atomic_load_n(&entry->dirty_gen, __ATOMIC_SEQ_CST);
-    if (current_gen != queued_gen)
+    if (__atomic_load_n(&entry->dirty_gen, __ATOMIC_SEQ_CST) != queued_gen)
     {
         atomic_write(&entry->writeback_queued, 0);
         writeback_requeue_if_dirty(entry, id);
@@ -239,16 +282,8 @@ static bool writeback_flush_item(BlockID id, uint64_t queued_gen)
     }
 
     auto acc = h.read_access();
-    if (!atomic_read(&entry->dirty) || !atomic_read(&entry->valid))
-    {
-        atomic_write(&entry->writeback_queued, 0);
-        return true;
-    }
-
-    current_gen = __atomic_load_n(&entry->dirty_gen, __ATOMIC_SEQ_CST);
-    bool ok = storage_write(acc->data, id, 1) == 0;
-    if (ok && current_gen == queued_gen && __atomic_load_n(&entry->dirty_gen, __ATOMIC_SEQ_CST) == queued_gen)
-        atomic_write(&entry->dirty, 0);
+    (void)acc;
+    bool ok = flush_locked_block_entry(id, entry, BlockFlushPolicy::kBackgroundDataWriteback, queued_gen, true);
 
     atomic_write(&entry->writeback_queued, 0);
     if (ok)
@@ -286,7 +321,7 @@ static bool writeback_flush_contiguous_run(const WritebackItem* items, uint32_t 
         }
 
         entries[i] = handles[i].get_entry();
-        if (!atomic_read(&entries[i]->dirty) || !atomic_read(&entries[i]->valid) ||
+        if (!block_entry_dirty_valid(entries[i]) ||
             __atomic_load_n(&entries[i]->dirty_gen, __ATOMIC_SEQ_CST) != items[i].gen)
         {
             for (uint32_t j = 0; j <= i; j++) handles[j] = BlockHandle();
@@ -300,7 +335,7 @@ static bool writeback_flush_contiguous_run(const WritebackItem* items, uint32_t 
     bool flushable = true;
     for (uint32_t i = 0; i < nr; i++)
     {
-        if (!atomic_read(&entries[i]->dirty) || !atomic_read(&entries[i]->valid) ||
+        if (!block_entry_dirty_valid(entries[i]) ||
             __atomic_load_n(&entries[i]->dirty_gen, __ATOMIC_SEQ_CST) != items[i].gen)
         {
             flushable = false;
@@ -321,7 +356,10 @@ static bool writeback_flush_contiguous_run(const WritebackItem* items, uint32_t 
         if (ok)
         {
             for (uint32_t i = 0; i < nr; i++)
-                atomic_write(&entries[i]->dirty, 0);
+            {
+                if (__atomic_load_n(&entries[i]->dirty_gen, __ATOMIC_SEQ_CST) == items[i].gen)
+                    atomic_write(&entries[i]->dirty, 0);
+            }
         }
     }
 
@@ -464,60 +502,88 @@ void bc_stop_writeback_and_drain()
 bool bc_flush_blocks_contiguous(BlockID start, uint32_t count)
 {
     static constexpr uint32_t kMaxBatch = 16;
-    struct StorageBlockEntryCompat { uint64_t lba; char* data; };
 
-    BlockHandle handles[kMaxBatch];
-    CacheEntry<BlockID, BlockData>* entries[kMaxBatch];
-    StorageBlockEntryCompat sgl_entries[kMaxBatch];
-    void* sgl_ptrs[kMaxBatch];
+    struct CachedFlushRun {
+        BlockID start = INVALID_BLOCK_ID;
+        uint32_t nr = 0;
+        BlockHandle handles[kMaxBatch];
+        CacheEntry<BlockID, BlockData>* entries[kMaxBatch];
+        StorageBlockEntryCompat sgl_entries[kMaxBatch];
+        void* sgl_ptrs[kMaxBatch];
 
-    uint32_t nr = 0;
-    BlockID run_start = INVALID_BLOCK_ID;
-
-    auto reset_run = [&]() {
-        for (uint32_t i = 0; i < nr; i++) handles[i] = BlockHandle();
-        nr = 0;
-        run_start = INVALID_BLOCK_ID;
-    };
-
-    auto flush_run = [&]() -> bool {
-        if (nr == 0) return true;
-
-        for (uint32_t i = 0; i < nr; i++)
-            rwmutex_rdlock(&entries[i]->rw_mtx);
-
-        bool all_valid = true;
-        bool any_dirty = false;
-        for (uint32_t i = 0; i < nr; i++)
+        void clear_handles()
         {
-            all_valid &= atomic_read(&entries[i]->valid);
-            any_dirty |= atomic_read(&entries[i]->dirty);
+            for (uint32_t i = 0; i < nr; i++) handles[i] = BlockHandle();
+            nr = 0;
+            start = INVALID_BLOCK_ID;
         }
 
-        bool ok = true;
-        if (all_valid && any_dirty)
+        void add(BlockID id, BlockHandle&& h, CacheEntry<BlockID, BlockData>* entry)
+        {
+            if (nr == 0) start = id;
+            handles[nr] = std::move(h);
+            entries[nr] = entry;
+            nr++;
+        }
+
+        void lock_entries()
+        {
+            for (uint32_t i = 0; i < nr; i++)
+                rwmutex_rdlock(&entries[i]->rw_mtx);
+        }
+
+        void unlock_entries_reverse()
+        {
+            for (uint32_t i = nr; i > 0; i--)
+                rwmutex_unlock(&entries[i - 1]->rw_mtx);
+        }
+
+        bool still_valid_and_dirty() const
+        {
+            bool all_valid = true;
+            bool any_dirty = false;
+            for (uint32_t i = 0; i < nr; i++)
+            {
+                all_valid &= atomic_read(&entries[i]->valid);
+                any_dirty |= block_entry_dirty_valid(entries[i]);
+            }
+            return all_valid && any_dirty;
+        }
+
+        bool write_locked_run()
         {
             for (uint32_t i = 0; i < nr; i++)
             {
-                sgl_entries[i] = {run_start + i, entries[i]->data.data};
+                sgl_entries[i] = {start + i, entries[i]->data.data};
                 sgl_ptrs[i] = &sgl_entries[i];
             }
 
-            ok = nr == 1 ? (storage_write(entries[0]->data.data, run_start, 1) == 0) : (write_blocks_to_disk(run_start, nr, sgl_ptrs) == 0);
-            if (ok)
+            bool ok = nr == 1 ? write_block_image(start, entries[0]->data.data, BlockFlushPolicy::kSyncWriteback)
+                              : write_blocks_to_disk(start, nr, sgl_ptrs) == 0;
+            if (!ok) return false;
+
+            for (uint32_t i = 0; i < nr; i++)
             {
-                for (uint32_t i = 0; i < nr; i++)
+                BlockID id = start + i;
+                if (flush_policy_cleans_entry(id, BlockFlushPolicy::kSyncWriteback))
                     atomic_write(&entries[i]->dirty, 0);
             }
+            return true;
         }
 
-        for (uint32_t i = nr; i > 0; i--)
-            rwmutex_unlock(&entries[i - 1]->rw_mtx);
+        bool flush()
+        {
+            if (nr == 0) return true;
 
-        if (!ok) return false;
-        reset_run();
-        return true;
-    };
+            lock_entries();
+            bool ok = !still_valid_and_dirty() || write_locked_run();
+            unlock_entries_reverse();
+
+            if (!ok) return false;
+            clear_handles();
+            return true;
+        }
+    } run;
 
     for (uint32_t i = 0; i < count; i++)
     {
@@ -526,7 +592,7 @@ bool bc_flush_blocks_contiguous(BlockID start, uint32_t count)
 #if CRASH_CONSISTENCY
         if (journal_is_metadata_block(id))
         {
-            if (!flush_run() || !bc_flush_block(id)) return false;
+            if (!run.flush() || !bc_flush_block(id)) return false;
             continue;
         }
 #endif
@@ -534,26 +600,23 @@ bool bc_flush_blocks_contiguous(BlockID start, uint32_t count)
         BlockHandle h = get_block_cache().find_cached(id);
         if (!h)
         {
-            if (!flush_run()) return false;
+            if (!run.flush()) return false;
             continue;
         }
 
         auto* entry = h.get_entry();
-        if (!atomic_read(&entry->dirty) || !atomic_read(&entry->valid))
+        if (!block_entry_dirty_valid(entry))
         {
-            if (!flush_run()) return false;
+            if (!run.flush()) return false;
             continue;
         }
 
-        if (nr == 0) run_start = id;
-        handles[nr] = std::move(h);
-        entries[nr] = entry;
-        nr++;
+        run.add(id, std::move(h), entry);
 
-        if (nr == kMaxBatch && !flush_run()) return false;
+        if (run.nr == kMaxBatch && !run.flush()) return false;
     }
 
-    return flush_run();
+    return run.flush();
 }
 
 bool bc_write_backend(BlockID id, const BlockData& value)

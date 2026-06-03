@@ -4,6 +4,7 @@
 
 #include "dir.h"
 #include "blockCache.h"
+#include "extent.h"
 #include "utili.h"
 #include <cstring>
 #include <cstdlib>
@@ -445,6 +446,34 @@ static inline void bitmap_clear_local(unsigned long* bmap, uint32_t bit)
     bmap[bit / (sizeof(unsigned long) * 8)] &= ~(1UL << (bit % (sizeof(unsigned long) * 8)));
 }
 
+template <typename T>
+class CFreeBuffer {
+    T* ptr_;
+
+public:
+    CFreeBuffer() : ptr_(nullptr) {}
+    ~CFreeBuffer() { free(ptr_); }
+
+    CFreeBuffer(const CFreeBuffer&) = delete;
+    CFreeBuffer& operator=(const CFreeBuffer&) = delete;
+
+    bool alloc_aligned(size_t bytes)
+    {
+        ptr_ = static_cast<T*>(aligned_alloc(BLOCK_SIZE, bytes));
+        return ptr_ != nullptr;
+    }
+
+    bool alloc_zeroed(size_t count)
+    {
+        ptr_ = static_cast<T*>(calloc(count, sizeof(T)));
+        return ptr_ != nullptr;
+    }
+
+    T* get() const { return ptr_; }
+    T& operator[](size_t idx) { return ptr_[idx]; }
+    const T& operator[](size_t idx) const { return ptr_[idx]; }
+};
+
 static bool group_for_data_block(BlockID block, uint32_t* gid, uint32_t* bit)
 {
     if (block < sb.group_blockstart || block >= sb.journal_blockstart) return false;
@@ -473,71 +502,39 @@ static bool mark_extent_allocated(unsigned long* group_bitmaps, uint32_t* used_c
     return true;
 }
 
-static inline bool disk_inode_uses_tree(const DInode& din)
+struct ExtentValidationCtx {
+    bool have_prev;
+    BlockID prev_logical;
+};
+
+static bool validate_disk_extent_cb(const iExtent& ext, void* arg)
 {
-    return din.valid_extent_count > LEGACY_MAX_EXTENT_NUM;
+    ExtentValidationCtx* ctx = static_cast<ExtentValidationCtx*>(arg);
+    if (ext.block_count == 0) return false;
+    uint32_t gid, bit;
+    if (!group_for_data_block(ext.physical_start, &gid, &bit)) return false;
+    if (!group_for_data_block(ext.physical_start + ext.block_count - 1, &gid, &bit)) return false;
+    if (ctx->have_prev && ext.logical_start <= ctx->prev_logical) return false;
+    ctx->have_prev = true;
+    ctx->prev_logical = ext.logical_start;
+    return true;
 }
 
-static inline bool disk_root_valid(const ExtentTreeHeader* hdr)
+struct MetadataBlockValidationCtx {
+    bool skip_root;
+};
+
+static bool validate_metadata_block_cb(BlockID block, void* arg)
 {
-    return hdr->magic == EXTENT_TREE_ROOT_MAGIC && hdr->version == EXTENT_TREE_VERSION && hdr->leaf_count <= EXTENT_TREE_ROOT_REFS && hdr->indirect_extent_count <= (uint32_t)EXTENT_TREE_ROOT_REFS * (uint32_t)EXTENT_TREE_LEAF_EXTENTS;
-}
-
-static inline bool disk_leaf_valid(const ExtentLeafHeader* hdr)
-{
-    return hdr->magic == EXTENT_TREE_LEAF_MAGIC && hdr->version == EXTENT_TREE_VERSION && hdr->extent_count <= EXTENT_TREE_LEAF_EXTENTS;
-}
-
-static inline const ExtentLeafRef* disk_root_refs(const void* data)
-{
-    return reinterpret_cast<const ExtentLeafRef*>(static_cast<const char*>(data) + sizeof(ExtentTreeHeader));
-}
-
-static inline const iExtent* disk_leaf_extents(const void* data)
-{
-    return reinterpret_cast<const iExtent*>(static_cast<const char*>(data) + sizeof(ExtentLeafHeader));
-}
-
-static bool validate_tree_inode(const DInode& din)
-{
-    if (din.indirect_extent_block == 0) return false;
-
-    alignas(BLOCK_SIZE) char root_block[BLOCK_SIZE];
-    if (storage_read(root_block, din.indirect_extent_block, 1) != 0) return false;
-
-    const ExtentTreeHeader* hdr = reinterpret_cast<const ExtentTreeHeader*>(root_block);
-    if (!disk_root_valid(hdr)) return false;
-    if (hdr->indirect_extent_count != din.valid_extent_count - DIRECT_EXTENT_NUM) return false;
-
-    const ExtentLeafRef* refs = disk_root_refs(root_block);
-    uint32_t seen = 0;
-    BlockID prev_logical = 0;
-    for (uint32_t r = 0; r < hdr->leaf_count; r++)
+    MetadataBlockValidationCtx* ctx = static_cast<MetadataBlockValidationCtx*>(arg);
+    if (ctx && ctx->skip_root)
     {
-        uint32_t gid, bit;
-        if (!group_for_data_block(refs[r].leaf_block, &gid, &bit)) return false;
-        if (r > 0 && refs[r].logical_start <= prev_logical) return false;
-        prev_logical = refs[r].logical_start;
-
-        alignas(BLOCK_SIZE) char leaf_block[BLOCK_SIZE];
-        if (storage_read(leaf_block, refs[r].leaf_block, 1) != 0) return false;
-
-        const ExtentLeafHeader* leaf = reinterpret_cast<const ExtentLeafHeader*>(leaf_block);
-        if (!disk_leaf_valid(leaf) || leaf->extent_count != refs[r].extent_count || leaf->extent_count == 0) return false;
-        const iExtent* exts = disk_leaf_extents(leaf_block);
-        if (exts[0].logical_start != refs[r].logical_start) return false;
-        for (uint32_t i = 0; i < leaf->extent_count; i++)
-        {
-            if (exts[i].block_count == 0) return false;
-            uint32_t tmp_gid, tmp_bit;
-            if (!group_for_data_block(exts[i].physical_start, &tmp_gid, &tmp_bit)) return false;
-            if (!group_for_data_block(exts[i].physical_start + exts[i].block_count - 1, &tmp_gid, &tmp_bit)) return false;
-            if (i > 0 && exts[i].logical_start <= exts[i - 1].logical_start) return false;
-        }
-        seen += leaf->extent_count;
+        ctx->skip_root = false;
+        return true;
     }
 
-    return seen == hdr->indirect_extent_count;
+    uint32_t gid, bit;
+    return group_for_data_block(block, &gid, &bit);
 }
 
 static bool inode_extent_valid(const DInode& din)
@@ -552,8 +549,12 @@ static bool inode_extent_valid(const DInode& din)
         if (!group_for_data_block(ext.physical_start, &gid, &bit)) return false;
         if (!group_for_data_block(ext.physical_start + ext.block_count - 1, &gid, &bit)) return false;
     }
-    if (disk_inode_uses_tree(din)) return validate_tree_inode(din);
-    return true;
+    if (din.valid_extent_count > DIRECT_EXTENT_NUM && din.indirect_extent_block == 0) return false;
+
+    ExtentValidationCtx ctx = {};
+    if (!disk_inode_for_each_extent(&din, false, validate_disk_extent_cb, &ctx)) return false;
+    MetadataBlockValidationCtx meta_ctx = { .skip_root = true };
+    return disk_inode_for_each_extent_metadata_block(&din, validate_metadata_block_cb, &meta_ctx);
 }
 
 static bool inode_is_live(const DInode* inodes, uint32_t inum)
@@ -588,41 +589,76 @@ static bool scrub_directory_block(BlockID block, const DInode* inodes)
     return !changed || journal_commit_single(block, buf);
 }
 
-static bool repair_filesystem_state()
+struct RepairAllocCtx {
+    unsigned long* group_bitmaps;
+    uint32_t* used_counts;
+};
+
+static bool mark_disk_extent_allocated_cb(const iExtent& ext, void* arg)
 {
-    DInode* inodes = static_cast<DInode*>(aligned_alloc(BLOCK_SIZE, sb.itable_blocknum * BLOCK_SIZE));
-    if (inodes == nullptr) return false;
-    if (storage_read(inodes, sb.itable_blockstart, sb.itable_blocknum) != 0) 
+    RepairAllocCtx* ctx = static_cast<RepairAllocCtx*>(arg);
+    return mark_extent_allocated(ctx->group_bitmaps, ctx->used_counts, ext);
+}
+
+struct RepairMetadataAllocCtx {
+    RepairAllocCtx* alloc;
+    bool skip_root;
+};
+
+static bool mark_extent_metadata_allocated_cb(BlockID block, void* arg)
+{
+    RepairMetadataAllocCtx* ctx = static_cast<RepairMetadataAllocCtx*>(arg);
+    if (ctx->skip_root)
     {
-        free(inodes);
-        return false;
+        ctx->skip_root = false;
+        return true;
     }
 
-    size_t imap_bytes = sb.imap_blocknum * BLOCK_SIZE;
-    unsigned long* new_imap = static_cast<unsigned long*>(aligned_alloc(BLOCK_SIZE, imap_bytes));
-    if (new_imap == nullptr) 
-    {
-        free(inodes);
-        return false;
-    }
-    memset(new_imap, 0, imap_bytes);
+    iExtent meta_ext = { .logical_start = 0, .physical_start = block, .block_count = 1 };
+    return mark_extent_allocated(ctx->alloc->group_bitmaps, ctx->alloc->used_counts, meta_ext);
+}
 
-    size_t gmap_longs_per_group = BLOCK_SIZE / sizeof(unsigned long);
-    unsigned long* group_bitmaps = static_cast<unsigned long*>(aligned_alloc(BLOCK_SIZE, (uint64_t)sb.group_num * BLOCK_SIZE));
-    uint32_t* used_counts = static_cast<uint32_t*>(calloc(sb.group_num, sizeof(uint32_t)));
-    GroupDescriptor* gdt = static_cast<GroupDescriptor*>(aligned_alloc(BLOCK_SIZE, sb.gdt_blocknum * BLOCK_SIZE));
-    if (group_bitmaps == nullptr || used_counts == nullptr || gdt == nullptr) 
-    {
-        free(gdt);
-        free(used_counts);
-        free(group_bitmaps);
-        free(new_imap);
-        free(inodes);
-        return false;
-    }
-    memset(group_bitmaps, 0, (uint64_t)sb.group_num * BLOCK_SIZE);
-    memset(gdt, 0, sb.gdt_blocknum * BLOCK_SIZE);
+struct MetadataBlockRegisterCtx {
+    bool skip_root;
+};
 
+static bool register_metadata_block_cb(BlockID block, void* arg)
+{
+    MetadataBlockRegisterCtx* ctx = static_cast<MetadataBlockRegisterCtx*>(arg);
+    if (ctx && ctx->skip_root)
+    {
+        ctx->skip_root = false;
+        return true;
+    }
+
+    journal_register_metadata_block(block);
+    return true;
+}
+
+static bool register_dir_data_extent_cb(const iExtent& ext, void*)
+{
+    journal_register_metadata_extent(ext.physical_start, ext.block_count);
+    return true;
+}
+
+static bool scrub_dir_extent_cb(const iExtent& ext, void* arg)
+{
+    const DInode* inodes = static_cast<const DInode*>(arg);
+    for (uint64_t b = 0; b < ext.block_count; ++b)
+        scrub_directory_block(ext.physical_start + b, inodes);
+    return true;
+}
+
+static bool repair_load_inode_table(DInode* inodes)
+{
+    return storage_read(inodes, sb.itable_blockstart, sb.itable_blocknum) == 0;
+}
+
+static bool repair_rebuild_allocation_maps(DInode* inodes,
+                                           unsigned long* new_imap,
+                                           unsigned long* group_bitmaps,
+                                           uint32_t* used_counts)
+{
     for (uint32_t inum = 0; inum < sb.inode_num; ++inum) 
     {
         DInode& din = inodes[inum];
@@ -637,116 +673,183 @@ static bool repair_filesystem_state()
 
         bitmap_set_local(new_imap, inum);
 
-        uint32_t direct_count = MIN(din.valid_extent_count, (uint32_t)DIRECT_EXTENT_NUM);
-        for (uint32_t i = 0; i < direct_count; ++i)
-            mark_extent_allocated(group_bitmaps, used_counts, din.direct_extents[i]);
-
-        if (din.valid_extent_count > DIRECT_EXTENT_NUM && din.indirect_extent_block != 0) 
-        {
-            if (disk_inode_uses_tree(din))
-            {
-                alignas(BLOCK_SIZE) char root_block[BLOCK_SIZE];
-                if (storage_read(root_block, din.indirect_extent_block, 1) == 0)
-                {
-                    const ExtentTreeHeader* hdr = reinterpret_cast<const ExtentTreeHeader*>(root_block);
-                    const ExtentLeafRef* refs = disk_root_refs(root_block);
-                    for (uint32_t r = 0; disk_root_valid(hdr) && r < hdr->leaf_count; r++)
-                    {
-                        iExtent meta_ext = { .logical_start = 0, .physical_start = refs[r].leaf_block, .block_count = 1 };
-                        mark_extent_allocated(group_bitmaps, used_counts, meta_ext);
-
-                        alignas(BLOCK_SIZE) char leaf_block[BLOCK_SIZE];
-                        if (storage_read(leaf_block, refs[r].leaf_block, 1) != 0) continue;
-                        const ExtentLeafHeader* leaf = reinterpret_cast<const ExtentLeafHeader*>(leaf_block);
-                        if (!disk_leaf_valid(leaf)) continue;
-                        const iExtent* exts = disk_leaf_extents(leaf_block);
-                        for (uint32_t i = 0; i < leaf->extent_count; i++)
-                            mark_extent_allocated(group_bitmaps, used_counts, exts[i]);
-                    }
-                }
-            }
-            else
-            {
-                iExtent* ind = static_cast<iExtent*>(aligned_alloc(BLOCK_SIZE, BLOCK_SIZE));
-                if (ind && storage_read(ind, din.indirect_extent_block, 1) == 0)
-                {
-                    uint32_t indirect_count = din.valid_extent_count - direct_count;
-                    for (uint32_t i = 0; i < indirect_count && i < EXTENTS_PER_BLOCK; ++i)
-                        mark_extent_allocated(group_bitmaps, used_counts, ind[i]);
-                }
-                free(ind);
-            }
-        }
+        RepairAllocCtx alloc_ctx = { .group_bitmaps = group_bitmaps, .used_counts = used_counts };
+        if (!disk_inode_for_each_extent(&din, true, mark_disk_extent_allocated_cb, &alloc_ctx)) return false;
+        RepairMetadataAllocCtx meta_alloc_ctx = { .alloc = &alloc_ctx, .skip_root = true };
+        if (!disk_inode_for_each_extent_metadata_block(&din, mark_extent_metadata_allocated_cb, &meta_alloc_ctx)) return false;
     }
+    return true;
+}
 
+static bool repair_register_and_scrub_directories(DInode* inodes)
+{
     for (uint32_t inum = 0; inum < sb.inode_num; ++inum) 
     {
         const DInode& din = inodes[inum];
         if (!din.used || din.type != DIRECTORY) continue;
 
-        uint32_t direct_count = MIN(din.valid_extent_count, (uint32_t)DIRECT_EXTENT_NUM);
-        for (uint32_t i = 0; i < direct_count; ++i)
-            journal_register_metadata_extent(din.direct_extents[i].physical_start, din.direct_extents[i].block_count);
-
-        if (disk_inode_uses_tree(din) && din.indirect_extent_block != 0)
-        {
-            alignas(BLOCK_SIZE) char root_block[BLOCK_SIZE];
-            if (storage_read(root_block, din.indirect_extent_block, 1) == 0)
-            {
-                const ExtentTreeHeader* hdr = reinterpret_cast<const ExtentTreeHeader*>(root_block);
-                const ExtentLeafRef* refs = disk_root_refs(root_block);
-                for (uint32_t r = 0; disk_root_valid(hdr) && r < hdr->leaf_count; r++)
-                {
-                    journal_register_metadata_block(refs[r].leaf_block);
-                    alignas(BLOCK_SIZE) char leaf_block[BLOCK_SIZE];
-                    if (storage_read(leaf_block, refs[r].leaf_block, 1) != 0) continue;
-                    const ExtentLeafHeader* leaf = reinterpret_cast<const ExtentLeafHeader*>(leaf_block);
-                    if (!disk_leaf_valid(leaf)) continue;
-                    const iExtent* exts = disk_leaf_extents(leaf_block);
-                    for (uint32_t e = 0; e < leaf->extent_count; e++)
-                        journal_register_metadata_extent(exts[e].physical_start, exts[e].block_count);
-                }
-            }
-        }
-
-        for (uint32_t i = 0; i < direct_count; ++i) 
-        {
-            const iExtent& ext = din.direct_extents[i];
-            for (uint64_t b = 0; b < ext.block_count; ++b)
-                scrub_directory_block(ext.physical_start + b, inodes);
-        }
+        MetadataBlockRegisterCtx meta_reg_ctx = { .skip_root = true };
+        if (!disk_inode_for_each_extent_metadata_block(&din, register_metadata_block_cb, &meta_reg_ctx)) return false;
+        if (!disk_inode_for_each_extent(&din, true, register_dir_data_extent_cb, nullptr)) return false;
+        if (!disk_inode_for_each_extent(&din, true, scrub_dir_extent_cb, inodes)) return false;
     }
+    return true;
+}
 
-    if (!journal_write_metadata(new_imap, imap_bytes, sb.imap_blockstart, 0)) goto fail;
+static bool repair_write_back_state(const DInode* inodes,
+                                    const unsigned long* new_imap,
+                                    size_t imap_bytes,
+                                    const unsigned long* group_bitmaps,
+                                    const uint32_t* used_counts,
+                                    GroupDescriptor* gdt)
+{
+    size_t gmap_longs_per_group = BLOCK_SIZE / sizeof(unsigned long);
+    if (!journal_write_metadata(new_imap, imap_bytes, sb.imap_blockstart, 0)) return false;
 
     for (uint32_t gid = 0; gid < sb.group_num; ++gid) 
     {
         BlockID bitmap_lba = sb.group_blockstart + (uint64_t)gid * TOTALBLOCKS_PERGROUP;
-        unsigned long* bmap = group_bitmaps + (uint64_t)gid * gmap_longs_per_group;
-        if (!journal_commit_single(bitmap_lba, bmap)) goto fail;
+        const unsigned long* bmap = group_bitmaps + (uint64_t)gid * gmap_longs_per_group;
+        if (!journal_commit_single(bitmap_lba, bmap)) return false;
 
         gdt[gid].free_blocks_count = DATABLOCKS_PERGROUP - used_counts[gid];
         gdt[gid].next_free_hint = 0;
         while (gdt[gid].next_free_hint < DATABLOCKS_PERGROUP && bitmap_test_local(bmap, gdt[gid].next_free_hint)) gdt[gid].next_free_hint++;
         if (gdt[gid].next_free_hint >= DATABLOCKS_PERGROUP) gdt[gid].next_free_hint = 0;
     }
-    if (!journal_write_metadata(gdt, sb.group_num * sizeof(GroupDescriptor), sb.gdt_blockstart, 0)) goto fail;
-    if (!journal_write_metadata(inodes, sb.itable_blocknum * BLOCK_SIZE, sb.itable_blockstart, 0)) goto fail;
+    if (!journal_write_metadata(gdt, sb.group_num * sizeof(GroupDescriptor), sb.gdt_blockstart, 0)) return false;
+    return journal_write_metadata(inodes, sb.itable_blocknum * BLOCK_SIZE, sb.itable_blockstart, 0);
+}
 
-    free(gdt);
-    free(used_counts);
-    free(group_bitmaps);
-    free(new_imap);
-    free(inodes);
+static bool repair_filesystem_state()
+{
+    size_t imap_bytes = sb.imap_blocknum * BLOCK_SIZE;
+    size_t inode_bytes = sb.itable_blocknum * BLOCK_SIZE;
+    size_t group_bitmap_bytes = (uint64_t)sb.group_num * BLOCK_SIZE;
+    size_t gdt_bytes = sb.gdt_blocknum * BLOCK_SIZE;
+
+    CFreeBuffer<DInode> inodes;
+    CFreeBuffer<unsigned long> new_imap;
+    CFreeBuffer<unsigned long> group_bitmaps;
+    CFreeBuffer<uint32_t> used_counts;
+    CFreeBuffer<GroupDescriptor> gdt;
+
+    if (!inodes.alloc_aligned(inode_bytes)) return false;
+    if (!repair_load_inode_table(inodes.get())) return false;
+
+    if (!new_imap.alloc_aligned(imap_bytes)) return false;
+    if (!group_bitmaps.alloc_aligned(group_bitmap_bytes)) return false;
+    if (!used_counts.alloc_zeroed(sb.group_num)) return false;
+    if (!gdt.alloc_aligned(gdt_bytes)) return false;
+    memset(new_imap.get(), 0, imap_bytes);
+    memset(group_bitmaps.get(), 0, group_bitmap_bytes);
+    memset(gdt.get(), 0, gdt_bytes);
+
+    return repair_rebuild_allocation_maps(inodes.get(), new_imap.get(), group_bitmaps.get(), used_counts.get()) &&
+           repair_register_and_scrub_directories(inodes.get()) &&
+           repair_write_back_state(inodes.get(), new_imap.get(), imap_bytes, group_bitmaps.get(), used_counts.get(), gdt.get());
+}
+
+struct ReplayTxn {
+    BlockID header_lba;
+    JournalHeader hdr;
+    JournalEntry entries[kMaxJournalEntries];
+};
+
+enum class JournalSlotClass {
+    kEmpty,
+    kCommitted,
+    kClearedNeedsRepair,
+    kFatal,
+};
+
+static JournalSlotClass classify_journal_slot(uint32_t slot, ReplayTxn* txn)
+{
+    BlockID header_lba = journal_slot_base(slot);
+    JournalHeader hdr;
+    JournalEntry entries[kMaxJournalEntries];
+    if (!read_header_at(header_lba, &hdr, entries)) return JournalSlotClass::kFatal;
+    if (hdr.magic == 0 || hdr.state == kJournalEmpty) return JournalSlotClass::kEmpty;
+
+    if (hdr.magic != kJournalMagic || hdr.version != kJournalVersion) 
+    {
+        log_warn("[journal] unknown journal header slot=%u magic=0x%x version=%u, clearing", slot, hdr.magic, hdr.version);
+        return write_zero_block(header_lba) ? JournalSlotClass::kClearedNeedsRepair : JournalSlotClass::kFatal;
+    }
+
+    if (hdr.entry_count == 0 || hdr.entry_count > kMaxJournalEntries)
+    {
+        log_warn("[journal] invalid entry_count=%u in slot=%u, clearing header", hdr.entry_count, slot);
+        return write_zero_block(header_lba) ? JournalSlotClass::kClearedNeedsRepair : JournalSlotClass::kFatal;
+    }
+
+    if (hdr.checksum != header_checksum(hdr, entries)) 
+    {
+        log_warn("[journal] incomplete or torn transaction in slot=%u, clearing header", slot);
+        return write_zero_block(header_lba) ? JournalSlotClass::kClearedNeedsRepair : JournalSlotClass::kFatal;
+    }
+
+    if (hdr.state == kJournalCommitted) 
+    {
+        txn->header_lba = header_lba;
+        txn->hdr = hdr;
+        memcpy(txn->entries, entries, sizeof(entries));
+        return JournalSlotClass::kCommitted;
+    }
+
+    log_warn("[journal] uncommitted transaction state=%u in slot=%u, clearing", hdr.state, slot);
+    return write_zero_block(header_lba) ? JournalSlotClass::kClearedNeedsRepair : JournalSlotClass::kFatal;
+}
+
+static bool collect_replay_transactions(ReplayTxn* txns, uint32_t* txn_count, bool* needs_repair)
+{
+    *txn_count = 0;
+    for (uint32_t slot = 0; slot < journal_slot_count; slot++)
+    {
+        ReplayTxn txn = {};
+        switch (classify_journal_slot(slot, &txn))
+        {
+          case JournalSlotClass::kEmpty:
+            break;
+          case JournalSlotClass::kCommitted:
+            txns[(*txn_count)++] = txn;
+            *needs_repair = true;
+            break;
+          case JournalSlotClass::kClearedNeedsRepair:
+            *needs_repair = true;
+            break;
+          case JournalSlotClass::kFatal:
+            return false;
+        }
+    }
     return true;
+}
 
-fail:
-    free(gdt);
-    free(used_counts);
-    free(group_bitmaps);
-    free(new_imap);
-    free(inodes);
-    return false;
+static bool replay_transactions(ReplayTxn* txns, uint32_t txn_count, uint64_t* max_replayed_seq)
+{
+    std::sort(txns, txns + txn_count, [](const ReplayTxn& a, const ReplayTxn& b) {
+        return a.hdr.seq < b.hdr.seq;
+    });
+
+    *max_replayed_seq = 0;
+    for (uint32_t i = 0; i < txn_count; i++)
+    {
+        log_info("[journal] replaying txn seq=%lu blocks=%u", txns[i].hdr.seq, txns[i].hdr.entry_count);
+        if (!replay_committed(txns[i].header_lba, txns[i].hdr, txns[i].entries)) return false;
+        if (txns[i].hdr.seq > *max_replayed_seq) *max_replayed_seq = txns[i].hdr.seq;
+        if (txns[i].hdr.seq >= journal_seq) journal_seq = txns[i].hdr.seq + 1;
+    }
+    return true;
+}
+
+static bool clear_slots_before_next_live(uint64_t max_replayed_seq)
+{
+    if (max_replayed_seq == 0 || journal_slot_count == 0) return true;
+
+    uint32_t oldest_live_slot = journal_slot_from_seq(max_replayed_seq + 1);
+    for (uint32_t slot = 0; slot < oldest_live_slot; slot++)
+        if (!write_zero_block(journal_slot_base(slot))) return false;
+    return true;
 }
 
 void journal_init()
@@ -786,75 +889,14 @@ bool journal_recover()
     if (!read_block_header(mount_state_lba(), &mount_hdr)) return false;
     bool needs_repair = mount_hdr.magic == kJournalMagic && mount_hdr.version == kJournalVersion && mount_hdr.state == kJournalDirty;
 
-    struct ReplayTxn {
-        BlockID header_lba;
-        JournalHeader hdr;
-        JournalEntry entries[kMaxJournalEntries];
-    };
     ReplayTxn txns[kMaxJournalSlots];
     uint32_t txn_count = 0;
-
-    for (uint32_t slot = 0; slot < journal_slot_count; slot++)
-    {
-        BlockID header_lba = journal_slot_base(slot);
-        JournalHeader hdr;
-        JournalEntry entries[kMaxJournalEntries];
-        if (!read_header_at(header_lba, &hdr, entries)) return false;
-        if (hdr.magic == 0 || hdr.state == kJournalEmpty) continue;
-
-        if (hdr.magic != kJournalMagic || hdr.version != kJournalVersion) 
-        {
-            log_warn("[journal] unknown journal header slot=%u magic=0x%x version=%u, clearing", slot, hdr.magic, hdr.version);
-            if (!write_zero_block(header_lba)) return false;
-            needs_repair = true;
-        } 
-        else if (hdr.entry_count == 0 || hdr.entry_count > kMaxJournalEntries)
-        {
-            log_warn("[journal] invalid entry_count=%u in slot=%u, clearing header", hdr.entry_count, slot);
-            if (!write_zero_block(header_lba)) return false;
-            needs_repair = true;
-        } 
-        else if (hdr.checksum != header_checksum(hdr, entries)) 
-        {
-            log_warn("[journal] incomplete or torn transaction in slot=%u, clearing header", slot);
-            if (!write_zero_block(header_lba)) return false;
-            needs_repair = true;
-        } 
-        else if (hdr.state == kJournalCommitted) 
-        {
-            txns[txn_count].header_lba = header_lba;
-            txns[txn_count].hdr = hdr;
-            memcpy(txns[txn_count].entries, entries, sizeof(entries));
-            txn_count++;
-            needs_repair = true;
-        } 
-        else 
-        {
-            log_warn("[journal] uncommitted transaction state=%u in slot=%u, clearing", hdr.state, slot);
-            if (!write_zero_block(header_lba)) return false;
-            needs_repair = true;
-        }
-    }
-
-    std::sort(txns, txns + txn_count, [](const ReplayTxn& a, const ReplayTxn& b) {
-        return a.hdr.seq < b.hdr.seq;
-    });
+    if (!collect_replay_transactions(txns, &txn_count, &needs_repair)) return false;
 
     uint64_t max_replayed_seq = 0;
-    for (uint32_t i = 0; i < txn_count; i++)
-    {
-        log_info("[journal] replaying txn seq=%lu blocks=%u", txns[i].hdr.seq, txns[i].hdr.entry_count);
-        if (!replay_committed(txns[i].header_lba, txns[i].hdr, txns[i].entries)) return false;
-        if (txns[i].hdr.seq > max_replayed_seq) max_replayed_seq = txns[i].hdr.seq;
-        if (txns[i].hdr.seq >= journal_seq) journal_seq = txns[i].hdr.seq + 1;
-    }
+    if (!replay_transactions(txns, txn_count, &max_replayed_seq)) return false;
 
-    if (max_replayed_seq != 0 && journal_slot_count != 0)
-    {
-        uint32_t oldest_live_slot = journal_slot_from_seq(max_replayed_seq + 1);
-        for (uint32_t slot = 0; slot < oldest_live_slot; slot++)
-            if (!write_zero_block(journal_slot_base(slot))) return false;
-    }
+    if (!clear_slots_before_next_live(max_replayed_seq)) return false;
 
     if (needs_repair) 
     {
@@ -1266,52 +1308,11 @@ void journal_build_metadata_map()
             if (!din.used) continue;
             const bool is_dir = din.type == DIRECTORY;
 
-            uint32_t direct_count = MIN(din.valid_extent_count, (uint32_t)DIRECT_EXTENT_NUM);
+            MetadataBlockRegisterCtx meta_reg_ctx = { .skip_root = true };
+            disk_inode_for_each_extent_metadata_block(&din, register_metadata_block_cb, &meta_reg_ctx);
+
             if (is_dir)
-            {
-                for (uint32_t e = 0; e < direct_count; ++e)
-                    journal_register_metadata_extent(din.direct_extents[e].physical_start, din.direct_extents[e].block_count);
-            }
-
-            if (din.valid_extent_count > DIRECT_EXTENT_NUM && din.indirect_extent_block != 0) 
-            {
-                if (disk_inode_uses_tree(din))
-                {
-                    alignas(BLOCK_SIZE) char root_block[BLOCK_SIZE];
-                    if (storage_read(root_block, din.indirect_extent_block, 1) == 0)
-                    {
-                        const ExtentTreeHeader* hdr = reinterpret_cast<const ExtentTreeHeader*>(root_block);
-                        const ExtentLeafRef* refs = disk_root_refs(root_block);
-                        for (uint32_t r = 0; disk_root_valid(hdr) && r < hdr->leaf_count; r++)
-                        {
-                            journal_register_metadata_block(refs[r].leaf_block);
-                            if (!is_dir) continue;
-
-                            alignas(BLOCK_SIZE) char leaf_block[BLOCK_SIZE];
-                            if (storage_read(leaf_block, refs[r].leaf_block, 1) != 0) continue;
-                            const ExtentLeafHeader* leaf = reinterpret_cast<const ExtentLeafHeader*>(leaf_block);
-                            if (!disk_leaf_valid(leaf)) continue;
-                            const iExtent* exts = disk_leaf_extents(leaf_block);
-                            for (uint32_t e = 0; e < leaf->extent_count; ++e)
-                                journal_register_metadata_extent(exts[e].physical_start, exts[e].block_count);
-                        }
-                    }
-                }
-                else
-                {
-                    if (!is_dir) continue;
-
-                    iExtent* ind = static_cast<iExtent*>(aligned_alloc(BLOCK_SIZE, BLOCK_SIZE));
-                    if (ind == nullptr) continue;
-                    if (storage_read(ind, din.indirect_extent_block, 1) == 0)
-                    {
-                        uint32_t indirect_count = din.valid_extent_count - direct_count;
-                        for (uint32_t e = 0; e < indirect_count && e < EXTENTS_PER_BLOCK; ++e)
-                            journal_register_metadata_extent(ind[e].physical_start, ind[e].block_count);
-                    }
-                    free(ind);
-                }
-            }
+                disk_inode_for_each_extent(&din, true, register_dir_data_extent_cb, nullptr);
         }
     }
 

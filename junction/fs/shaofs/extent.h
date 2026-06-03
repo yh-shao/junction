@@ -10,6 +10,8 @@ bool inode_lookup_extent_locked(MInode* inode_ptr, BlockID logical_blk, iExtent*
 int inode_append_run_locked(MInode* inode_ptr, BlockID logical_start, int max_blocks, BlockID* out_blocks);
 bool inode_for_each_extent(const MInode* inode, bool include_direct, bool (*cb)(const iExtent&, void*), void* arg);
 bool inode_for_each_extent_metadata_block(const MInode* inode, bool (*cb)(BlockID, void*), void* arg);
+bool disk_inode_for_each_extent(const DInode* inode, bool include_direct, bool (*cb)(const iExtent&, void*), void* arg);
+bool disk_inode_for_each_extent_metadata_block(const DInode* inode, bool (*cb)(BlockID, void*), void* arg);
 bool inode_flush_extent_metadata(const MInode* inode);
 bool inode_free_extent_metadata(MInode* inode);
 bool inode_drain_deferred_extent_frees();

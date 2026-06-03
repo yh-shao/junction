@@ -949,6 +949,59 @@ bool inode_for_each_extent(const MInode* inode, bool include_direct, bool (*cb)(
     return true;
 }
 
+bool disk_inode_for_each_extent(const DInode* inode, bool include_direct, bool (*cb)(const iExtent&, void*), void* arg)
+{
+    if (!inode || !cb) return false;
+
+    uint32_t direct_cnt = direct_extent_count(inode);
+    if (include_direct)
+    {
+        for (uint32_t i = 0; i < direct_cnt; i++)
+            if (!cb(inode->direct_extents[i], arg)) return false;
+    }
+
+    if (!uses_indirect_block(inode)) return true;
+    if (inode->indirect_extent_block == 0) return false;
+
+    alignas(BLOCK_SIZE) char root_block[BLOCK_SIZE];
+    if (storage_read(root_block, inode->indirect_extent_block, 1) != 0) return false;
+
+    if (!uses_extent_tree(inode))
+    {
+        const iExtent* exts = reinterpret_cast<const iExtent*>(root_block);
+        uint32_t cnt = legacy_indirect_extent_count(inode);
+        for (uint32_t i = 0; i < cnt; i++)
+            if (!cb(exts[i], arg)) return false;
+        return true;
+    }
+
+    const ExtentTreeHeader* hdr = tree_header(root_block);
+    if (!root_valid(hdr) || hdr->indirect_extent_count != inode->valid_extent_count - DIRECT_EXTENT_NUM) return false;
+
+    const ExtentLeafRef* refs = tree_refs(root_block);
+    uint32_t seen = 0;
+    BlockID prev_ref_logical = 0;
+    for (uint32_t r = 0; r < hdr->leaf_count; r++)
+    {
+        if (r > 0 && refs[r].logical_start <= prev_ref_logical) return false;
+        prev_ref_logical = refs[r].logical_start;
+
+        alignas(BLOCK_SIZE) char leaf_block[BLOCK_SIZE];
+        if (storage_read(leaf_block, refs[r].leaf_block, 1) != 0) return false;
+
+        const ExtentLeafHeader* leaf = leaf_header(leaf_block);
+        if (!leaf_valid(leaf) || leaf->extent_count != refs[r].extent_count || leaf->extent_count == 0) return false;
+
+        const iExtent* exts = leaf_extents(leaf_block);
+        if (exts[0].logical_start != refs[r].logical_start) return false;
+        for (uint32_t i = 0; i < leaf->extent_count; i++)
+            if (!cb(exts[i], arg)) return false;
+        seen += leaf->extent_count;
+    }
+
+    return seen == hdr->indirect_extent_count;
+}
+
 bool inode_for_each_extent_metadata_block(const MInode* inode, bool (*cb)(BlockID, void*), void* arg)
 {
     if (!inode || !cb || !uses_indirect_block(inode)) return true;
@@ -962,6 +1015,24 @@ bool inode_for_each_extent_metadata_block(const MInode* inode, bool (*cb)(BlockI
     const ExtentTreeHeader* hdr = tree_header(root_acc->data);
     if (!root_valid(hdr)) return false;
     const ExtentLeafRef* refs = tree_refs(root_acc->data);
+    for (uint32_t i = 0; i < hdr->leaf_count; i++)
+        if (!cb(refs[i].leaf_block, arg)) return false;
+    return true;
+}
+
+bool disk_inode_for_each_extent_metadata_block(const DInode* inode, bool (*cb)(BlockID, void*), void* arg)
+{
+    if (!inode || !cb || !uses_indirect_block(inode)) return true;
+    if (inode->indirect_extent_block == 0) return false;
+    if (!cb(inode->indirect_extent_block, arg)) return false;
+    if (!uses_extent_tree(inode)) return true;
+
+    alignas(BLOCK_SIZE) char root_block[BLOCK_SIZE];
+    if (storage_read(root_block, inode->indirect_extent_block, 1) != 0) return false;
+
+    const ExtentTreeHeader* hdr = tree_header(root_block);
+    if (!root_valid(hdr)) return false;
+    const ExtentLeafRef* refs = tree_refs(root_block);
     for (uint32_t i = 0; i < hdr->leaf_count; i++)
         if (!cb(refs[i].leaf_block, arg)) return false;
     return true;
