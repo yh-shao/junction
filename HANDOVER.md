@@ -30,7 +30,7 @@ shaoFS 是一个构建在 **Junction LibOS + Caladan uthread runtime** 之上的
 | **构建系统** | CMake + Make，封装脚本 `scripts/build.sh` |
 | **磁盘格式化** | 自定义 mkfs 工具（`/home/syh/mkfs/mkfs.sh`） |
 
-### 1.4 2026-06-02 当前交接快照
+### 1.4 2026-06-02 历史交接快照
 
 - 当前阶段：ShaoFS 的 Filebench 导向机制优化、debug 清理和四项 Filebench 自动化对比已经完成一轮。核心目标已经从“跑通”推进到“在 fileserver/webserver/varmail/webproxy 四项中对 ext4 形成稳定领先”的状态。
 - 当前 `build/CMakeCache.txt` 中 `SHAOFS_IO_PREEMPT=ON`、`SHAOFS_CRASH_CONSISTENCY=ON`。CMake 默认值仍分别是 `IO_PREEMPT=OFF`、`CRASH_CONSISTENCY=ON`，正式实验前必须显式记录 cache 状态。
@@ -43,6 +43,30 @@ shaoFS 是一个构建在 **Junction LibOS + Caladan uthread runtime** 之上的
 - 本轮 cleanup 已删除探索阶段临时接口 `storage_read2/storage_write2`、回退 `test_storage_iops.c` 到原始写 IOPS 测试，并移除早期 `test_storage_randread_iops` 探索测试及其生成物。保留的 storage async API 是最终 raw benchmark 所需，不属于 debug 代码。
 - 2026-06-01/02 已完成 `numjobs=256` 的 ShaoFS/ext4 4KB random read `O_DIRECT` 对比。ShaoFS 通过 `runtime_kthreads` 控 core，ext4 通过 `taskset` 控 Linux CPU affinity。当前近满写入/全盘已写状态下 raw 上限约 583K IOPS；ShaoFS 1 core 即达到约 583K，ext4 约需 4 cores 达到同水平。详见 `8.12`。
 - 最近一次裸盘状态复现实验结束后，目标盘 PCI `0000:5b:00.0` 已恢复到 Linux `nvme` 驱动，`/dev/nvme2n1` 当前没有文件系统签名，并且已经被 SPDK 顺序写满过。继续跑 ShaoFS 前需要重新执行 `/home/syh/mkfs/mkfs.sh`；继续跑 ext4 前需要重新 `mkfs.ext4`/挂载。不要假设盘仍保留上一轮 ShaoFS 或 ext4 数据。
+
+### 1.5 2026-06-03 历史交接快照
+
+- 当时阶段：完成两轮以可读性和机制一致性为主的 ShaoFS 重构审查。第一轮当时记录在 `plan.md`，第二轮当时记录在 `plan2.md`。注意：截至 2026-06-07，仓库根目录 `plan.md` 已被本轮 Junction 多进程验证计划覆盖，当前工作区未发现 `plan2.md`；本节和 `8.13` 保留的是 2026-06-03 重构阶段的历史摘要。
+- 当时 tracked ShaoFS 源码 diff 仍较大：`10 files changed, 974 insertions(+), 724 deletions(-)`。这不是净删代码式重构；本轮主要价值在于把大函数拆成更清楚的顶层流程，并封装重复的 direct/cached write、fsync、journal recovery 和 block flush 机制。
+- 主要重构点：`syscall.cc` 中 `my_open()` / `my_mkdir()` / `my_fsync()` 拆分为命名 helper；`file.cc` 中 cached write 参数改为 `CachedWriteOp`，append/EOF extension 和 direct write helper 统一；`blockCache.cc` 中 `bc_flush_blocks_contiguous()` 改为显式 `CachedFlushRun`；`journal.cc` 中 repair buffer 改为 `CFreeBuffer<T>`，recovery slot classification/replay/repair 拆分为独立 helper。
+- 第二轮最终正确性回归目录：`/tmp/shaofs_plan2_phase6_correctness_20260603`。状态 `0`：`test_shaofs_syscall_correctness`、`test_shaofs_direct_correctness`、`test_shaofs_concurrent_correctness`、`test_shaofs_append_prealloc`、`test_shaofs_concurrent_append`、`test_shaofs_direct_concurrent_append`、`test_shaofs_many_extents`、`test_shaofs_mt_full_extents 4 256 2 write-verify 8`、`test_shaofs_fsync_direct_verify`。`journal_recovery_prepare --crash` 退出 `124` 是预期 timeout 崩溃模拟，独立重启后的 `journal_recovery_check` 退出 `0`。
+- 第二轮最终 ShaoFS-only Filebench 对比的是 Phase 0 baseline，而不是 2026-05-28 ext4 对比。首轮目录 `junction/fs/mytest/scripts/results/filebench_compare_plan2_final_20260603_015704`，fileserver/varmail 因首轮波动超过 10% 阈值已各复跑一次。最终采用值：fileserver `62460.787 ops/s` (`-0.70%` vs baseline)，webserver `483673.175 ops/s` (`-0.08%`)，varmail `173705.862 ops/s` (`-2.30%`)，webproxy `612508.355 ops/s` (`+57.21%`)。无确认的 >10% 性能回归。
+- 当前 `build/CMakeCache.txt` 仍显示 `SHAOFS_IO_PREEMPT:BOOL=ON`、`SHAOFS_CRASH_CONSISTENCY:BOOL=ON`；当前 `build/junction/caladan_test.config` 为 `runtime_kthreads=1`、`runtime_spinning_kthreads=0`、`runtime_quantum_us=100`、`enable_storage=1`。正式实验前必须重新记录这些构建/cache/config 状态。
+- 当时没有残留 `iokerneld` / `junction_run` / Filebench 进程。当前工作区仍有大量 untracked benchmark、script、result、`plan.md`、`.cache/`、`logs/` 和 generated build artifact；历史交接曾提到 `plan2.md`，但截至 2026-06-07 当前工作区未发现该文件。不要盲目删除用户可能仍需要的实验资产。
+
+### 1.6 2026-06-07 当前交接快照
+
+- 当前阶段：完成了 **Junction 单容器多进程运行能力验证**，目标是验证 README 中“一个 `junction_run` 容器可以运行多个应用/进程”的声明。该工作只新增测试程序、计划和报告，没有修改 Junction/ShaoFS/Caladan 实现代码。
+- 新增测试程序：`junction/fs/mytest/junction_multiproc_vfork.c`。它是一个纯 C 双模式程序：controller 模式显式调用 `vfork()`，child 立即 `execv()` 同一二进制的 `--worker` 模式，parent 用 `waitpid()` 回收所有 child；worker 打印 `getpid/gettid/getppid`、记录起止时间，并写入 ShaoFS 私有文件。
+- 新增报告：`junction_multiproc_report.md`。当前根目录 `plan.md` 是本轮多进程验证的 checklist，不再是旧的 ShaoFS 重构/ablation 计划。
+- 原始日志目录：`/tmp/junction_multiproc_20260607_162050`。`mkfs.status=0`、`vfork.status=0`、`fish.status=0`、`hostps_vfork.status=0`。
+- vfork/exec 路线：`sudo timeout 30s ./junction_run caladan_test.config -- mytest/junction_multiproc_vfork 4 20 50000 FSHAO:/junction_multiproc_vfork` 成功。容器内 controller PID/TID 为 `1/1`，worker PID/TID 为 `2/2`、`3/3`、`4/4`、`5/5`，所有 worker `ppid=1`，parent 成功 `waitpid()`，并验证 4 个 ShaoFS worker 文件，最终输出 `MULTIPROC_VFORK_OK workers=4`。
+- fish/`posix_spawn()` 路线：`sudo timeout 30s ./junction_run caladan_test.config -- /usr/bin/fish -c 'for i in (seq 0 3); mytest/junction_multiproc_vfork --worker $i 20 50000 FSHAO:/junction_multiproc_fish &; end; wait'` 成功。worker PID/TID 为 `4/4`、`5/5`、`6/6`、`7/7`，验证 README 推荐的 fish 后台任务方式可以在单个 Junction 容器内启动多个任务。
+- host 侧证据：约 6 秒长运行期间，Linux `pgrep -a junction_run` 只看到一个 host `junction_run` 进程；`ps -T -p <junction_run_pid>` 只显示 `junction_run` 主线程和 DPDK 辅助线程 `dpdk-intr`、`dpdk-mp-msg`。容器内多个 Junction PID 没有对应为多个 host Linux 子进程，符合“Junction process 由 LibOS/Caladan uthread 承载”的预期。
+- 重要边界：本轮验证的是 `vfork()` + `execve()` 和 fish/`posix_spawn()` 路线，不等价于证明通用 Linux `fork()` 语义完整支持。`vfork()` child 在 exec 前共享 parent 地址空间且 parent 被暂停，所以 child 在 exec 前不能做复杂工作。
+- 当前 `build/CMakeCache.txt` 仍显示 `SHAOFS_IO_PREEMPT:BOOL=ON`、`SHAOFS_CRASH_CONSISTENCY:BOOL=ON`；`build/junction/caladan_test.config` 为 `runtime_kthreads 1`、`runtime_spinning_kthreads 0`、`runtime_guaranteed_kthreads 0`、`runtime_quantum_us 100`、`enable_storage 1`。
+- 本轮运行前执行过 `/home/syh/mkfs/mkfs.sh`，随后 vfork/fish/hostps 三轮测试都正常退出并触发 final flush。测试结束后已确认没有残留 `iokerneld` / `junction_run` 进程。若后续实验需要干净磁盘状态，仍建议重新执行 mkfs。
+- 当前工作区仍有大量未跟踪测试、benchmark、报告和结果文件；`git status --short` 还显示 `junction/CMakeLists.txt`、`junction/fs/file.cc`、`junction/fs/shaofs/file.cc`、`junction/fs/shaofs/syscall.cc` 为已修改状态，这些不是本轮多进程验证新增修改，接手时不要误删或回退。
 
 ---
 
@@ -58,7 +82,7 @@ Junction 拦截 syscall → usys_write() [junction/fs/file.cc]
     │
     ├─ 检查 f->get_inode()->get_mode() == SHAOFS ?
     │   ├─ YES → 提取 direct = f->get_flags() & kFlagDirect
-    │   │        调用 my_write(inum, buf, &offset, len, direct) [shaofs/syscall.cc]
+    │   │        调用 my_write(inum, buf, &offset, len, direct, append) [shaofs/syscall.cc]
     │   │            │
     │   │            ├─ direct=false → file_write() [shaofs/file.cc]
     │   │            │   ├─ ic_get_inode(inum)           → Inode Cache 获取 inode
@@ -75,12 +99,12 @@ Junction 拦截 syscall → usys_write() [junction/fs/file.cc]
     │   │            │   ├─ memcpy(block, user_buf)      → 数据写入缓存
     │   │            │   └─ mark_dirty()                 → 标记脏页（延迟写回）
     │   │            │
-    │   │            └─ direct=true → file_write_direct() [shaofs/file.cc]
+    │   │            └─ direct=true → file_write_direct() / file_write_direct_append() [shaofs/file.cc]
     │   │                ├─ 校验 user buffer/offset/length 是否满足 DMA 合约
     │   │                ├─ storage_prepare_user_dma()    → mlock + spdk_mem_register + vtophys 验证
     │   │                ├─ inode_bmap_locked(allocate=true) → 同上
     │   │                ├─ storage_write_user_dma()      → 绕过 Block Cache，user buffer 直接作为 SPDK payload
-    │   │                └─ 更新 file_size
+    │   │                └─ 更新 file_size；O_APPEND 时在 inode 写锁内读取 EOF 并写入
     │   │
     │   └─ NO → 走 Junction 原生 VFS 路径（linuxfs/memfs/procfs）
     │
@@ -93,7 +117,7 @@ Junction 拦截 syscall → usys_write() [junction/fs/file.cc]
 ```
 ┌─────────────────────────────────────────────────────────┐
 │                    Dentry Cache                          │
-│  16384 entries, 16 shards                               │
+│  16384 entries, 256 shards                              │
 │  Key: (parent_inum, filename) → Value: (inum, type)     │
 │  Policy: LRU, write-through (不负责写回磁盘)             │
 │  Backend: dir_lookup() 从磁盘读取目录项                   │
@@ -102,7 +126,7 @@ Junction 拦截 syscall → usys_write() [junction/fs/file.cc]
                       ▼
 ┌─────────────────────────────────────────────────────────┐
 │                    Inode Cache                            │
-│  8192 entries, 16 shards                                │
+│  8192 entries, 256 shards                               │
 │  Key: inum (int) → Value: MInode (extends DInode)        │
 │  Policy: LRU, write-back                                │
 │  Backend: 通过 Block Cache 读写 inode table blocks        │
@@ -252,14 +276,14 @@ junction/fs/shaofs/                    ← 我们的项目代码
 │                                        SpinGuardNP, kguard, atomic_read/write/inc/dec
 ├── dsa.h/cc                           ← Intel DSA/DML 初始化、direction-aware 异步 copy/copyv，
 │                                        硬件不可用或策略不满足时回退 CPU memcpy
-├── journal.h/cc                       ← metadata-only redo journal + dirty mount repair
-│                                        sync commit API + batched group commit + async home-block checkpoint + recovery scan
-│                                        journal_init/recover/mark_dirty/mark_clean,
-│                                        journal_write_metadata, journal_commit_single,
-│                                        journal_build_metadata_map
-├── OPTIMIZATION_REPORT.md             ← 优化报告
-└── IOPS_BENCHMARK_REPORT.md           ← IOPS 测试报告
+└── journal.h/cc                       ← metadata-only redo journal + dirty mount repair
+                                         sync commit API + batched group commit + async home-block checkpoint + recovery scan
+                                         journal_init/recover/mark_dirty/mark_clean,
+                                         journal_write_metadata, journal_commit_single,
+                                         journal_build_metadata_map
 ```
+
+注：早期交接内容曾把 `OPTIMIZATION_REPORT.md` 和 `IOPS_BENCHMARK_REPORT.md` 列为 `junction/fs/shaofs` 下的文件；2026-06-03 复查该目录时未发现这两个文件。2026-06-03 ShaoFS 重构阶段的历史摘要见本文 `1.5` / `8.13` 和 `junction/fs/mytest/scripts/results/` 下的结果目录；截至 2026-06-07，仓库根目录 `plan.md` 已被 Junction 多进程验证 checklist 覆盖，当前工作区未发现 `plan2.md`，不要再把当前 `plan.md` 当作旧 ShaoFS 重构计划。
 
 ### 3.2 VFS 集成层（Junction 侧）
 
@@ -298,6 +322,7 @@ junction/fs/shaofs/                    ← 我们的项目代码
 | `test_many_inodes.c` | 回归测试 | 顺序创建大量小文件，用于验证 inode bitmap 分配能越过 inode cache 容量 |
 | `test_many_inodes_read_threads.c` | 回归测试 | 创建大量 16KB 文件后用 3 个 pthread 反复整文件读取并校验内容，用于覆盖 Filebench 类似读负载 |
 | `test_barrier_sleep.c` | 兼容性测试 | pthread_barrier + sleep() 在 Junction 中的正确性 |
+| `junction_multiproc_vfork.c` | Junction 多进程验证 | 双模式 C 测试：controller 显式 `vfork()`，child 立即 `execv()` 同一二进制的 `--worker` 模式；worker 打印 PID/TID/PPID 并写 ShaoFS 文件，parent `waitpid()` 回收并校验输出文件；2026-06-07 用于验证单个 `junction_run` 容器可承载多个 Junction process |
 | `myls.c` | 工具 | 列出 shaofs 目录内容 |
 | `mystat.c` | 工具 | 显示文件元数据 |
 | `mycat.c` | 工具 | 显示文件内容（文本/hex dump） |
@@ -730,6 +755,15 @@ dir_delete_entry()→ DirWriteGuard (rwmutex_wrlock)
 `dir_foreach_locked()` 是 static 模板函数，调用前 caller 必须已持有锁。
 
 当前代码还为每个目录 inode 增加了内存态 `DirIndex`。第一次 `dir_add_entry()` 或需要写入目录时会在持有目录写锁的情况下扫描目录块，构建 hash bucket、free slot 链表和 live child 计数；之后 `dir_lookup()` 命中已存在索引时可以直接按文件名 hash 查找，不再线性扫描目录文件。`dir_add_entry()` 优先复用 free slot，否则追加到目录尾部；`dir_delete_entry()` 将目录项写成空 slot，并把对应 `DirIndexNode` 放回 free slot 链表。该索引不写入磁盘，inode eviction/destruction 时通过 `MInode::drop_dir_index()` 释放。
+
+`DirIndex` 与 `dentryCache` 有交叉但不是同一个东西：
+
+- `dentryCache` 是全局 sharded LRU，key 为 `(parent_inum, name)`，value 为 `(inum, type)`；`namei()` 每解析一级路径都会先查它，miss 后由 `DentryBackend::read()` 调用 `dir_lookup()`。
+- `DirIndex` 是某一个目录 inode 内部的运行时索引，除了 `(name -> inum/type)`，还保存目录项 `offset`、`free_slots` 和 `live_children`。这些字段用于目录文件内部管理，`dentryCache` 无法替代。
+- 因此当前调用层次是：`namei()` → `dentryCache` → miss 时 `dir_lookup()` → 已建 `DirIndex` 则 hash 查找，否则扫描目录文件。
+- 若要简化架构，可以评估弱化或删除 `dentryCache`，让 `namei()` 直接依赖 `dir_lookup()`/`DirIndex`；但不能简单删除 `DirIndex`，因为它承担 free slot 复用和 `dir_is_empty()` 快路径。
+
+内存风险：`DirIndexNode` 在当前 x86_64 布局约 `296B`，`DirIndexChunk` 固定包含 512 个 node，约 `148KB`。因此一个很小的目录只要触发 `dir_ensure_index_locked()`，最低也会分配约 148KB 的节点 chunk。少量热点目录可接受，但如果大量小目录都发生 add/delete，会有明显内存放大。后续优化方向是小目录延迟建索引、降低 chunk size，或超过目录项阈值后再建完整 hash index。
 
 ### 5.8 I/O completion driven preemption（`IO_PREEMPT`）
 
@@ -1178,6 +1212,65 @@ printf 'syh2syh\n' | sudo -S pkill -9 iokerneld
 
 ```text
 sync ret=0 errno=0 (Success)
+```
+
+### 6.5.1 编译并运行 Junction 单容器多进程验证
+
+本测试用于验证 README 提到的“一个 `junction_run` 容器中运行多个应用/进程”能力。测试程序不修改 Junction/ShaoFS 实现，只通过用户程序显式触发 `vfork()` + `execv()`，并用 ShaoFS 文件写入和 `waitpid()` 证明多个 Junction PID 能在同一个容器中运行。
+
+编译：
+
+```bash
+cd /home/syh/MyProj1/junction
+mkdir -p build/junction/mytest
+gcc -O2 -Wall -Wextra junction/fs/mytest/junction_multiproc_vfork.c \
+  -o build/junction/mytest/junction_multiproc_vfork -lpthread
+```
+
+重新格式化并启动 IOKernel：
+
+```bash
+cd /home/syh/MyProj1/junction
+printf 'syh2syh\n' | sudo -S pkill -9 iokerneld 2>/dev/null || true
+cd /home/syh/mkfs && printf 'syh2syh\n' | sudo -S bash ./mkfs.sh
+
+cd /home/syh/MyProj1/junction
+printf 'syh2syh\n' | sudo -S lib/caladan/iokerneld ias
+```
+
+在另一个 shell 运行 `vfork()` + `execv()` 路线：
+
+```bash
+cd /home/syh/MyProj1/junction/build/junction
+printf 'syh2syh\n' | sudo -S timeout 30s ./junction_run caladan_test.config -- \
+  mytest/junction_multiproc_vfork 4 20 50000 FSHAO:/junction_multiproc_vfork
+```
+
+成功时应看到 controller PID/TID 为 `1/1`，4 个 worker 使用不同 Junction PID/TID，并最终输出：
+
+```text
+MULTIPROC_VFORK_OK workers=4
+```
+
+也可以验证 README 中 fish 后台任务路线：
+
+```bash
+cd /home/syh/MyProj1/junction/build/junction
+printf 'syh2syh\n' | sudo -S timeout 30s ./junction_run caladan_test.config -- \
+  /usr/bin/fish -c 'for i in (seq 0 3); mytest/junction_multiproc_vfork --worker $i 20 50000 FSHAO:/junction_multiproc_fish &; end; wait'
+```
+
+需要确认 host 侧只有一个 `junction_run` 进程时，可以把 worker 运行时间调长，然后在第三个 shell 观察：
+
+```bash
+pgrep -a junction_run
+ps -T -p <junction_run_pid>
+```
+
+2026-06-07 实测中，host 侧只看到一个 `junction_run` 进程及 DPDK 辅助线程；容器内 worker PID/TID 分别为 `2/2`、`3/3`、`4/4`、`5/5`。这说明多个 Junction process 没有被实现成多个 Linux child process。测试结束后清理：
+
+```bash
+printf 'syh2syh\n' | sudo -S pkill -9 iokerneld
 ```
 
 ### 6.6 编译并运行 crash consistency 测试
@@ -1793,6 +1886,18 @@ shaoFS 的 `RuntimeFSBaseGuard` 与 Junction 原有 `RuntimeLibcGuard` 不同。
 - 涉及多进程隔离、进程级资源统计、真实 fork/exec 行为的 Filebench workload 不应直接拿当前 patch 的结果做结论。
 - `toggle_filebench.sh apply` 后 Filebench 子仓库处于 modified/dirty 状态是预期的；源码修改应通过 `filebench_changes.patch` 管理，不要直接手改子仓库后忘记更新 patch。
 
+### 7.16.1 GOTCHA 15A：已验证 `vfork()+exec` 多进程路线，但不要推断完整 `fork()` 语义
+
+2026-06-07 已通过 `junction_multiproc_vfork.c` 和 fish 后台任务验证：单个 `junction_run` 容器可以承载多个 Junction process，容器内可观察到多个 Junction PID/TID，host 侧仍只有一个 Linux `junction_run` 进程。
+
+这个结论不推翻 Filebench/FxMark 当前的 pthread 降级策略。原因是本轮验证的核心路径是：
+
+- `vfork()` child 立即 `execv()`，parent 在 child `exec/exit` 前被暂停。
+- fish 后台任务通常走 `posix_spawn()` / fork-exec 类路线，实测可以启动多个独立任务。
+- 这不能证明“parent 和 child 在 `fork()` 后、`exec()` 前共享一份用户地址空间快照并并发执行”的完整 Linux fork 语义。
+
+因此，像 FxMark worker 或 Filebench procflow 这类需要 worker 与 parent 并发运行、共享或传递复杂运行时状态的 benchmark，仍不能只因为 `vfork()+exec` 成功就恢复为原始 process/fork 模型。若未来要恢复原始模型，必须针对目标 workload 单独验证 `fork`、`exec`、`wait*`、信号、文件描述符继承和共享内存/IPC 行为。
+
 ### 7.17 GOTCHA 16：`O_DIRECT` user-buffer DMA 合约非常严格
 
 当前 shaoFS O_DIRECT 不再为不合规请求自动回退到 bounce buffer。测试程序或 benchmark 如果要验证“NVMe SSD ↔ user buffer”直通路径，必须保证：
@@ -1917,7 +2022,7 @@ Caladan 的 `spin_lock()` 只是 raw busy-wait，不会自动禁止 uthread 抢�
 - **O_DIRECT user-buffer DMA**：满足 4KB 对齐请求合约且底层覆盖 2MB 注册成功时绕过 Block Cache，直接用用户 buffer 作为 SPDK NVMe read/write payload；不满足时返回错误
 - **Direct `readv/preadv` 显式批量读**：shaoFS O_DIRECT fd 的 `readv/preadv` 会聚合多个整块 iovec，通过 `storage_read_aligned_batch()` 一次提交多个 NVMe read 并只 park 一次；普通 `pread/read` 不透明合并
 - **O_TRUNC**：`truncate_inode()` 释放所有数据块并重置 file_size
-- **O_APPEND**：shaoFS buffered write 路径已把 append 语义下推到 `my_write(..., append=true)` / `file_write_append()`，在 inode 写锁内读取 EOF 并写入，避免并发 append 抢同一个 EOF；direct `O_APPEND` 仍在 dispatch 层先 `my_lseek(SEEK_END)` 后走 direct write
+- **O_APPEND**：shaoFS buffered write 路径已把 append 语义下推到 `my_write(..., append=true)` / `file_write_append()`，在 inode 写锁内读取 EOF 并写入，避免并发 append 抢同一个 EOF；direct `O_APPEND` 当前通过 `file_write_direct_append()` 在 inode 写锁内读取 EOF、校验 direct DMA 对齐约束并写入，dispatch 层仍会先更新 fd offset 作为兼容处理，但真正的 direct append EOF reservation 在 `file_write_direct_append()` 内完成
 - **fsync**：dirty byte range 精确刷写 + inode metadata sequence 快路径；clean repeated fsync 可以直接返回
 - **sync**：全局刷写 shaoFS 内存脏状态（imap、GDT、inode cache、block cache），用于 FxMark/FIO/Filebench 等会调用 `sync()` 的 benchmark；不会执行 clean unmount 语义或清 dirty marker
 - **stat/fstat**：完整填充 `struct stat`（通过 tree-aware extent 遍历统计 allocated blocks）
@@ -2352,6 +2457,125 @@ sudo /home/syh/MyProj1/junction/lib/caladan/spdk/build/bin/spdk_nvme_perf \
 
 现场状态：本复现实验结束后已执行 SPDK setup reset，`/dev/nvme2n1` 在 Linux `nvme` 驱动下，无文件系统签名，且全盘已写过。后续 ShaoFS/ext4 实验必须重新格式化。
 
+### 8.13 2026-06-03 ShaoFS 重构阶段结果
+
+本轮用户目标是对 `junction/fs/shaofs` 做深度 code review 和可读性重构。第一次计划当时记录在仓库根目录 `plan.md`；第二次、也是当时更重要的执行计划记录在 `plan2.md`。截至 2026-06-07，当前根目录 `plan.md` 已被 Junction 单容器多进程验证 checklist 覆盖，当前工作区未发现 `plan2.md`；本节保留的是 2026-06-03 阶段的历史摘要，不应再从当前 `plan.md` 恢复旧 ShaoFS 重构计划。目录子系统阶段在分析后选择跳过大改，原因是 `DirIndex` 不是 `dentryCache` 的简单重复，贸然删除会破坏目录 free slot 复用和 `dir_is_empty()` 快路径。
+
+当时 tracked ShaoFS 代码 diff 规模为 `10 files changed, 974 insertions(+), 724 deletions(-)`。这不是“净删除大量代码”的重构；主要价值在于把大函数中的隐式状态、重复分支和补丁式路径拆成更明确的 helper 和小结构体，降低后续维护成本。主要涉及：
+
+- `shaofs/syscall.cc`：把 `my_open()` / `my_mkdir()` / `my_fsync()` 中的路径准备、inode 初始化、目录创建、dirty-range fsync 等逻辑拆成命名 helper；`my_mkdir()` 的错误返回现在更明确地保持负 errno 语义。
+- `shaofs/file.cc` / `file.h`：引入 `CachedWriteOp`，把 cached write 的参数组收敛；拆出 `write_cached_existing_block()`、`write_cached_allocated_block_locked()`、`file_write_extend_locked()`、`direct_write_one_block_locked()`；direct `O_APPEND` 由 `file_write_direct_append()` 在 inode 写锁内完成 EOF reservation。
+- `shaofs/blockCache.cc`：`bc_flush_blocks_contiguous()` 改用 `CachedFlushRun` 明确描述 contiguous flush run，并拆出 writeback/metadata flush 的判断与提交 helper。
+- `shaofs/journal.cc`：repair/recovery 路径使用 `CFreeBuffer<T>` 管理 C 分配内存，并拆出 journal slot 分类、slot 收集、replay、clear 和 dirty mount repair helper。
+- `shaofs/extent.h/cc`：补充给 recovery/repair 使用的 disk inode extent 遍历 helper，避免 journal 修复路径继续手写 extent 扫描细节。
+
+重构后正确性检查结果目录：
+
+```text
+/tmp/shaofs_plan2_phase6_correctness_20260603
+```
+
+该阶段以下测试退出码均为 `0`：`test_shaofs_syscall_correctness`、`test_shaofs_direct_correctness`、`test_shaofs_concurrent_correctness`、`test_shaofs_append_prealloc`、`test_shaofs_concurrent_append`、`test_shaofs_direct_concurrent_append`、`test_shaofs_many_extents`、`test_shaofs_mt_full_extents 4 256 2 write-verify 8`、`test_shaofs_fsync_direct_verify`、`journal_recovery_check`。`journal_recovery_prepare --crash` 由 `timeout` 杀死，退出码 `124` 是该 crash-recovery 测试的预期行为。
+
+Filebench 四项性能对比使用 2026-06-03 Phase0 baseline 和 plan2 final 结果；结果目录如下：
+
+```text
+junction/fs/mytest/scripts/results/filebench_compare_20260603_010941
+junction/fs/mytest/scripts/results/filebench_compare_plan2_final_20260603_015704
+junction/fs/mytest/scripts/results/filebench_compare_plan2_final_fileserver_rerun_20260603_020235
+junction/fs/mytest/scripts/results/filebench_compare_plan2_final_varmail_rerun_20260603_020408
+```
+
+| Workload | Phase0 baseline ShaoFS ops/s | Final ShaoFS ops/s | 变化 |
+|----------|------------------------------:|-------------------:|-----:|
+| fileserver | 62,900.199 | 62,460.787 | -0.70% |
+| webserver | 484,067.536 | 483,673.175 | -0.08% |
+| varmail | 177,792.079 | 173,705.862 | -2.30% |
+| webproxy | 389,611.111 | 612,508.355 | +57.21% |
+
+`fileserver` 和 `varmail` 的 final 首轮曾低于 baseline，随后单项重跑后恢复到上表数值；因此当前没有确认到超过 10% 的性能回退。正式论文数据仍应多轮重复并记录均值/方差，不能只引用单轮结果。
+
+本轮测试结束后已清理测试进程；接手时仍建议先执行 `pgrep -a iokerneld` / `pgrep -a junction_run` 确认现场干净。当前构建缓存中 `SHAOFS_CRASH_CONSISTENCY=ON`、`SHAOFS_IO_PREEMPT=ON`；`build/junction/caladan_test.config` 为 `runtime_kthreads 1`、`runtime_spinning_kthreads 0`、`runtime_guaranteed_kthreads 0`、`runtime_quantum_us 100`、`enable_storage 1`。
+
+### 8.14 2026-06-07 Junction 单容器多进程验证结果
+
+本轮目标是验证 Junction README 中提到的单个 `junction_run` 容器运行多个进程/任务的能力。实现方式是新增用户态测试程序和报告，没有修改 Junction/ShaoFS/Caladan 实现代码。
+
+新增文件和记录：
+
+- 测试程序：`junction/fs/mytest/junction_multiproc_vfork.c`
+- 实践报告：`junction_multiproc_report.md`
+- 当前计划文件：`plan.md`，内容为 Junction single-container multi-process verification checklist
+- 原始日志目录：`/tmp/junction_multiproc_20260607_162050`
+
+编译命令：
+
+```bash
+cd /home/syh/MyProj1/junction
+gcc -O2 -Wall -Wextra junction/fs/mytest/junction_multiproc_vfork.c \
+  -o build/junction/mytest/junction_multiproc_vfork -lpthread
+```
+
+测试前执行过：
+
+```bash
+printf 'syh2syh\n' | sudo -S bash /home/syh/mkfs/mkfs.sh
+```
+
+`vfork()` + `execv()` 路线：
+
+```bash
+cd /home/syh/MyProj1/junction/build/junction
+printf 'syh2syh\n' | sudo -S timeout 30s ./junction_run caladan_test.config -- \
+  mytest/junction_multiproc_vfork 4 20 50000 FSHAO:/junction_multiproc_vfork
+```
+
+结果状态 `vfork.status=0`。关键输出：
+
+```text
+CONTROLLER_START pid=1 tid=1 workers=4
+PARENT_AFTER_VFORK worker=0 child_pid=2
+PARENT_AFTER_VFORK worker=1 child_pid=3
+PARENT_AFTER_VFORK worker=2 child_pid=4
+PARENT_AFTER_VFORK worker=3 child_pid=5
+WORKER_START id=0 pid=2 tid=2 ppid=1
+WORKER_START id=1 pid=3 tid=3 ppid=1
+WORKER_START id=2 pid=4 tid=4 ppid=1
+WORKER_START id=3 pid=5 tid=5 ppid=1
+WAIT_OK worker=0 child_pid=2
+WAIT_OK worker=1 child_pid=3
+WAIT_OK worker=2 child_pid=4
+WAIT_OK worker=3 child_pid=5
+VERIFY_OK worker=0
+VERIFY_OK worker=1
+VERIFY_OK worker=2
+VERIFY_OK worker=3
+MULTIPROC_VFORK_OK workers=4
+```
+
+fish / `posix_spawn()` 路线：
+
+```bash
+cd /home/syh/MyProj1/junction/build/junction
+printf 'syh2syh\n' | sudo -S timeout 30s ./junction_run caladan_test.config -- \
+  /usr/bin/fish -c 'for i in (seq 0 3); mytest/junction_multiproc_vfork --worker $i 20 50000 FSHAO:/junction_multiproc_fish &; end; wait'
+```
+
+结果状态 `fish.status=0`。关键输出显示 worker PID/TID 为 `4/4`、`5/5`、`6/6`、`7/7`，所有 worker `ppid=1`，均正常完成。该路线验证 README 推荐的 fish 后台任务方式可以在单个 Junction 容器内启动多个任务。
+
+host 侧证据：
+
+- 长运行版测试状态 `hostps_vfork.status=0`。
+- 测试运行期间 `pgrep -a junction_run` 只看到一个 host `junction_run` 进程。
+- `ps -T -p <junction_run_pid>` 只显示 `junction_run`、`dpdk-intr`、`dpdk-mp-msg` 等线程，没有为每个 Junction child 创建一个 Linux 子进程。
+- 与此同时，容器 stdout 中仍能看到 controller PID `1` 和 worker PID `2`、`3`、`4`、`5`。
+
+结论：当前 Junction 在本项目环境中可以在单个 `junction_run` 容器内运行多个 Junction process；这些 process 由 LibOS/Caladan runtime 管理，host 侧不表现为多个 Linux child process。
+
+边界：本轮只证明 `vfork()` + `execve()`、fish/`posix_spawn()` 这两条路线可用。它不能作为通用 `fork()` 语义完整支持的证据，也不能直接用于推翻 Filebench/FxMark 当前为了适配 Junction 而采用的 pthread worker 模型。
+
+本轮结束后已确认没有残留 `iokerneld` / `junction_run`。当前构建缓存仍为 `SHAOFS_CRASH_CONSISTENCY=ON`、`SHAOFS_IO_PREEMPT=ON`；`build/junction/caladan_test.config` 为 `runtime_kthreads 1`、`runtime_spinning_kthreads 0`、`runtime_guaranteed_kthreads 0`、`runtime_quantum_us 100`、`enable_storage 1`。
+
 ---
 
 ## 第九章：已知缺陷与待办事项
@@ -2374,7 +2598,7 @@ sudo /home/syh/MyProj1/junction/lib/caladan/spdk/build/bin/spdk_nvme_perf \
 14. **FS base 策略是针对 shaoFS 的混合修复，不是 Junction 全局 TLS 架构终局**：当前已经覆盖 shaoFS guard 内 park/yield 的场景，但其他隐式进入 runtime libc 且可能 yield 的路径仍需单独审计。
 15. **Filebench patch 改变 procflow 执行模型**：当前 Filebench 适配版用于跑通 Junction/shaoFS 学术负载；它不是对上游 Filebench 多进程语义的完整兼容。
 16. **32768 inode 边界尚未完整耗尽验证**：当前已修复约 8192 inode 附近失败的问题，并验证过 10000 文件级别场景；完整创建到接近 `INODENUM=32768` 后的行为仍应补充压力测试。
-17. **当前工作区存在未跟踪 benchmark/patch/report/script 文件**：`junction/fs/mytest/benchmark/`、`junction/fs/mytest/scripts/`、`junction/fs/shaofs/OPTIMIZATION_REPORT.md`、`junction/fs/shaofs/IOPS_BENCHMARK_REPORT.md` 等当前在主仓库中显示为 untracked 或包含大量未跟踪结果；接手前应确认哪些需要纳入版本控制
+17. **当前工作区存在未跟踪 benchmark/patch/script/result 文件**：`junction/fs/mytest/benchmark/`、`junction/fs/mytest/scripts/`、`junction/fs/mytest/scripts/results/`、`plan.md`、`junction_multiproc_report.md`、`junction/fs/mytest/junction_multiproc_vfork.c` 等当前在主仓库中显示为 untracked 或包含大量未跟踪结果；接手前应确认哪些需要纳入版本控制。早期文档曾提到的 `junction/fs/shaofs/OPTIMIZATION_REPORT.md` / `IOPS_BENCHMARK_REPORT.md` 当前目录下未发现；历史交接曾提到的 `plan2.md` 当前工作区未发现。
 18. **FxMark patch 是 Junction 适配版，不是上游语义完整等价实现**：当前把 FxMark worker 从 process/fork 模型改成同进程 pthread 模型，只验证了 DRBL 跑通。涉及进程隔离、真实多进程扩展性或其他 FxMark workload 的结论需要单独验证。
 19. **FxMark 多 worker smoke 不是多核扩展性结果**：2026-05-15 跑 FxMark 时的 `build/junction/caladan_test.config` 只有 `runtime_kthreads=1` / `runtime_spinning_kthreads=1`，所以 `--ncore 8` 并不表示 Junction/shaoFS 使用了 8 个 runtime kthreads。2026-05-19 当时 config 曾改为 `runtime_kthreads=10` / `runtime_spinning_kthreads=0` / `runtime_quantum_us=100`；2026-05-20 当前 config 又已改为 `runtime_kthreads=1` / `runtime_spinning_kthreads=1`。正式多核实验必须重新记录并验证当前 config。
 20. **`sync()` 是全局 flush，不是 clean unmount**：`usys_sync()` 当前调用 `shaofs_sync_all()` 刷写脏状态，但不会调用 `journal_mark_clean()`，也不会清除 `runtime_info->spdk_uipi`。如果测试依赖 clean shutdown 语义，仍应让 `junction_run` 正常退出走 `final_flush()`。
@@ -2387,6 +2611,9 @@ sudo /home/syh/MyProj1/junction/lib/caladan/spdk/build/bin/spdk_nvme_perf \
 27. **PM9A3 raw baseline 必须匹配 LBA 状态**：2026-06-01/02 已确认 discard/unwritten LBA 可测到约 1.17M IOPS，而已写数据 LBA 约 583K IOPS。ShaoFS/ext4 读文件数据时应和“已写数据 LBA”baseline 对比；不要拿 discard 后全盘 randread 的 1.17M 直接判断文件系统没有打满硬件。
 28. **2026-06-01/02 只完成了 O_DIRECT 256-job 对比，buffered I/O 尚未重跑**：当前 `8.12` 表格不能代表 buffered read 场景，也不能代表 page cache/block cache 命中场景。
 29. **当前目标盘现场状态不是文件系统可用状态**：最后一次裸盘复现实验后，`/dev/nvme2n1` 无文件系统签名并已被 SPDK 写满；下一轮 ShaoFS 或 ext4 实验必须显式重新格式化，不能直接复用当前盘。
+30. **`DirIndex` 有小目录内存放大风险**：当前 `DirIndexChunk` 固定包含 512 个 `DirIndexNode`，在 x86_64 上约 148KB；一个小目录只要触发 `dir_ensure_index_locked()` 就会分配一整个 chunk。少量热点目录可接受，但大量小目录 create/delete 负载可能放大内存占用。
+31. **`dentryCache` 与 `DirIndex` 的取舍尚未通过实验定论**：二者职责不同，`dentryCache` 是全局路径解析 LRU，`DirIndex` 是单目录内部索引并维护 free slot/live child；不能直接删除 `DirIndex`。是否弱化或删除 `dentryCache` 需要先做 path lookup、Filebench webserver/webproxy 和多目录压力测试。
+32. **Junction 多进程验证不等于完整 `fork()` 支持**：2026-06-07 已验证单个 `junction_run` 容器内可通过 `vfork()+execve()` 和 fish/`posix_spawn()` 启动多个 Junction process；但这不能证明通用 Linux `fork()` 后 parent/child 在 exec 前并发执行的完整语义。Filebench/FxMark 的 pthread 降级仍应保留，除非目标 workload 另行完成 fork/exec/wait/IPC/信号验证。
 
 ### 9.2 优先待办任务
 
@@ -2477,7 +2704,7 @@ sudo /home/syh/MyProj1/junction/lib/caladan/spdk/build/bin/spdk_nvme_perf \
 - 每次 ext4 测试前确认 `/home/syh/mkfs/reset_ext4.sh` 成功格式化并挂载目标盘，避免拿旧数据或 page cache 结果做对比。
 
 **Task 15: 清理或纳入未跟踪工作区文件**
-- 当前 benchmark patch、Filebench WML 和 shaoFS 报告文件大量处于 untracked 状态。
+- 当前 benchmark patch、Filebench WML、`plan.md`、`junction_multiproc_report.md`、`junction/fs/mytest/junction_multiproc_vfork.c` 和 `junction/fs/mytest/scripts/results/` 下的实验结果大量处于 untracked 状态；历史交接曾提到 `plan2.md`，但当前工作区未发现该文件。
 - 接手者应先决定哪些是正式资产，哪些只是临时实验输出，再统一加入版本控制或清理；不要盲目删除用户可能仍需要的实验文件。
 
 **Task 16: 完整验证 inode 上限**
@@ -2504,12 +2731,31 @@ sudo /home/syh/MyProj1/junction/lib/caladan/spdk/build/bin/spdk_nvme_perf \
 - 覆盖 clean repeated fsync、dirty append+fsync、direct read after buffered fsync、同步 checkpoint 后 clean shutdown、async checkpoint 未完成时 clean shutdown、强杀后 recovery。
 - 2026-05-28 清理后已重新构建，并完整跑通 Filebench 四项 shaoFS/ext4 对比；下一步应补更多 targeted crash/checkpoint 回归和多轮 benchmark 重复。
 
+**Task 21: 评估目录索引与 dentryCache 简化方案**
+- 先写一个大量小目录 create/delete/lookup 压力测试，记录 `DirIndex` chunk 数、目录数量、RSS 和 lookup/add/delete 吞吐，确认 148KB/chunk 是否会成为目标场景瓶颈。
+- 如果内存放大明显，优先考虑小目录不建完整索引、降低 `kDirIndexNodeChunkEntries`，或超过目录项阈值后再建 hash index；修改后必须覆盖 `dir_add_entry()` free slot 复用、`dir_delete_entry()`、`dir_is_empty()` 和 remount 后扫描行为。
+- 评估删除或弱化 `dentryCache` 时，只能把 `namei()` miss/backend 路径改为直接依赖 `dir_lookup()`/`DirIndex`；不能用 `dentryCache` 替代 `DirIndex`，因为前者不保存目录项 offset/free slot/live child。该实验需要和当前 Filebench 四项 baseline 对比，确认 path lookup 性能没有显著下降。
+
+**Task 22: 按需扩展 Junction 多进程语义验证**
+- 当前 `junction_multiproc_vfork.c` 已覆盖 `vfork()+execv()`、`waitpid()`、worker 文件 I/O 和 fish 后台任务路线；如果后续 benchmark 要恢复原始多进程模型，需要继续验证通用 `fork()`、`execve()` 多目标程序、`wait4/waitid`、信号、文件描述符继承、pipe/stdout/stderr 和共享内存/IPC。
+- 不要因为 2026-06-07 的验证通过就直接撤销 Filebench/FxMark 的 pthread worker 适配；二者当前依赖的是与 `vfork()+exec` 不同的执行语义。
+- 若决定把本轮测试纳入正式回归，应将 `junction/fs/mytest/junction_multiproc_vfork.c`、`junction_multiproc_report.md` 和当前 `plan.md` 的取舍一起整理，避免长期保留未跟踪但关键的交接资产。
+
 ---
 
 ## 第十章：文件修改历史总览
 
 | 文件 | 修改类型 | 说明 |
 |------|----------|------|
+| `plan.md` | Handover artifact | 2026-06-07 当前内容为 Junction single-container multi-process verification checklist；旧 ShaoFS plan 内容已被覆盖，2026-06-03 ShaoFS 重构阶段摘要见本文 `1.5` / `8.13` |
+| `junction_multiproc_report.md` | Report | 2026-06-07 Junction 单容器多进程技术实践报告，记录 README 机制理解、`vfork()+execv()` / fish 复现命令、日志路径、host 侧证据和语义边界 |
+| `junction/fs/mytest/junction_multiproc_vfork.c` | New test | 2026-06-07 双模式 C 测试：controller 显式 `vfork()` 后 child 立即 `execv()` 同一二进制的 `--worker` 模式；worker 写 `FSHAO` 文件并打印 PID/TID/PPID，parent `waitpid()` 并校验 worker 文件 |
+| `shaofs/syscall.cc` | Refactor | 2026-06-03 plan2：拆分 `my_open()` / `my_mkdir()` / `my_fsync()` 的路径准备、inode 初始化、目录插入和 dirty-range fsync helper；目标是降低大函数认知负担，行为由 plan2 Phase6 correctness 和 Filebench final 验证 |
+| `shaofs/file.cc` / `shaofs/file.h` | Refactor + correctness | 2026-06-03 plan2：引入 `CachedWriteOp`，拆出 cached existing-block/new-block/EOF extension helper 和 direct 单块写 helper；direct `O_APPEND` 由 `file_write_direct_append()` 在 inode 写锁内完成 EOF reservation |
+| `shaofs/blockCache.cc` | Refactor | 2026-06-03 plan2：`bc_flush_blocks_contiguous()` 改用 `CachedFlushRun` 表达连续 flush run，并拆出 data/metadata flush 判断与提交 helper |
+| `shaofs/journal.cc` | Refactor | 2026-06-03 plan2：repair/recovery 使用 `CFreeBuffer<T>` 管理 C buffer，并把 slot 分类、收集、replay、clear、dirty mount repair 拆成小 helper |
+| `shaofs/extent.h/cc` | Refactor | 2026-06-03 plan2：补充 disk inode extent 遍历 helper，供 journal repair/recovery 复用，减少修复路径手写 extent 扫描 |
+| `shaofs/dir.cc` | Design note | 2026-06-03 review：确认 `DirIndex` 是目录 inode 内部运行时索引，和全局 `dentryCache` 不等价；plan2 未删除该机制，但记录了小目录内存放大风险 |
 | `shaofs/group.cc` | Bug fix + perf | 移除热路径 log_info；`alloc_block` 中 write_access 移到 kguard 之前 |
 | `shaofs/file.cc` | Perf + feature | 拆分 file_write 锁范围；新增 truncate_inode + free_inode_data_blocks；新增 file_read/write_direct；当前 O_DIRECT 请求层要求 `buf`/`len`/`offset` 4KB 对齐，底层按覆盖 2MB 区间注册 |
 | `shaofs/file.cc` | Feature | 新增 `file_readv_direct()`：shaoFS O_DIRECT `readv/preadv` 聚合多个整块 iovec，调用 `storage_read_aligned_batch()` 一次提交多个 read 并只 park 一次；dirty cache、sparse hole 或非整块场景 fallback 到 scalar direct read |

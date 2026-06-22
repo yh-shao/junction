@@ -28,6 +28,9 @@ extern "C" {
 #include "junction/fs/shaofs/file.h"
 #include "junction/fs/shaofs/blockCache.h"
 #include "junction/fs/shaofs/syscall.h"
+extern "C" {
+#include "runtime/shaofs_timing.h"
+}
 
 namespace {
 
@@ -227,20 +230,37 @@ ssize_t usys_read(int fd, void *buf, size_t len) {
   FileTable &ftbl = myproc().get_file_table();
   File *f = ftbl.Get(fd);
   if (unlikely(!f || !f->is_readable())) return -EBADF;
+  bool direct = f->get_flags() & kFlagDirect;
+  if (direct) shaofs_tbd_begin(SHAOFS_TBD_OP_READ, f->get_inode() ? f->get_inode()->get_inum() : -1, f->get_off_ref(), len);
+  shaofs_tbd_event(SHAOFS_TBD_USYS_ENTER);
 
   if (f->get_inode() && f->get_inode()->get_mode() == SHAOFS)
   {
-    if (f->get_type() == FileType::kDirectory) return -EISDIR;
-    bool direct = f->get_flags() & kFlagDirect;
+    if (f->get_type() == FileType::kDirectory) {
+      if (direct) shaofs_tbd_cancel();
+      return -EISDIR;
+    }
+    shaofs_tbd_event(SHAOFS_TBD_SHAOFS_BRANCH_ENTER);
     if (direct && f->get_shaofs_direct_read_hint()->valid)
     {
+      shaofs_tbd_set_direct_hint(true);
+      shaofs_tbd_event(SHAOFS_TBD_USYS_DISPATCH);
+      shaofs_tbd_event(SHAOFS_TBD_SHAOFS_LOGIC_ENTER);
       ssize_t ret = file_read_direct_hint(f->get_shaofs_direct_read_hint(), (char*)buf, f->get_off_ref(), len);
       if (ret >= 0) f->get_off_ref() += ret;
+      shaofs_tbd_event(SHAOFS_TBD_USYS_RETURN);
+      if (direct) shaofs_tbd_finish(ret);
       return ret;
     }
-    return my_read(f->get_inode()->get_inum(), buf, &f->get_off_ref(), len, direct);
+    shaofs_tbd_event(SHAOFS_TBD_USYS_DISPATCH);
+    shaofs_tbd_event(SHAOFS_TBD_SHAOFS_LOGIC_ENTER);
+    ssize_t ret = my_read(f->get_inode()->get_inum(), buf, &f->get_off_ref(), len, direct);
+    shaofs_tbd_event(SHAOFS_TBD_USYS_RETURN);
+    if (direct) shaofs_tbd_finish(ret);
+    return ret;
   }
 
+  if (direct) shaofs_tbd_cancel();
   Status<size_t> ret = f->Read(readable_span(buf, len), &f->get_off_ref());
   if (!ret) return MakeCError(ret);
   return static_cast<ssize_t>(*ret);
@@ -286,18 +306,30 @@ ssize_t usys_write(int fd, const void *buf, size_t len) {
   FileTable &ftbl = myproc().get_file_table();
   File *f = ftbl.Get(fd);
   if (unlikely(!f || !f->is_writeable())) return -EBADF;
+  bool direct = f->get_flags() & kFlagDirect;
+  if (direct) shaofs_tbd_begin(SHAOFS_TBD_OP_WRITE, f->get_inode() ? f->get_inode()->get_inum() : -1, f->get_off_ref(), len);
+  shaofs_tbd_event(SHAOFS_TBD_USYS_ENTER);
 
   if (f->get_inode() && f->get_inode()->get_mode() == SHAOFS)
   {
-    if (f->get_type() == FileType::kDirectory) return -EISDIR;
+    if (f->get_type() == FileType::kDirectory) {
+      if (direct) shaofs_tbd_cancel();
+      return -EISDIR;
+    }
+    shaofs_tbd_event(SHAOFS_TBD_SHAOFS_BRANCH_ENTER);
     int inum = f->get_inode()->get_inum();
-    bool direct = f->get_flags() & kFlagDirect;
     f->get_shaofs_direct_read_hint()->valid = false;
     bool append = f->get_flags() & O_APPEND;
     if (append && direct) f->get_off_ref() = my_lseek(inum, 0, SEEK_END, 0);
-    return my_write(inum, buf, &f->get_off_ref(), len, direct, append);
+    shaofs_tbd_event(SHAOFS_TBD_USYS_DISPATCH);
+    shaofs_tbd_event(SHAOFS_TBD_SHAOFS_LOGIC_ENTER);
+    ssize_t ret = my_write(inum, buf, &f->get_off_ref(), len, direct, append);
+    shaofs_tbd_event(SHAOFS_TBD_USYS_RETURN);
+    if (direct) shaofs_tbd_finish(ret);
+    return ret;
   }
 
+  if (direct) shaofs_tbd_cancel();
   Status<size_t> ret = f->Write(writable_span(buf, len), &f->get_off_ref());
   if (!ret) return MakeCError(ret);
   return static_cast<ssize_t>(*ret);
@@ -307,15 +339,36 @@ ssize_t usys_pread64(int fd, void *buf, size_t len, off_t offset) {
   FileTable &ftbl = myproc().get_file_table();
   File *f = ftbl.Get(fd);
   if (unlikely(!f || !f->is_readable())) return -EBADF;
+  bool direct = f->get_flags() & kFlagDirect;
+  if (direct) shaofs_tbd_begin(SHAOFS_TBD_OP_READ, f->get_inode() ? f->get_inode()->get_inum() : -1, offset, len);
+  shaofs_tbd_event(SHAOFS_TBD_USYS_ENTER);
 
   if (f->get_inode() && f->get_inode()->get_mode() == SHAOFS)
   {
-    if (f->get_type() == FileType::kDirectory) return -EISDIR;
-    bool direct = f->get_flags() & kFlagDirect;
-    if (direct && f->get_shaofs_direct_read_hint()->valid) return file_read_direct_hint(f->get_shaofs_direct_read_hint(), (char*)buf, offset, len);
-    return my_read(f->get_inode()->get_inum(), buf, &offset, len, direct);
+    if (f->get_type() == FileType::kDirectory) {
+      if (direct) shaofs_tbd_cancel();
+      return -EISDIR;
+    }
+    shaofs_tbd_event(SHAOFS_TBD_SHAOFS_BRANCH_ENTER);
+    if (direct && f->get_shaofs_direct_read_hint()->valid)
+    {
+      shaofs_tbd_set_direct_hint(true);
+      shaofs_tbd_event(SHAOFS_TBD_USYS_DISPATCH);
+      shaofs_tbd_event(SHAOFS_TBD_SHAOFS_LOGIC_ENTER);
+      ssize_t ret = file_read_direct_hint(f->get_shaofs_direct_read_hint(), (char*)buf, offset, len);
+      shaofs_tbd_event(SHAOFS_TBD_USYS_RETURN);
+      if (direct) shaofs_tbd_finish(ret);
+      return ret;
+    }
+    shaofs_tbd_event(SHAOFS_TBD_USYS_DISPATCH);
+    shaofs_tbd_event(SHAOFS_TBD_SHAOFS_LOGIC_ENTER);
+    ssize_t ret = my_read(f->get_inode()->get_inum(), buf, &offset, len, direct);
+    shaofs_tbd_event(SHAOFS_TBD_USYS_RETURN);
+    if (direct) shaofs_tbd_finish(ret);
+    return ret;
   }
 
+  if (direct) shaofs_tbd_cancel();
   Status<size_t> ret = f->Read(readable_span(buf, len), &offset);
   if (!ret) return MakeCError(ret);
   return static_cast<ssize_t>(*ret);
@@ -612,15 +665,27 @@ ssize_t usys_pwrite64(int fd, const void *buf, size_t len, off_t offset) {
   FileTable &ftbl = myproc().get_file_table();
   File *f = ftbl.Get(fd);
   if (unlikely(!f || !f->is_writeable())) return -EBADF;
+  bool direct = f->get_flags() & kFlagDirect;
+  if (direct) shaofs_tbd_begin(SHAOFS_TBD_OP_WRITE, f->get_inode() ? f->get_inode()->get_inum() : -1, offset, len);
+  shaofs_tbd_event(SHAOFS_TBD_USYS_ENTER);
 
   if (f->get_inode() && f->get_inode()->get_mode() == SHAOFS)
   {
-    if (f->get_type() == FileType::kDirectory) return -EISDIR;
-    bool direct = f->get_flags() & kFlagDirect;
+    if (f->get_type() == FileType::kDirectory) {
+      if (direct) shaofs_tbd_cancel();
+      return -EISDIR;
+    }
+    shaofs_tbd_event(SHAOFS_TBD_SHAOFS_BRANCH_ENTER);
     f->get_shaofs_direct_read_hint()->valid = false;
-    return my_write(f->get_inode()->get_inum(), buf, &offset, len, direct, false);
+    shaofs_tbd_event(SHAOFS_TBD_USYS_DISPATCH);
+    shaofs_tbd_event(SHAOFS_TBD_SHAOFS_LOGIC_ENTER);
+    ssize_t ret = my_write(f->get_inode()->get_inum(), buf, &offset, len, direct, false);
+    shaofs_tbd_event(SHAOFS_TBD_USYS_RETURN);
+    if (direct) shaofs_tbd_finish(ret);
+    return ret;
   }
 
+  if (direct) shaofs_tbd_cancel();
   Status<size_t> ret = f->Write(writable_span(buf, len), &offset);
   if (!ret) return MakeCError(ret);
   return static_cast<ssize_t>(*ret);

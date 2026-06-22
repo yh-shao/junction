@@ -14,6 +14,7 @@
 extern "C" {
 #include "runtime/runtime.h"
 #include "runtime/storage.h"
+#include "runtime/shaofs_timing.h"
 }
 
 static inline bool user_dma_request_ok(const void* buf, off_t offset, size_t len)
@@ -343,6 +344,7 @@ void final_flush()
 #endif
 
     RuntimeFSBaseGuard g;
+    dsa_dump_stats();
     flush_all_dirty_state(true);
     journal_mark_clean();
 }
@@ -921,11 +923,14 @@ ssize_t file_write(int inum, const char* buf, off_t offset, size_t len)
 /* O_DIRECT I/O */
 ssize_t file_read_direct(int inum, char* buf, off_t offset, size_t len)
 {
+    shaofs_tbd_event(SHAOFS_TBD_FILE_ENTER);
     if (len == 0) return 0;
     if (!user_dma_request_ok(buf, offset, len)) return -EINVAL;   // O_DIRECT 使用严格的用户 buffer DMA 合约；不满足条件或注册失败时直接返回错误。
+    shaofs_tbd_event(SHAOFS_TBD_FILE_VALIDATE_DONE);
 
     InodeHandle ih = ic_get_inode(inum);
     if (unlikely(!ih)) return -1;
+    shaofs_tbd_event(SHAOFS_TBD_FILE_INODE_DONE);
 
     uint64_t bytes_read = 0;
     while (bytes_read < len)
@@ -948,6 +953,7 @@ ssize_t file_read_direct(int inum, char* buf, off_t offset, size_t len)
 
             phys_blk = inode_bmap_locked(const_cast<MInode*>(&(*read_acc)), logical_blk, false, nullptr);
         }
+        shaofs_tbd_event(SHAOFS_TBD_FILE_EXTENT_DONE);
 
         if (phys_blk == INVALID_BLOCK_ID)
         {
@@ -956,7 +962,13 @@ ssize_t file_read_direct(int inum, char* buf, off_t offset, size_t len)
         else
         {
             char* dst = buf + bytes_read;
-            if (atomic_read(&ih.get_entry()->data.has_dirty_data_cache) && !bc_flush_block(phys_blk)) break;  // 若该块在 cache 中且为脏，先刷盘保证 Direct I/O 能读到最新数据
+            if (atomic_read(&ih.get_entry()->data.has_dirty_data_cache))
+            {
+                shaofs_tbd_set_dirty_flush(true);
+                shaofs_tbd_event(SHAOFS_TBD_FILE_DIRTY_FLUSH_BEGIN);
+                if (!bc_flush_block(phys_blk)) break;  // 若该块在 cache 中且为脏，先刷盘保证 Direct I/O 能读到最新数据
+                shaofs_tbd_event(SHAOFS_TBD_FILE_DIRTY_FLUSH_END);
+            }
 
             if (storage_read_aligned(dst, phys_blk, copy_len / BLOCK_SIZE) != 0) break;
         }
@@ -964,6 +976,7 @@ ssize_t file_read_direct(int inum, char* buf, off_t offset, size_t len)
         bytes_read += copy_len;
     }
 
+    shaofs_tbd_event(SHAOFS_TBD_FILE_RETURN);
     return bytes_read;
 }
 
@@ -1014,9 +1027,12 @@ bool file_prepare_direct_read_hint(int inum, DirectReadHint* hint)
 
 ssize_t file_read_direct_hint(DirectReadHint* hint, char* buf, off_t offset, size_t len)
 {
+    shaofs_tbd_event(SHAOFS_TBD_FILE_ENTER);
+    shaofs_tbd_set_direct_hint(true);
     if (!hint || !hint->valid) return -1;
     if (len == 0) return 0;
     if (!user_dma_request_ok(buf, offset, len)) return -EINVAL;
+    shaofs_tbd_event(SHAOFS_TBD_FILE_VALIDATE_DONE);
 
     RuntimeFSBaseGuard g;
 
@@ -1026,6 +1042,7 @@ ssize_t file_read_direct_hint(DirectReadHint* hint, char* buf, off_t offset, siz
         hint->valid = false;
         return file_read_direct(hint->inum, buf, offset, len);
     }
+    shaofs_tbd_event(SHAOFS_TBD_FILE_INODE_DONE);
 
     bool metadata_stale = false;
     bool has_dirty_data = false;
@@ -1088,12 +1105,14 @@ ssize_t file_read_direct_hint(DirectReadHint* hint, char* buf, off_t offset, siz
         if (max_blocks == 0) break;
         copy_len = max_blocks * BLOCK_SIZE;
         phys_blk = ext.physical_start + (logical_blk - ext.logical_start);
+        shaofs_tbd_event(SHAOFS_TBD_FILE_EXTENT_DONE);
 
         char* dst = buf + bytes_read;
         if (storage_read_aligned(dst, phys_blk, copy_len / BLOCK_SIZE) != 0) break;
         bytes_read += copy_len;
     }
 
+    shaofs_tbd_event(SHAOFS_TBD_FILE_RETURN);
     return bytes_read;
 }
 
@@ -1177,7 +1196,11 @@ ssize_t file_readv_direct(int inum, const struct iovec* iov, int iovcnt, off_t o
 
 static bool direct_write_one_block_locked(const char* src, BlockID phys_blk, uint32_t block_count, const char* log_prefix)
 {
+    shaofs_tbd_set_lba(phys_blk, block_count);
+    shaofs_tbd_set_dirty_flush(true);
+    shaofs_tbd_event(SHAOFS_TBD_FILE_DIRTY_FLUSH_BEGIN);
     (void)bc_flush_block(phys_blk);
+    shaofs_tbd_event(SHAOFS_TBD_FILE_DIRTY_FLUSH_END);
     if (storage_write_user_dma(src, phys_blk, block_count) != 0)
     {
         log_err("[%s] Failed to write to physical block %lu", log_prefix, phys_blk);
@@ -1190,8 +1213,10 @@ static bool direct_write_one_block_locked(const char* src, BlockID phys_blk, uin
 
 ssize_t file_write_direct(int inum, const char* buf, off_t offset, size_t len)
 {
+    shaofs_tbd_event(SHAOFS_TBD_FILE_ENTER);
     if (len == 0) return 0;
     if (!user_dma_request_ok(buf, offset, len)) return -EINVAL;
+    shaofs_tbd_event(SHAOFS_TBD_FILE_VALIDATE_DONE);
 
     InodeHandle ih = ic_get_inode(inum);
     if (unlikely(!ih)) 
@@ -1199,6 +1224,7 @@ ssize_t file_write_direct(int inum, const char* buf, off_t offset, size_t len)
         log_err("[file_write_direct] Failed to get inode %d from cache", inum);
         return -1;
     }
+    shaofs_tbd_event(SHAOFS_TBD_FILE_INODE_DONE);
 
     uint64_t bytes_written = 0;
     while (bytes_written < len)
@@ -1223,6 +1249,7 @@ ssize_t file_write_direct(int inum, const char* buf, off_t offset, size_t len)
             if (current_offset + copy_len <= read_acc->file_size)
             {
                 phys_blk = inode_bmap_locked(const_cast<MInode*>(&(*read_acc)), logical_blk, false, nullptr);
+                shaofs_tbd_event(SHAOFS_TBD_FILE_EXTENT_DONE);
                 if (phys_blk != INVALID_BLOCK_ID) 
                 {
                     if (!direct_write_one_block_locked(buf + bytes_written, phys_blk, copy_len / BLOCK_SIZE, "file_write_direct")) break;
@@ -1247,6 +1274,7 @@ ssize_t file_write_direct(int inum, const char* buf, off_t offset, size_t len)
 
             phys_blk = inode_bmap_locked(&*write_acc, logical_blk, true, nullptr);
             if (phys_blk == INVALID_BLOCK_ID) break;
+            shaofs_tbd_event(SHAOFS_TBD_FILE_EXTENT_DONE);
             if (write_acc->type == DIRECTORY) journal_register_metadata_block(phys_blk);
 
             if (!direct_write_one_block_locked(buf + bytes_written, phys_blk, copy_len / BLOCK_SIZE, "file_write_direct")) break;
@@ -1263,6 +1291,7 @@ ssize_t file_write_direct(int inum, const char* buf, off_t offset, size_t len)
         bytes_written += copy_len;
     }
 
+    shaofs_tbd_event(SHAOFS_TBD_FILE_RETURN);
     return (bytes_written == 0 && len > 0) ? -1 : bytes_written;
 }
 

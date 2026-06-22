@@ -8,6 +8,9 @@
 #include "blockCache.h"
 #include "extent.h"
 #include "junction/fs/file.h"
+extern "C" {
+#include "runtime/shaofs_timing.h"
+}
 
 struct InodeLifecycle {
     spinlock_t lock;
@@ -248,17 +251,22 @@ int my_open(const char* pathname, int flags, mode_t mode, file_type_t* type_out)
 
 ssize_t my_read(int inum, void *buf, off_t* off, size_t len, bool direct)
 {
+    shaofs_tbd_event(SHAOFS_TBD_MY_ENTER);
     RuntimeFSBaseGuard g;
+    shaofs_tbd_event(SHAOFS_TBD_MY_AFTER_GUARD);
 
     ssize_t ret = direct ? file_read_direct(inum, (char*)buf, *off, len)
                          : file_read(inum, (char*)buf, *off, len);
     if (ret >= 0) *off += ret;
+    shaofs_tbd_event(SHAOFS_TBD_MY_RETURN);
     return ret;
 }
 
 ssize_t my_write(int inum, const void *buf, off_t* off, size_t len, bool direct, bool append)
 {
+    shaofs_tbd_event(SHAOFS_TBD_MY_ENTER);
     RuntimeFSBaseGuard g;
+    shaofs_tbd_event(SHAOFS_TBD_MY_AFTER_GUARD);
 
     ssize_t ret;
     if (append && direct)
@@ -270,6 +278,7 @@ ssize_t my_write(int inum, const void *buf, off_t* off, size_t len, bool direct,
                      : file_write(inum, (const char*)buf, *off, len);
 
     if (ret >= 0 && !append) *off += ret;
+    shaofs_tbd_event(SHAOFS_TBD_MY_RETURN);
     return ret;
 }
 
